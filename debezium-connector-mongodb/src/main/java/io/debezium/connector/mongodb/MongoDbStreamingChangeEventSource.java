@@ -135,6 +135,7 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                 throw new ConnectException("Error while attempting to " + desc, error);
             }
             else {
+                dispatcher.dispatchConnectorEvent(new DisconnectEvent());
                 LOGGER.error("Error while attempting to {}: {}", desc, error.getMessage(), error);
                 throw new ConnectException("Error while attempting to " + desc, error);
             }
@@ -189,7 +190,7 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                 // In this situation if not document is available, we'll pause.
                 final Document event = cursor.tryNext();
                 if (event != null) {
-                    if (!handleOplogEvent(primaryAddress, event, event, 0, oplogContext)) {
+                    if (!handleOplogEvent(primaryAddress, event, event, 0, oplogContext, context)) {
                         // Something happened and we are supposed to stop reading
                         return;
                     }
@@ -238,7 +239,8 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
         return skippedOperationsFilter;
     }
 
-    private boolean handleOplogEvent(ServerAddress primaryAddress, Document event, Document masterEvent, long txOrder, ReplicaSetOplogContext oplogContext) {
+    private boolean handleOplogEvent(ServerAddress primaryAddress, Document event, Document masterEvent, long txOrder, ReplicaSetOplogContext oplogContext,
+                                     ChangeEventSourceContext context) {
         String ns = event.getString("ns");
         Document object = event.get(OBJECT_FIELD, Document.class);
         if (Objects.isNull(object)) {
@@ -272,6 +274,8 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                     LOGGER.info("Found new primary event in oplog, current {} is new primary. " +
                             "Continue to process oplog event.", primaryAddress);
                 }
+
+                dispatcher.dispatchConnectorEvent(new PrimaryElectionEvent(serverAddress));
             }
             // Otherwise ignore
             if (LOGGER.isDebugEnabled()) {
@@ -290,7 +294,7 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                             LOGGER.debug("Skipping record as it is expected to be already processed: {}", change);
                             continue;
                         }
-                        final boolean r = handleOplogEvent(primaryAddress, change, event, txOrder, oplogContext);
+                        final boolean r = handleOplogEvent(primaryAddress, change, event, txOrder, oplogContext, context);
                         if (!r) {
                             return false;
                         }
@@ -300,9 +304,9 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                 return true;
             }
             try {
-                dispatcher.dispatchTransactionStartedEvent(Long.toString(txOrder), oplogContext.getOffset());
+                dispatcher.dispatchTransactionStartedEvent(getTransactionId(event), oplogContext.getOffset());
                 for (Document change : txChanges) {
-                    final boolean r = handleOplogEvent(primaryAddress, change, event, ++txOrder, oplogContext);
+                    final boolean r = handleOplogEvent(primaryAddress, change, event, ++txOrder, oplogContext, context);
                     if (!r) {
                         return false;
                     }
@@ -352,7 +356,8 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
                             new MongoDbChangeRecordEmitter(
                                     oplogContext.getOffset(),
                                     clock,
-                                    event));
+                                    event,
+                                    false));
                 }
                 catch (Exception e) {
                     errorHandler.setProducerThrowable(e);
@@ -394,6 +399,15 @@ public class MongoDbStreamingChangeEventSource implements StreamingChangeEventSo
         });
 
         return new MongoDbOffsetContext(new SourceInfo(connectorConfig), new TransactionContext(), positions);
+    }
+
+    private static String getTransactionId(Document event) {
+        final Long operationId = event.getLong(SourceInfo.OPERATION_ID);
+        if (operationId != null && operationId != 0L) {
+            return Long.toString(operationId);
+        }
+
+        return MongoUtil.getOplogSessionTransactionId(event);
     }
 
     /**

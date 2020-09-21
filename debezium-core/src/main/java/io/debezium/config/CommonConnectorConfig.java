@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -47,7 +48,7 @@ public abstract class CommonConnectorConfig {
 
         private final String value;
 
-        private Version(String value) {
+        Version(String value) {
             this.value = value;
         }
 
@@ -94,7 +95,7 @@ public abstract class CommonConnectorConfig {
     /**
      * The set of predefined modes for dealing with failures during event processing.
      */
-    public static enum EventProcessingFailureHandlingMode implements EnumeratedValue {
+    public enum EventProcessingFailureHandlingMode implements EnumeratedValue {
 
         /**
          * Problematic events will be skipped.
@@ -120,7 +121,7 @@ public abstract class CommonConnectorConfig {
 
         private final String value;
 
-        private EventProcessingFailureHandlingMode(String value) {
+        EventProcessingFailureHandlingMode(String value) {
             this.value = value;
         }
 
@@ -157,11 +158,98 @@ public abstract class CommonConnectorConfig {
         }
     }
 
+    /**
+     * The set of predefined BinaryHandlingMode options or aliases
+     */
+    public enum BinaryHandlingMode implements EnumeratedValue {
+
+        /**
+         * Represent binary values as byte array
+         */
+        BYTES("bytes", SchemaBuilder::bytes),
+
+        /**
+         * Represent binary values as base64-encoded string
+         */
+        BASE64("base64", SchemaBuilder::string),
+
+        /**
+         * Represents binary values as hex-encoded (base16) string
+         */
+        HEX("hex", SchemaBuilder::string);
+
+        private final String value;
+        private final Supplier<SchemaBuilder> schema;
+
+        BinaryHandlingMode(String value, Supplier<SchemaBuilder> schema) {
+            this.value = value;
+            this.schema = schema;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public SchemaBuilder getSchema() {
+            return schema.get();
+        }
+
+        /**
+         * Determine if the supplied values is one of the predefined options
+         *
+         * @param value the configuration property value ; may not be null
+         * @return the matching option, or null if the match is not found
+         */
+        public static BinaryHandlingMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (BinaryHandlingMode option : BinaryHandlingMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Determine if the supplied values is one of the predefined options
+         *
+         * @param value the configuration property value ; may not be null
+         * @param defaultValue the default value ; may be null
+         * @return the matching option or null if the match is not found and non-null default is invalid
+         */
+        public static BinaryHandlingMode parse(String value, String defaultValue) {
+            BinaryHandlingMode mode = parse(value);
+            if (mode == null && defaultValue != null) {
+                mode = parse(defaultValue);
+            }
+            return mode;
+        }
+    }
+
+    private static final String CONFLUENT_AVRO_CONVERTER = "io.confluent.connect.avro.AvroConverter";
+    private static final String APICURIO_AVRO_CONVERTER = "io.apicurio.registry.utils.converter.AvroConverter";
+
     public static final int DEFAULT_MAX_QUEUE_SIZE = 8192;
     public static final int DEFAULT_MAX_BATCH_SIZE = 2048;
+    public static final int DEFAULT_QUERY_FETCH_SIZE = 0;
     public static final long DEFAULT_POLL_INTERVAL_MILLIS = 500;
     public static final String DATABASE_CONFIG_PREFIX = "database.";
     private static final String CONVERTER_TYPE_SUFFIX = ".type";
+    public static final long DEFAULT_RETRIABLE_RESTART_WAIT = 10000L;
+
+    public static final Field RETRIABLE_RESTART_WAIT = Field.create("retriable.restart.connector.wait.ms")
+            .withDisplayName("Retriable restart wait (ms)")
+            .withType(Type.LONG)
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.LOW)
+            .withDefault(DEFAULT_RETRIABLE_RESTART_WAIT)
+            .withDescription(
+                    "Time to wait before restarting connector after retriable exception occurs. Defaults to " + DEFAULT_RETRIABLE_RESTART_WAIT + "ms.")
+            .withValidation(Field::isPositiveLong);
 
     public static final Field TOMBSTONES_ON_DELETE = Field.create("tombstones.on.delete")
             .withDisplayName("Change the behaviour of Debezium with regards to delete operations")
@@ -272,6 +360,46 @@ public abstract class CommonConnectorConfig {
             .withDescription("The comma-separated list of operations to skip during streaming, defined as: 'i' for inserts; 'u' for updates; 'd' for deletes. "
                     + "By default, no operations will be skipped.");
 
+    public static final Field BINARY_HANDLING_MODE = Field.create("binary.handling.mode")
+            .withDisplayName("Binary Handling")
+            .withEnum(BinaryHandlingMode.class, BinaryHandlingMode.BYTES)
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.LOW)
+            .withDescription("Specify how binary (blob, binary, etc.) columns should be represented in change events, including:"
+                    + "'bytes' represents binary data as byte array (default)"
+                    + "'base64' represents binary data as base64-encoded string"
+                    + "'hex' represents binary data as hex-encoded (base16) string");
+
+    public static final Field QUERY_FETCH_SIZE = Field.create("query.fetch.size")
+            .withDisplayName("Query fetch size")
+            .withType(Type.INT)
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The maximum number of records that should be loaded into memory while streaming.  A value of `0` uses the default JDBC fetch size.")
+            .withValidation(Field::isNonNegativeInteger)
+            .withDefault(DEFAULT_QUERY_FETCH_SIZE);
+
+    protected static final ConfigDefinition CONFIG_DEFINITION = ConfigDefinition.editor()
+            .connector(
+                    EVENT_PROCESSING_FAILURE_HANDLING_MODE,
+                    MAX_BATCH_SIZE,
+                    MAX_QUEUE_SIZE,
+                    POLL_INTERVAL_MS,
+                    PROVIDE_TRANSACTION_METADATA,
+                    SKIPPED_OPERATIONS,
+                    SNAPSHOT_DELAY_MS,
+                    SNAPSHOT_FETCH_SIZE,
+                    RETRIABLE_RESTART_WAIT,
+                    QUERY_FETCH_SIZE)
+            .events(
+                    CUSTOM_CONVERTERS,
+                    SANITIZE_FIELD_NAMES,
+                    TOMBSTONES_ON_DELETE,
+                    SOURCE_STRUCT_MAKER_VERSION,
+                    Heartbeat.HEARTBEAT_INTERVAL,
+                    Heartbeat.HEARTBEAT_TOPICS_PREFIX)
+            .create();
+
     private final Configuration config;
     private final boolean emitTombstoneOnDelete;
     private final int maxQueueSize;
@@ -280,12 +408,15 @@ public abstract class CommonConnectorConfig {
     private final String logicalName;
     private final String heartbeatTopicsPrefix;
     private final Duration snapshotDelayMs;
+    private final Duration retriableRestartWait;
     private final int snapshotFetchSize;
+    private final Integer queryFetchSize;
     private final SourceInfoStructMaker<? extends AbstractSourceInfo> sourceInfoStructMaker;
     private final boolean sanitizeFieldNames;
     private final boolean shouldProvideTransactionMetadata;
     private final EventProcessingFailureHandlingMode eventProcessingFailureHandlingMode;
     private final CustomConverterRegistry customConverterRegistry;
+    private final BinaryHandlingMode binaryHandlingMode;
 
     protected CommonConnectorConfig(Configuration config, String logicalName, int defaultSnapshotFetchSize) {
         this.config = config;
@@ -296,18 +427,23 @@ public abstract class CommonConnectorConfig {
         this.logicalName = logicalName;
         this.heartbeatTopicsPrefix = config.getString(Heartbeat.HEARTBEAT_TOPICS_PREFIX);
         this.snapshotDelayMs = Duration.ofMillis(config.getLong(SNAPSHOT_DELAY_MS));
+        this.retriableRestartWait = Duration.ofMillis(config.getLong(RETRIABLE_RESTART_WAIT));
         this.snapshotFetchSize = config.getInteger(SNAPSHOT_FETCH_SIZE, defaultSnapshotFetchSize);
+        this.queryFetchSize = config.getInteger(QUERY_FETCH_SIZE);
         this.sourceInfoStructMaker = getSourceInfoStructMaker(Version.parse(config.getString(SOURCE_STRUCT_MAKER_VERSION)));
         this.sanitizeFieldNames = config.getBoolean(SANITIZE_FIELD_NAMES) || isUsingAvroConverter(config);
         this.shouldProvideTransactionMetadata = config.getBoolean(PROVIDE_TRANSACTION_METADATA);
         this.eventProcessingFailureHandlingMode = EventProcessingFailureHandlingMode.parse(config.getString(EVENT_PROCESSING_FAILURE_HANDLING_MODE));
         this.customConverterRegistry = new CustomConverterRegistry(getCustomConverters());
+        this.binaryHandlingMode = BinaryHandlingMode.parse(config.getString(BINARY_HANDLING_MODE));
     }
 
     /**
      * Provides access to the "raw" config instance. In most cases, access via typed getters for individual properties
      * on the connector config class should be preferred.
+     * TODO this should be protected in the future to force proper facade methods based access / encapsulation
      */
+    @Deprecated
     public Configuration getConfig() {
         return config;
     }
@@ -334,8 +470,14 @@ public abstract class CommonConnectorConfig {
 
     public abstract String getContextName();
 
+    public abstract String getConnectorName();
+
     public String getHeartbeatTopicsPrefix() {
         return heartbeatTopicsPrefix;
+    }
+
+    public Duration getRetriableRestartWait() {
+        return retriableRestartWait;
     }
 
     public Duration getSnapshotDelay() {
@@ -344,6 +486,10 @@ public abstract class CommonConnectorConfig {
 
     public int getSnapshotFetchSize() {
         return snapshotFetchSize;
+    }
+
+    public int getQueryFetchSize() {
+        return queryFetchSize;
     }
 
     public boolean shouldProvideTransactionMetadata() {
@@ -395,6 +541,14 @@ public abstract class CommonConnectorConfig {
         }
     }
 
+    /**
+     * @return true if the connector should emit messages about schema changes into a public facing
+     * topic.
+     */
+    public boolean isSchemaChangesHistoryEnabled() {
+        return false;
+    }
+
     private static int validateMaxQueueSize(Configuration config, Field field, Field.ValidationOutput problems) {
         int maxQueueSize = config.getInteger(field);
         int maxBatchSize = config.getInteger(MAX_BATCH_SIZE);
@@ -420,7 +574,7 @@ public abstract class CommonConnectorConfig {
         for (String operation : operations.split(",")) {
             switch (operation.trim()) {
                 case "r":
-                case "i":
+                case "c":
                 case "u":
                 case "d":
                     continue;
@@ -434,10 +588,11 @@ public abstract class CommonConnectorConfig {
     }
 
     private static boolean isUsingAvroConverter(Configuration config) {
-        final String avroConverter = "io.confluent.connect.avro.AvroConverter";
         final String keyConverter = config.getString("key.converter");
         final String valueConverter = config.getString("value.converter");
-        return avroConverter.equals(keyConverter) || avroConverter.equals(valueConverter);
+
+        return CONFLUENT_AVRO_CONVERTER.equals(keyConverter) || CONFLUENT_AVRO_CONVERTER.equals(valueConverter)
+                || APICURIO_AVRO_CONVERTER.equals(keyConverter) || APICURIO_AVRO_CONVERTER.equals(valueConverter);
     }
 
     protected static int validateServerNameIsDifferentFromHistoryTopicName(Configuration config, Field field, ValidationOutput problems) {
@@ -456,4 +611,8 @@ public abstract class CommonConnectorConfig {
      * Returns the connector-specific {@link SourceInfoStructMaker} based on the given configuration.
      */
     protected abstract SourceInfoStructMaker<?> getSourceInfoStructMaker(Version version);
+
+    public BinaryHandlingMode binaryHandlingMode() {
+        return binaryHandlingMode;
+    }
 }

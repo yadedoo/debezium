@@ -66,7 +66,7 @@ public class MySqlSourceTypeInSchemaIT extends AbstractConnectorTest {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NEVER)
-                .with("column.propagate.source.type", ".*c1,.*c2,.*c3.*,.*f.")
+                .with("column.propagate.source.type", ".*\\.c1,.*\\.c2,.*\\.c3.*,.*\\.f.")
                 .build();
 
         // Start the connector ...
@@ -168,6 +168,7 @@ public class MySqlSourceTypeInSchemaIT extends AbstractConnectorTest {
 
         // Start the connector ...
         start(MySqlConnector.class, config);
+        waitForStreamingRunning("mysql", DATABASE.getServerName(), "binlog");
 
         // ---------------------------------------------------------------------------------------------------------------
         // Consume all of the events due to startup and initialization of the database

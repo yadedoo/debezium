@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.mysql;
 
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
+import static io.debezium.junit.EqualityCheck.LESS_THAN_OR_EQUAL;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -28,6 +30,7 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 
 import io.debezium.config.CommonConnectorConfig.EventProcessingFailureHandlingMode;
@@ -41,6 +44,8 @@ import io.debezium.data.SchemaChangeHistory;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.junit.SkipTestRule;
+import io.debezium.junit.SkipWhenDatabaseVersion;
 import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.Testing;
 
@@ -48,6 +53,7 @@ import io.debezium.util.Testing;
  * @author Randall Hauch
  *
  */
+@SkipWhenDatabaseVersion(check = LESS_THAN, major = 5, minor = 6, reason = "DDL uses fractional second data types, not supported until MySQL 5.6")
 public class BinlogReaderIT {
 
     private static final Path DB_HISTORY_PATH = Testing.Files.createTestingPath("file-db-history-binlog.txt").toAbsolutePath();
@@ -61,6 +67,9 @@ public class BinlogReaderIT {
     private BinlogReader reader;
     private KeyValueStore store;
     private SchemaChangeHistory schemaChanges;
+
+    @Rule
+    public SkipTestRule skipRule = new SkipTestRule();
 
     @Before
     public void beforeEach() {
@@ -115,14 +124,13 @@ public class BinlogReaderIT {
 
     protected long filterAtLeast(final int minNumber, final long timeout, final TimeUnit unit) throws InterruptedException {
         final BinlogReaderMetrics metrics = reader.getMetrics();
-        final long initialFilterCount = metrics.getNumberOfEventsFiltered();
-        final long targetNumber = initialFilterCount + minNumber;
+        final long targetNumber = minNumber;
         long startTime = System.currentTimeMillis();
         while (metrics.getNumberOfEventsFiltered() < targetNumber && (System.currentTimeMillis() - startTime) < unit.toMillis(timeout)) {
             // Ignore the records polled.
             reader.poll();
         }
-        return reader.getMetrics().getNumberOfEventsFiltered() - initialFilterCount;
+        return reader.getMetrics().getNumberOfEventsFiltered();
     }
 
     protected Configuration.Builder simpleConfig() {
@@ -313,6 +321,46 @@ public class BinlogReaderIT {
         assertThat(reader.getMetrics().getNumberOfSkippedEvents()).isEqualTo(0);
     }
 
+    /**
+     * Setup a DATABASE_INCLUDE_LIST filter that filters all events.
+     * Verify all events are properly filtered.
+     * Verify numberOfFilteredEvents metric is incremented correctly.
+     */
+    @Test
+    @FixFor("DBZ-1206")
+    public void shouldFilterAllRecordsBasedOnDatabaseIncludeListFilter() throws Exception {
+        // Define configuration that will ignore all events from MySQL source.
+        config = simpleConfig()
+                .with(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, "db-does-not-exist")
+                .build();
+
+        final Filters filters = new Filters.Builder(config).build();
+        context = new MySqlTaskContext(config, filters);
+        context.start();
+        context.source().setBinlogStartPoint("", 0L); // start from beginning
+        context.initializeHistory();
+        reader = new BinlogReader("binlog", context, new AcceptAllPredicate());
+
+        // Start reading the binlog ...
+        reader.start();
+
+        // Lets wait for at least 35 events to be filtered.
+        final int expectedFilterCount = 35;
+        final long numberFiltered = filterAtLeast(expectedFilterCount, 20, TimeUnit.SECONDS);
+
+        // All events should have been filtered.
+        assertThat(numberFiltered).isGreaterThanOrEqualTo(expectedFilterCount);
+
+        // There should be no schema changes
+        assertThat(schemaChanges.recordCount()).isEqualTo(0);
+
+        // There should be no records
+        assertThat(store.collectionCount()).isEqualTo(0);
+
+        // There should be no skipped
+        assertThat(reader.getMetrics().getNumberOfSkippedEvents()).isEqualTo(0);
+    }
+
     @Test
     @FixFor("DBZ-183")
     public void shouldHandleTimestampTimezones() throws Exception {
@@ -322,8 +370,8 @@ public class BinlogReaderIT {
 
         String tableName = "dbz_85_fractest";
         config = simpleConfig().with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
-                .with(MySqlConnectorConfig.DATABASE_WHITELIST, REGRESSION_DATABASE.getDatabaseName())
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, REGRESSION_DATABASE.qualifiedTableName(tableName))
+                .with(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, REGRESSION_DATABASE.getDatabaseName())
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, REGRESSION_DATABASE.qualifiedTableName(tableName))
                 .build();
         Filters filters = new Filters.Builder(config).build();
         context = new MySqlTaskContext(config, filters);
@@ -365,8 +413,8 @@ public class BinlogReaderIT {
 
         String tableName = "dbz_342_timetest";
         config = simpleConfig().with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
-                .with(MySqlConnectorConfig.DATABASE_WHITELIST, REGRESSION_DATABASE.getDatabaseName())
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, REGRESSION_DATABASE.qualifiedTableName(tableName))
+                .with(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, REGRESSION_DATABASE.getDatabaseName())
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, REGRESSION_DATABASE.qualifiedTableName(tableName))
                 .build();
         Filters filters = new Filters.Builder(config).build();
         context = new MySqlTaskContext(config, filters);
@@ -484,6 +532,7 @@ public class BinlogReaderIT {
 
     @Test
     @FixFor("DBZ-1208")
+    @SkipWhenDatabaseVersion(check = LESS_THAN_OR_EQUAL, major = 5, minor = 6, reason = "MySQL 5.6 does not support SSL")
     public void shouldAcceptTls12() {
         final UniqueDatabase REGRESSION_DATABASE = new UniqueDatabase("logical_server_name", "regression_test")
                 .withDbHistoryPath(DB_HISTORY_PATH);

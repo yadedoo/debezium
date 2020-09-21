@@ -5,12 +5,14 @@
  */
 package io.debezium.testing.openshift.tools.kafka;
 
+import static io.debezium.testing.openshift.tools.WaitConditions.scaled;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.testing.openshift.tools.OpenShiftUtils;
+import io.debezium.testing.openshift.tools.WaitConditions;
 import io.debezium.testing.openshift.tools.YAML;
 import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.api.model.Secret;
@@ -26,8 +28,6 @@ import io.strimzi.api.kafka.model.DoneableKafkaConnect;
 import io.strimzi.api.kafka.model.Kafka;
 import io.strimzi.api.kafka.model.KafkaConnect;
 import io.strimzi.api.kafka.model.KafkaConnectBuilder;
-import io.strimzi.api.kafka.model.status.HasStatus;
-import io.strimzi.api.kafka.model.status.Status;
 
 import okhttp3.OkHttpClient;
 
@@ -103,16 +103,11 @@ public class KafkaDeployer {
     }
 
     public Kafka waitForKafkaCluster(String name) throws InterruptedException {
-        return kafkaOperation().withName(name).waitUntilCondition(this::waitForReadyStatus, 5, MINUTES);
+        return kafkaOperation().withName(name).waitUntilCondition(WaitConditions::kafkaReadyCondition, scaled(5), MINUTES);
     }
 
     public KafkaConnect waitForConnectCluster(String name) throws InterruptedException {
-        return kafkaConnectOperation().withName(name).waitUntilCondition(this::waitForReadyStatus, 5, MINUTES);
-    }
-
-    private <T extends Status> boolean waitForReadyStatus(HasStatus<T> kc) {
-        return kc.getStatus() != null &&
-                kc.getStatus().getConditions().stream().anyMatch(c -> c.getType().equalsIgnoreCase("Ready") && c.getStatus().equalsIgnoreCase("True"));
+        return kafkaConnectOperation().withName(name).waitUntilCondition(WaitConditions::kafkaReadyCondition, scaled(5), MINUTES);
     }
 
     /**

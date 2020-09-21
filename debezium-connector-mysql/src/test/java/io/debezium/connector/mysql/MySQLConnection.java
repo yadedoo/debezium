@@ -21,7 +21,9 @@ import io.debezium.jdbc.JdbcConnection;
 public class MySQLConnection extends JdbcConnection {
 
     public enum MySqlVersion {
-        MYSQL_5,
+        MYSQL_5_5,
+        MYSQL_5_6,
+        MYSQL_5_7,
         MYSQL_8;
     }
 
@@ -74,6 +76,32 @@ public class MySQLConnection extends JdbcConnection {
                 .build());
     }
 
+    /**
+     * Obtain whether the database source is MySQL 5.x or not.
+     *
+     * @return true if the database version is 5.x; otherwise false.
+     */
+    public static boolean isMySQL5() {
+        switch (forTestDatabase("mysql").getMySqlVersion()) {
+            case MYSQL_5_5:
+            case MYSQL_5_6:
+            case MYSQL_5_7:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Obtain whether the database source is the Percona Server fork.
+     *
+     * @return true if the database is Percona Server; otherwise false.
+     */
+    public static boolean isPerconaServer() {
+        String comment = forTestDatabase("mysql").getMySqlVersionComment();
+        return comment.startsWith("Percona");
+    }
+
     protected static void addDefaults(Configuration.Builder builder) {
         builder.withDefault(JdbcConfiguration.HOSTNAME, "localhost")
                 .withDefault(JdbcConfiguration.PORT, 3306)
@@ -94,21 +122,53 @@ public class MySQLConnection extends JdbcConnection {
 
     public MySqlVersion getMySqlVersion() {
         if (mySqlVersion == null) {
-            String versionString;
-            try {
-                versionString = connect().queryAndMap("SHOW GLOBAL VARIABLES LIKE 'version'", rs -> {
-                    rs.next();
-                    return rs.getString(2);
-                });
-
-                mySqlVersion = versionString.startsWith("8.") ? MySqlVersion.MYSQL_8 : MySqlVersion.MYSQL_5;
+            final String versionString = getMySqlVersionString();
+            if (versionString.startsWith("8.")) {
+                mySqlVersion = MySqlVersion.MYSQL_8;
             }
-            catch (SQLException e) {
-                throw new IllegalStateException("Couldn't obtain MySQL Server version", e);
+            else if (versionString.startsWith("5.5")) {
+                mySqlVersion = MySqlVersion.MYSQL_5_5;
+            }
+            else if (versionString.startsWith("5.6")) {
+                mySqlVersion = MySqlVersion.MYSQL_5_6;
+            }
+            else if (versionString.startsWith("5.7")) {
+                mySqlVersion = MySqlVersion.MYSQL_5_7;
+            }
+            else {
+                throw new IllegalStateException("Couldn't resolve MySQL Server version");
             }
         }
 
         return mySqlVersion;
+    }
+
+    public String getMySqlVersionString() {
+        String versionString;
+        try {
+            versionString = connect().queryAndMap("SHOW GLOBAL VARIABLES LIKE 'version'", rs -> {
+                rs.next();
+                return rs.getString(2);
+            });
+        }
+        catch (SQLException e) {
+            throw new IllegalStateException("Couldn't obtain MySQL Server version", e);
+        }
+        return versionString;
+    }
+
+    public String getMySqlVersionComment() {
+        String versionString;
+        try {
+            versionString = connect().queryAndMap("SHOW GLOBAL VARIABLES LIKE 'version_comment'", rs -> {
+                rs.next();
+                return rs.getString(2);
+            });
+        }
+        catch (SQLException e) {
+            throw new IllegalStateException("Couldn't obtain MySQL Server version comment", e);
+        }
+        return versionString;
     }
 
     public DatabaseDifferences databaseAsserts() {

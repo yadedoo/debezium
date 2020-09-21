@@ -18,12 +18,14 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.data.Envelope;
 import io.debezium.function.BlockingConsumer;
+import io.debezium.relational.RelationalChangeRecordEmitter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
@@ -267,9 +269,9 @@ public class RecordMakers {
                     throws InterruptedException {
                 int count = 0;
                 validateColumnCount(tableSchema, after);
-                Object key = tableSchema.keyFromColumnData(after);
+                Object newkey = tableSchema.keyFromColumnData(after);
                 Struct valueAfter = tableSchema.valueFromColumnData(after);
-                if (valueAfter != null || key != null) {
+                if (valueAfter != null || newkey != null) {
                     Object oldKey = tableSchema.keyFromColumnData(before);
                     Struct valueBefore = tableSchema.valueFromColumnData(before);
                     Schema keySchema = tableSchema.keySchema();
@@ -277,12 +279,16 @@ public class RecordMakers {
                     Map<String, Object> offset = source.offsetForRow(rowNumber, numberOfRows);
                     source.tableEvent(id);
                     Struct origin = source.struct();
-                    if (key != null && !Objects.equals(key, oldKey)) {
+                    if (newkey != null && !Objects.equals(newkey, oldKey)) {
                         // The key has changed, so we need to deal with both the new key and old key.
                         // Consumers may push the events into a system that won't allow both records to exist at the same time,
                         // so we first want to send the delete event for the old key...
+
+                        ConnectHeaders headers = new ConnectHeaders();
+                        headers.add(RelationalChangeRecordEmitter.PK_UPDATE_NEWKEY_FIELD, newkey, keySchema);
+
                         SourceRecord record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
-                                keySchema, oldKey, envelope.schema(), envelope.delete(valueBefore, origin, ts));
+                                keySchema, oldKey, envelope.schema(), envelope.delete(valueBefore, origin, ts), null, headers);
                         consumer.accept(record);
                         ++count;
 
@@ -293,16 +299,19 @@ public class RecordMakers {
                             ++count;
                         }
 
+                        headers = new ConnectHeaders();
+                        headers.add(RelationalChangeRecordEmitter.PK_UPDATE_OLDKEY_FIELD, oldKey, keySchema);
+
                         // And finally send the create event ...
                         record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
-                                keySchema, key, envelope.schema(), envelope.create(valueAfter, origin, ts));
+                                keySchema, newkey, envelope.schema(), envelope.create(valueAfter, origin, ts), null, headers);
                         consumer.accept(record);
                         ++count;
                     }
                     else {
                         // The key has not changed, so a simple update is fine ...
                         SourceRecord record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
-                                keySchema, key, envelope.schema(), envelope.update(valueBefore, valueAfter, origin, ts));
+                                keySchema, newkey, envelope.schema(), envelope.update(valueBefore, valueAfter, origin, ts));
                         consumer.accept(record);
                         ++count;
                     }

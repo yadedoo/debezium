@@ -5,8 +5,6 @@
  */
 package io.debezium.connector.sqlserver;
 
-import static org.fest.assertions.Assertions.assertThat;
-
 import java.sql.SQLException;
 import java.util.concurrent.TimeUnit;
 
@@ -41,11 +39,10 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         connection = TestHelper.testConnection();
         connection.execute(
                 "CREATE TABLE tablea (id int primary key, cola varchar(30))",
-                "CREATE TABLE tableb (id int primary key, colb varchar(30))",
+                "CREATE TABLE tableb (id int primary key, colb BIGINT NOT NULL)",
                 "CREATE TABLE tablec (id int primary key, colc varchar(30))");
         TestHelper.enableTableCdc(connection, "tablea");
         TestHelper.enableTableCdc(connection, "tableb");
-        connection.execute("ALTER TABLE dbo.tableb ADD colb2 INT");
 
         initializeConnectorTestFramework();
         Testing.Files.delete(TestHelper.DB_HISTORY_PATH);
@@ -72,18 +69,27 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
         TestHelper.waitForSnapshotToBeCompleted();
 
+        // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
+        // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
+        connection.execute("ALTER TABLE dbo.tableb ALTER COLUMN colb varchar(30)");
+
         for (int i = 0; i < RECORDS_PER_TABLE; i++) {
             final int id = ID_START_1 + i;
             connection.execute(
                     "INSERT INTO tablea VALUES(" + id + ", 'a')");
             connection.execute(
-                    "INSERT INTO tableb VALUES(" + id + ", 'b', 2)");
+                    "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
         SourceRecords records = consumeRecordsByTopic(RECORDS_PER_TABLE);
         Assertions.assertThat(records.recordsForTopic("server1.dbo.tablea")).hasSize(RECORDS_PER_TABLE);
         Assertions.assertThat(records.recordsForTopic("server1.dbo.tableb")).isNull();
-        assertThat(logInterceptor.containsWarnMessage("Error while processing event at offset {")).isTrue();
+
+        Awaitility.await()
+                .alias("Found warning message in logs")
+                .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
+                    return logInterceptor.containsWarnMessage("Error while processing event at offset {");
+                });
     }
 
     @Test
@@ -99,12 +105,16 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
         TestHelper.waitForSnapshotToBeCompleted();
 
+        // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
+        // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
+        connection.execute("ALTER TABLE dbo.tableb ALTER COLUMN colb varchar(30)");
+
         for (int i = 0; i < RECORDS_PER_TABLE; i++) {
             final int id = ID_START_1 + i;
             connection.execute(
                     "INSERT INTO tablea VALUES(" + id + ", 'a')");
             connection.execute(
-                    "INSERT INTO tableb VALUES(" + id + ", 'b', 2)");
+                    "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
         SourceRecords records = consumeRecordsByTopic(RECORDS_PER_TABLE);
@@ -125,19 +135,25 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
         TestHelper.waitForSnapshotToBeCompleted();
 
+        // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
+        // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
+        connection.execute("ALTER TABLE dbo.tableb ALTER COLUMN colb varchar(30)");
+
         for (int i = 0; i < RECORDS_PER_TABLE; i++) {
             final int id = ID_START_1 + i;
             connection.execute(
                     "INSERT INTO tablea VALUES(" + id + ", 'a')");
             connection.execute(
-                    "INSERT INTO tableb VALUES(" + id + ", 'b', 2)");
+                    "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
         SourceRecords records = consumeRecordsByTopic(1);
         Assertions.assertThat(records.recordsForTopic("server1.dbo.tablea")).hasSize(1);
-        assertThat(logInterceptor.containsStacktraceElement("Error while processing event at offset {")).isTrue();
-        Awaitility.await().atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
-            return !engine.isRunning();
-        });
+        Awaitility.await()
+                .alias("Found warning message in logs")
+                .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
+                    boolean foundErrorMessageInLogs = logInterceptor.containsStacktraceElement("Error while processing event at offset {");
+                    return foundErrorMessageInLogs && !engine.isRunning();
+                });
     }
 }

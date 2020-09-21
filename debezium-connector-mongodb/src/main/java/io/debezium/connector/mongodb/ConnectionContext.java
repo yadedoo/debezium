@@ -63,6 +63,10 @@ public class ConnectionContext implements AutoCloseable {
         final boolean useSSL = config.getBoolean(MongoDbConnectorConfig.SSL_ENABLED);
         final boolean sslAllowInvalidHostnames = config.getBoolean(MongoDbConnectorConfig.SSL_ALLOW_INVALID_HOSTNAMES);
 
+        final int connectTimeoutMs = config.getInteger(MongoDbConnectorConfig.CONNECT_TIMEOUT_MS);
+        final int socketTimeoutMs = config.getInteger(MongoDbConnectorConfig.SOCKET_TIMEOUT_MS);
+        final int serverSelectionTimeoutMs = config.getInteger(MongoDbConnectorConfig.SERVER_SELECTION_TIMEOUT_MS);
+
         // Set up the client pool so that it ...
         MongoClients.Builder clientBuilder = MongoClients.create();
         if (username != null || password != null) {
@@ -71,6 +75,12 @@ public class ConnectionContext implements AutoCloseable {
         if (useSSL) {
             clientBuilder.options().sslEnabled(true).sslInvalidHostNameAllowed(sslAllowInvalidHostnames);
         }
+
+        clientBuilder.options()
+                .serverSelectionTimeout(serverSelectionTimeoutMs)
+                .socketTimeout(socketTimeoutMs)
+                .connectTimeout(connectTimeoutMs);
+
         pool = clientBuilder.build();
 
         this.replicaSets = ReplicaSets.parse(hosts());
@@ -132,8 +142,14 @@ public class ConnectionContext implements AutoCloseable {
         return config.getString(MongoDbConnectorConfig.HOSTS);
     }
 
-    public int pollPeriodInSeconds() {
-        return config.getInteger(MongoDbConnectorConfig.POLL_INTERVAL_SEC);
+    public Duration pollInterval() {
+        if (config.hasKey(MongoDbConnectorConfig.MONGODB_POLL_INTERVAL_MS.name())) {
+            return Duration.ofMillis(config.getLong(MongoDbConnectorConfig.MONGODB_POLL_INTERVAL_MS));
+        }
+        if (config.hasKey(MongoDbConnectorConfig.POLL_INTERVAL_SEC.name())) {
+            logger.warn("The option `mongodb.poll.interval.sec` is deprecated. Use `mongodb.poll.interval.ms` instead.");
+        }
+        return Duration.ofSeconds(config.getInteger(MongoDbConnectorConfig.POLL_INTERVAL_SEC));
     }
 
     public int maxConnectionAttemptsForPrimary() {

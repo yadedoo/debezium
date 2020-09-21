@@ -7,10 +7,10 @@ package io.debezium.embedded;
 
 import org.apache.kafka.connect.source.SourceRecord;
 
-import io.debezium.engine.ChangeEventFormat;
+import io.debezium.engine.format.SerializationFormat;
 
 /**
- * A {@link ChangeEventFormat} defining the {@link SourceRecord} type from Kafka Connect API.
+ * A {@link SerializationFormat} defining the {@link SourceRecord} type from Kafka Connect API.
  */
-public class Connect implements ChangeEventFormat<SourceRecord> {
+public class Connect implements SerializationFormat<SourceRecord> {
 }

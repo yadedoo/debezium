@@ -17,6 +17,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.BitSet;
 import java.util.EnumMap;
@@ -24,6 +25,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -66,11 +69,13 @@ import com.github.shyiko.mysql.binlog.network.SSLSocketFactory;
 import io.debezium.config.CommonConnectorConfig.EventProcessingFailureHandlingMode;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SecureConnectionMode;
 import io.debezium.connector.mysql.RecordMakers.RecordsForTable;
+import io.debezium.data.Envelope.Operation;
 import io.debezium.function.BlockingConsumer;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 import io.debezium.util.ElapsedTimeStrategy;
+import io.debezium.util.Metronome;
 import io.debezium.util.Strings;
 import io.debezium.util.Threads;
 
@@ -84,6 +89,7 @@ public class BinlogReader extends AbstractReader {
 
     private static final long INITIAL_POLL_PERIOD_IN_MILLIS = TimeUnit.SECONDS.toMillis(5);
     private static final long MAX_POLL_PERIOD_IN_MILLIS = TimeUnit.HOURS.toMillis(1);
+    private static final String KEEPALIVE_THREAD_NAME = "blc-keepalive";
 
     private final boolean recordSchemaChangesInSourceRecords;
     private final RecordMakers recordMakers;
@@ -109,6 +115,7 @@ public class BinlogReader extends AbstractReader {
     private Heartbeat heartbeat;
     private MySqlJdbcContext connectionContext;
     private final float heartbeatIntervalFactor = 0.8f;
+    private final Map<String, Thread> binaryLogClientThreads = new ConcurrentHashMap<>(4);
 
     public static class BinlogPosition {
         final String filename;
@@ -201,7 +208,9 @@ public class BinlogReader extends AbstractReader {
         // Set up the log reader ...
         client = new BinaryLogClient(connectionContext.hostname(), connectionContext.port(), connectionContext.username(), connectionContext.password());
         // BinaryLogClient will overwrite thread names later
-        client.setThreadFactory(Threads.threadFactory(MySqlConnector.class, context.getConnectorConfig().getLogicalName(), "binlog-client", false));
+        client.setThreadFactory(
+                Threads.threadFactory(MySqlConnector.class, context.getConnectorConfig().getLogicalName(), "binlog-client", false, false,
+                        x -> binaryLogClientThreads.put(x.getName(), x)));
         client.setServerId(serverId);
         client.setSSLMode(sslModeFor(connectionContext.sslMode()));
         if (connectionContext.sslModeEnabled()) {
@@ -222,6 +231,7 @@ public class BinlogReader extends AbstractReader {
                 : (new EventBuffer(context.bufferSizeForBinlogReader(), this))::add);
 
         client.registerLifecycleListener(new ReaderThreadLifecycleListener());
+        client.registerEventListener(this::onEvent);
         if (logger.isDebugEnabled()) {
             client.registerEventListener(this::logEvent);
         }
@@ -303,6 +313,7 @@ public class BinlogReader extends AbstractReader {
     @Override
     protected void doStart() {
         context.dbSchema().assureNonEmptySchema();
+        Set<Operation> skippedOperations = context.getConnectorConfig().getSkippedOps();
 
         // Register our event handlers ...
         eventHandlers.put(EventType.STOP, this::handleServerStop);
@@ -311,12 +322,22 @@ public class BinlogReader extends AbstractReader {
         eventHandlers.put(EventType.ROTATE, this::handleRotateLogsEvent);
         eventHandlers.put(EventType.TABLE_MAP, this::handleUpdateTableMetadata);
         eventHandlers.put(EventType.QUERY, this::handleQueryEvent);
-        eventHandlers.put(EventType.WRITE_ROWS, this::handleInsert);
-        eventHandlers.put(EventType.UPDATE_ROWS, this::handleUpdate);
-        eventHandlers.put(EventType.DELETE_ROWS, this::handleDelete);
-        eventHandlers.put(EventType.EXT_WRITE_ROWS, this::handleInsert);
-        eventHandlers.put(EventType.EXT_UPDATE_ROWS, this::handleUpdate);
-        eventHandlers.put(EventType.EXT_DELETE_ROWS, this::handleDelete);
+
+        if (!skippedOperations.contains(Operation.CREATE)) {
+            eventHandlers.put(EventType.WRITE_ROWS, this::handleInsert);
+            eventHandlers.put(EventType.EXT_WRITE_ROWS, this::handleInsert);
+        }
+
+        if (!skippedOperations.contains(Operation.UPDATE)) {
+            eventHandlers.put(EventType.UPDATE_ROWS, this::handleUpdate);
+            eventHandlers.put(EventType.EXT_UPDATE_ROWS, this::handleUpdate);
+        }
+
+        if (!skippedOperations.contains(Operation.DELETE)) {
+            eventHandlers.put(EventType.DELETE_ROWS, this::handleDelete);
+            eventHandlers.put(EventType.EXT_DELETE_ROWS, this::handleDelete);
+        }
+
         eventHandlers.put(EventType.VIEW_CHANGE, this::viewChange);
         eventHandlers.put(EventType.XA_PREPARE, this::prepareTransaction);
         eventHandlers.put(EventType.XID, this::handleTransactionCompletion);
@@ -384,6 +405,24 @@ public class BinlogReader extends AbstractReader {
             try {
                 logger.debug("Attempting to establish binlog reader connection with timeout of {} ms", timeout);
                 client.connect(timeout);
+                // Need to wait for keepalive thread to be running, otherwise it can be left orphaned
+                // The problem is with timing. When the close is called too early after connect then
+                // the keepalive thread is not terminated
+                if (client.isKeepAlive()) {
+                    logger.info("Waiting for keepalive thread to start");
+                    final Metronome metronome = Metronome.parker(Duration.ofMillis(100), clock);
+                    int waitAttempts = 50;
+                    boolean keepAliveThreadRunning = false;
+                    while (!keepAliveThreadRunning && waitAttempts-- > 0) {
+                        for (Thread t : binaryLogClientThreads.values()) {
+                            if (t.getName().startsWith(KEEPALIVE_THREAD_NAME) && t.isAlive()) {
+                                logger.info("Keepalive thread is running");
+                                keepAliveThreadRunning = true;
+                            }
+                        }
+                        metronome.pause();
+                    }
+                }
             }
             catch (TimeoutException e) {
                 // If the client thread is interrupted *before* the client could connect, the client throws a timeout exception
@@ -481,6 +520,31 @@ public class BinlogReader extends AbstractReader {
         logger.trace("Received event: {}", event);
     }
 
+    protected void onEvent(Event event) {
+        long ts = 0;
+
+        if (event.getHeader().getEventType() == EventType.HEARTBEAT) {
+            // HEARTBEAT events have no timestamp but are fired only when
+            // there is no traffic on the connection which means we are caught-up
+            // https://dev.mysql.com/doc/internals/en/heartbeat-event.html
+            metrics.setMilliSecondsBehindSource(ts);
+            return;
+        }
+
+        // MySQL has seconds resolution but mysql-binlog-connector-java returns
+        // a value in milliseconds
+        long eventTs = event.getHeader().getTimestamp();
+
+        if (eventTs == 0) {
+            logger.trace("Received unexpected event with 0 timestamp: {}", event);
+            return;
+        }
+
+        ts = clock.currentTimeInMillis() - eventTs;
+        logger.trace("Current milliseconds behind source: {} ms", ts);
+        metrics.setMilliSecondsBehindSource(ts);
+    }
+
     protected void ignoreEvent(Event event) {
         logger.trace("Ignoring event due to missing handler: {}", event);
     }
@@ -493,8 +557,12 @@ public class BinlogReader extends AbstractReader {
         // Update the source offset info. Note that the client returns the value in *milliseconds*, even though the binlog
         // contains only *seconds* precision ...
         EventHeader eventHeader = event.getHeader();
-        source.setBinlogTimestampSeconds(eventHeader.getTimestamp() / 1000L); // client returns milliseconds, but only second
-                                                                              // precision
+        if (!eventHeader.getEventType().equals(EventType.HEARTBEAT)) {
+            // HEARTBEAT events have no timestamp; only set the timestamp if the event is not a HEARTBEAT
+            source.setBinlogTimestampSeconds(eventHeader.getTimestamp() / 1000L); // client returns milliseconds,
+                                                                                  // but only second precision
+        }
+
         source.setBinlogServerId(eventHeader.getServerId());
         EventType eventType = eventHeader.getEventType();
         if (eventType == EventType.ROTATE) {
@@ -568,7 +636,7 @@ public class BinlogReader extends AbstractReader {
     }
 
     /**
-     * Handle the supplied event that is sent by a master to a slave to let the slave know that the master is still alive. Not
+     * Handle the supplied event that is sent by a primary to a replica to let the replica know that the primary is still alive. Not
      * written to a binary log.
      *
      * @param event the server stopped event to be processed; may not be null
@@ -578,8 +646,8 @@ public class BinlogReader extends AbstractReader {
     }
 
     /**
-     * Handle the supplied event that signals that an out of the ordinary event that occurred on the master. It notifies the slave
-     * that something happened on the master that might cause data to be in an inconsistent state.
+     * Handle the supplied event that signals that an out of the ordinary event that occurred on the master. It notifies the replica
+     * that something happened on the primary that might cause data to be in an inconsistent state.
      *
      * @param event the server stopped event to be processed; may not be null
      */

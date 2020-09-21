@@ -5,21 +5,23 @@
  */
 package io.debezium.testing.openshift.tools.kafka;
 
+import static io.debezium.testing.openshift.tools.WaitConditions.scaled;
 import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.awaitility.Awaitility.await;
 
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.testing.openshift.tools.OpenShiftUtils;
+import io.debezium.testing.openshift.tools.WaitConditions;
+import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.EnvVar;
 import io.fabric8.kubernetes.api.model.LocalObjectReference;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
-import io.fabric8.kubernetes.api.model.apps.DeploymentCondition;
-import io.fabric8.kubernetes.api.model.apps.DeploymentStatus;
 import io.fabric8.openshift.client.OpenShiftClient;
 
 /**
@@ -44,48 +46,94 @@ public class OperatorController {
     }
 
     /**
+     * Disables Strimzi cluster operator by scaling it to ZERO
+     */
+    public void disable() {
+        LOGGER.info("Disabling Operator");
+        setNumberOfReplicas(0);
+        operator = ocp.apps().deployments().inNamespace(project).withName(name).createOrReplace(operator);
+        await()
+                .atMost(scaled(30), SECONDS)
+                .pollDelay(5, SECONDS)
+                .pollInterval(3, SECONDS)
+                .until(() -> ocp.pods().inNamespace(project).withLabel("strimzi.io/kind", "cluster-operator").list().getItems().isEmpty());
+    }
+
+    /**
+     * Enables Strimzi cluster operator by scaling it to ONE
+     * @throws InterruptedException
+     */
+    public void enable() throws InterruptedException {
+        LOGGER.info("Enabling Operator");
+        setNumberOfReplicas(1);
+        updateOperator();
+    }
+
+    /**
+     * Sets number of replicas
+     * @param replicas number of replicas
+     */
+    public void setNumberOfReplicas(int replicas) {
+        LOGGER.info("Scaling Operator replicas to " + replicas);
+        operator.getSpec().setReplicas(replicas);
+    }
+
+    /**
+     * Semantic shortcut for calling {@link #setNumberOfReplicas(int)} with {@code 1} as value
+     */
+    public void setSingleReplica() {
+        setNumberOfReplicas(1);
+    }
+
+    /**
      * Sets image pull secret for operator's {@link Deployment} resource
      * @param secret name of the secret
-     * @return {@link Deployment} resource of the operator
      */
-    public Deployment setImagePullSecret(String secret) {
+    public void setImagePullSecret(String secret) {
         LOGGER.info("Using " + secret + " as image pull secret for deployment '" + name + "'");
         List<LocalObjectReference> pullSecrets = Collections.singletonList(new LocalObjectReference(secret));
         ocpUtils.ensureHasPullSecret(operator, secret);
-        return operator;
     }
 
     /**
      * Sets image pull secrets for operands by setting STRIMZI_IMAGE_PULL_SECRETS environment variable
-     * @return {@link Deployment} resource of the operator
      */
-    public Deployment setOperandImagePullSecrets(String names) {
-        return setEnvVar("STRIMZI_IMAGE_PULL_SECRETS", names);
+    public void setOperandImagePullSecrets(String names) {
+        setEnvVar("STRIMZI_IMAGE_PULL_SECRETS", names);
     }
 
     /**
      * Sets operator log level
      * @param level log leel
-     * @return {@link Deployment} resource of the operator
      */
-    public Deployment setLogLevel(String level) {
-        return setEnvVar("STRIMZI_LOG_LEVEL", level);
+    public void setLogLevel(String level) {
+        setEnvVar("STRIMZI_LOG_LEVEL", level);
     }
 
-    public Deployment setAlwaysPullPolicy() {
-        return setEnvVar("STRIMZI_IMAGE_PULL_POLICY", "Always");
+    /**
+     * Sets pull policy of the operator to 'Always'
+     */
+    public void setAlwaysPullPolicy() {
+        LOGGER.info("Using 'Always' pull policy for all containers of deployment " + name + "'");
+        List<Container> containers = operator.getSpec().getTemplate().getSpec().getContainers();
+        containers.forEach(c -> c.setImagePullPolicy("Always"));
+    }
+
+    /**
+     * Sets pull policy of operands to 'Always'
+     */
+    public void setOperandAlwaysPullPolicy() {
+        setEnvVar("STRIMZI_IMAGE_PULL_POLICY", "Always");
     }
 
     /**
      * Set environment variable on all containers of operator's deployment
      * @param name variable's name
      * @param val variable's value
-     * @return {@link Deployment} resource of the operator
      */
-    public Deployment setEnvVar(String name, String val) {
-        LOGGER.info("Setting variable " + name + "=" + val + " on deployment '" + name + "'");
+    public void setEnvVar(String name, String val) {
+        LOGGER.info("Setting variable " + name + "='" + val + "' on deployment '" + this.name + "'");
         ocpUtils.ensureHasEnv(operator, new EnvVar(name, val, null));
-        return operator;
     }
 
     /**
@@ -94,17 +142,12 @@ public class OperatorController {
      */
     public Deployment updateOperator() throws InterruptedException {
         operator = ocp.apps().deployments().inNamespace(project).createOrReplace(operator);
-        operator = ocp.apps().deployments().inNamespace(project).withName(name)
-                .waitUntilCondition(this::waitForAvailable, 5, MINUTES);
+        operator = waitForAvailable();
         return operator;
     }
 
-    private boolean waitForAvailable(Deployment resource) {
-        DeploymentStatus status = resource.getStatus();
-        if (status == null) {
-            return false;
-        }
-        Stream<DeploymentCondition> conditions = status.getConditions().stream();
-        return conditions.anyMatch(c -> c.getType().equalsIgnoreCase("Available") && c.getStatus().equalsIgnoreCase("True"));
+    private Deployment waitForAvailable() throws InterruptedException {
+        return ocp.apps().deployments().inNamespace(project).withName(name).waitUntilCondition(WaitConditions::deploymentAvailableCondition, scaled(5), MINUTES);
     }
+
 }

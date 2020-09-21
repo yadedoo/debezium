@@ -47,6 +47,8 @@ public class SimpleSourceConnectorOutputTest extends ConnectorOutputTest {
      */
     @Test
     public void shouldGenerateExpected() throws Exception {
+        // The test connector is blocking so we need to execute interrupt faster
+        System.setProperty("debezium.embedded.shutdown.pause.before.interrupt.ms", "5000");
         int numBatches = 1;
         int numRecordsPerBatch = 10;
         // Testing.Debug.enable();
@@ -83,6 +85,7 @@ public class SimpleSourceConnectorOutputTest extends ConnectorOutputTest {
         // Run the connector again (with fresh offsets) to read the expected results ...
         cleanOffsetStorage();
         runConnector("gen-expected", dir);
+        System.clearProperty("debezium.embedded.shutdown.pause.before.interrupt.ms");
     }
 
     /**
@@ -120,6 +123,15 @@ public class SimpleSourceConnectorOutputTest extends ConnectorOutputTest {
     public void shouldRunConnectorFromFilesInOneStepWithTimestamps() {
         // Testing.Debug.enable();
         runConnector("simple-test-d", "src/test/resources/simple/test/d");
+    }
+
+    /**
+     * Run the connector and verify that {@link org.apache.kafka.connect.errors.RetriableException} is handled.
+     */
+    @Test
+    public void shouldRecoverFromRetriableException() {
+        // Testing.Debug.enable();
+        runConnector("simple-test-e", "src/test/resources/simple/test/e");
     }
 
     protected void writeConfigurationFileWithDefaultName(Path dir, Properties props) throws IOException {

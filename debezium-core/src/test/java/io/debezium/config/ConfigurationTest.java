@@ -5,9 +5,14 @@
  */
 package io.debezium.config;
 
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST;
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.COLUMN_EXCLUDE_LIST;
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.COLUMN_INCLUDE_LIST;
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.COLUMN_WHITELIST;
 import static io.debezium.relational.RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS;
 import static org.fest.assertions.Assertions.assertThat;
 
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
@@ -18,6 +23,7 @@ import org.junit.Test;
 
 import io.debezium.doc.FixFor;
 import io.debezium.function.Predicates;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.history.DatabaseHistory;
 
 /**
@@ -54,6 +60,67 @@ public class ConfigurationTest {
     public void shouldCreateInternalFields() {
         config = Configuration.create().with(Field.createInternal("a"), "a1").build();
         assertThat(config.getString("internal.a")).isEqualTo("a1");
+    }
+
+    @Test
+    @FixFor("DBZ-1962")
+    public void shouldThrowValidationOnDuplicateOldColumnFilterConfigurationOld() {
+        config = Configuration.create()
+                .with(COLUMN_WHITELIST, ".+aa")
+                .with(COLUMN_BLACKLIST, ".+bb")
+                .build();
+
+        List<String> errorMessages = config.validate(Field.setOf(COLUMN_EXCLUDE_LIST)).get(COLUMN_EXCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isNotEmpty();
+        assertThat(errorMessages.get(0)).isEqualTo(RelationalDatabaseConnectorConfig.COLUMN_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG);
+    }
+
+    @Test
+    @FixFor("DBZ-1962")
+    public void shouldThrowValidationOnDuplicateOldColumnFilterConfiguration() {
+        config = Configuration.create()
+                .with(COLUMN_INCLUDE_LIST, ".+aa")
+                .with(COLUMN_EXCLUDE_LIST, ".+bb")
+                .build();
+
+        List<String> errorMessages = config.validate(Field.setOf(COLUMN_EXCLUDE_LIST)).get(COLUMN_EXCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isNotEmpty();
+        assertThat(errorMessages.get(0)).isEqualTo(RelationalDatabaseConnectorConfig.COLUMN_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG);
+    }
+
+    @Test
+    @FixFor("DBZ-1962")
+    public void shouldThrowValidationOnDuplicateColumnFilterConfiguration() {
+        config = Configuration.create()
+                .with("column.include.list", ".+aa")
+                .with("column.exclude.list", ".+bb")
+                .build();
+
+        List<String> errorMessages = config.validate(Field.setOf(COLUMN_EXCLUDE_LIST)).get(COLUMN_EXCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isNotEmpty();
+        assertThat(errorMessages.get(0)).isEqualTo(RelationalDatabaseConnectorConfig.COLUMN_INCLUDE_LIST_ALREADY_SPECIFIED_ERROR_MSG);
+    }
+
+    @Test
+    public void shouldAllowNewColumnFilterIncludeListConfiguration() {
+        config = Configuration.create()
+                .with("column.include.list", ".+aa")
+                .build();
+
+        List<String> errorMessages = config.validate(Field.setOf(COLUMN_EXCLUDE_LIST)).get(COLUMN_EXCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isEmpty();
+        errorMessages = config.validate(Field.setOf(COLUMN_INCLUDE_LIST)).get(COLUMN_INCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isEmpty();
+    }
+
+    @Test
+    public void shouldAllowNewColumnFilterExcludeListConfiguration() {
+        config = Configuration.create()
+                .with("column.exclude.list", ".+bb")
+                .build();
+
+        List<String> errorMessages = config.validate(Field.setOf(COLUMN_EXCLUDE_LIST)).get(COLUMN_EXCLUDE_LIST.name()).errorMessages();
+        assertThat(errorMessages).isEmpty();
     }
 
     @Test

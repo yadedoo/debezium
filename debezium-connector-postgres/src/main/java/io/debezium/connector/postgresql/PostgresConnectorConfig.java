@@ -17,7 +17,7 @@ import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigValue;
 
-import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
@@ -37,7 +37,6 @@ import io.debezium.connector.postgresql.snapshot.InitialSnapshotter;
 import io.debezium.connector.postgresql.snapshot.NeverSnapshotter;
 import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.heartbeat.DatabaseHeartbeatImpl;
-import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
@@ -364,7 +363,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         DECODERBUFS("decoderbufs") {
             @Override
             public MessageDecoder messageDecoder(MessageDecoderConfig config) {
-                return new PgProtoMessageDecoder();
+                return new PgProtoMessageDecoder(config);
             }
 
             @Override
@@ -375,7 +374,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         WAL2JSON_STREAMING("wal2json_streaming") {
             @Override
             public MessageDecoder messageDecoder(MessageDecoderConfig config) {
-                return new StreamingWal2JsonMessageDecoder();
+                return new StreamingWal2JsonMessageDecoder(config);
             }
 
             @Override
@@ -396,7 +395,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         WAL2JSON_RDS_STREAMING("wal2json_rds_streaming") {
             @Override
             public MessageDecoder messageDecoder(MessageDecoderConfig config) {
-                return new StreamingWal2JsonMessageDecoder();
+                return new StreamingWal2JsonMessageDecoder(config);
             }
 
             @Override
@@ -422,7 +421,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         WAL2JSON("wal2json") {
             @Override
             public MessageDecoder messageDecoder(MessageDecoderConfig config) {
-                return new NonStreamingWal2JsonMessageDecoder();
+                return new NonStreamingWal2JsonMessageDecoder(config);
             }
 
             @Override
@@ -443,7 +442,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         WAL2JSON_RDS("wal2json_rds") {
             @Override
             public MessageDecoder messageDecoder(MessageDecoderConfig config) {
-                return new NonStreamingWal2JsonMessageDecoder();
+                return new NonStreamingWal2JsonMessageDecoder(config);
             }
 
             @Override
@@ -556,8 +555,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
     protected static final int DEFAULT_MAX_RETRIES = 6;
     protected static final Duration DEFAULT_RETRY_DELAY = Duration.ofSeconds(10);
 
-    private static final String TABLE_WHITELIST_NAME = "table.whitelist";
-
     public static final Field PLUGIN_NAME = Field.create("plugin.name")
             .withDisplayName("Plugin")
             .withEnum(LogicalDecoder.class, LogicalDecoder.DECODERBUFS)
@@ -594,6 +591,85 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDefault(ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME)
             .withDescription("The name of the Postgres 10+ publication used for streaming changes from a plugin." +
                     "Defaults to '" + ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME + "'");
+
+    public enum AutoCreateMode implements EnumeratedValue {
+        /**
+         * No Publication will be created, it's expected the user
+         * has already created the publication.
+         */
+        DISABLED("disabled"),
+        /**
+         * Enable publication for all tables.
+         */
+        ALL_TABLES("all_tables"),
+        /**
+         * Enable publication on a specific set of tables.
+         */
+        FILTERED("filtered");
+
+        private final String value;
+
+        AutoCreateMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @return the matching option, or null if no match is found
+         */
+        public static AutoCreateMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+            for (AutoCreateMode option : AutoCreateMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value        the configuration property value; may not be null
+         * @param defaultValue the default value; may be null
+         * @return the matching option, or null if no match is found and the non-null default is invalid
+         */
+        public static AutoCreateMode parse(String value, String defaultValue) {
+            AutoCreateMode mode = parse(value);
+            if (mode == null && defaultValue != null) {
+                mode = parse(defaultValue);
+            }
+            return mode;
+        }
+    }
+
+    public static final Field PUBLICATION_AUTOCREATE_MODE = Field.create("publication.autocreate.mode")
+            .withDisplayName("Publication Auto Create Mode")
+            .withEnum(AutoCreateMode.class, AutoCreateMode.ALL_TABLES)
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription(
+                    "Applies only when streaming changes using pgoutput." +
+                            "Determine how creation of a publication should work, the default is all_tables." +
+                            "DISABLED - The connector will not attempt to create a publication at all. The expectation is " +
+                            "that the user has created the publication up-front. If the publication isn't found to exist upon " +
+                            "startup, the connector will throw an exception and stop." +
+                            "ALL_TABLES - If no publication exists, the connector will create a new publication for all tables. " +
+                            "Note this requires that the configured user has access. If the publication already exists, it will be used" +
+                            ". i.e CREATE PUBLICATION <publication_name> FOR ALL TABLES;" +
+                            "FILTERED - If no publication exists, the connector will create a new publication for all those tables matching" +
+                            "the current filter configuration (see table/database include/exclude list properties). If the publication already" +
+                            " exists, it will be used. i.e CREATE PUBLICATION <publication_name> FOR TABLE <tbl1, tbl2, etc>");
 
     public static final Field STREAM_PARAMS = Field.create("slot.stream.params")
             .withDisplayName("Optional parameters to pass to the logical decoder when the stream is started.")
@@ -717,44 +793,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDescription(
                     "A name of class to that creates SSL Sockets. Use org.postgresql.ssl.NonValidatingFactory to disable SSL validation in development environments");
 
-    /**
-     * A comma-separated list of regular expressions that match the fully-qualified names of tables to be monitored.
-     * Fully-qualified names for tables are of the form {@code <schemaName>.<tableName>} or
-     * {@code <databaseName>.<schemaName>.<tableName>}. May not be used with {@link #TABLE_BLACKLIST}, and superseded by schema
-     * inclusions/exclusions.
-     */
-    public static final Field TABLE_WHITELIST = Field.create(TABLE_WHITELIST_NAME)
-            .withDisplayName("Tables")
-            .withType(Type.LIST)
-            .withWidth(Width.LONG)
-            .withImportance(Importance.HIGH)
-            .withValidation(Field::isListOfRegex)
-            .withDescription("The tables for which changes are to be captured");
-
-    /**
-     * A comma-separated list of regular expressions that match the fully-qualified names of tables to be excluded from
-     * monitoring. Fully-qualified names for tables are of the form {@code <schemaName>.<tableName>} or
-     * {@code <databaseName>.<schemaName>.<tableName>}. May not be used with {@link #TABLE_WHITELIST}.
-     */
-    public static final Field TABLE_BLACKLIST = Field.create("table.blacklist")
-            .withDisplayName("Exclude Tables")
-            .withType(Type.STRING)
-            .withWidth(Width.LONG)
-            .withImportance(Importance.MEDIUM)
-            .withValidation(Field::isListOfRegex, PostgresConnectorConfig::validateTableBlacklist)
-            .withInvisibleRecommender();
-
-    // TODO author=Horia Chiorean date=25/10/2016 description=PG 9.x logical decoding does not support schema changes
-    public static final Field INCLUDE_SCHEMA_CHANGES = Field.create("include.schema.changes")
-            .withDisplayName("Include database schema changes")
-            .withType(Type.BOOLEAN)
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("Whether the connector should publish changes in the database schema to a Kafka topic with "
-                    + "the same name as the database server name."
-                    + "The default is 'false' because atm this feature is not supported by Postgres logical decoding")
-            .withDefault(false);
-
     public static final Field SNAPSHOT_MODE = Field.create("snapshot.mode")
             .withDisplayName("Snapshot mode")
             .withEnum(SnapshotMode.class, SnapshotMode.INITIAL)
@@ -865,55 +903,15 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDefault("__debezium_unavailable_value")
             .withImportance(Importance.MEDIUM)
             .withDescription("Specify the constant that will be provided by Debezium to indicate that " +
-                    "the original value is a toasted value not provided by the database." +
+                    "the original value is a toasted value not provided by the database. " +
                     "If starts with 'hex:' prefix it is expected that the rest of the string repesents hexadecimally encoded octets.");
-
-    /**
-     * Method that generates a Field for specifying that string columns whose names match a set of regular expressions should
-     * have their values masked by the specified number of asterisk ('*') characters.
-     *
-     * @param length the number of asterisks that should appear in place of the column's string values written in source records;
-     *               must be positive
-     * @return the field; never null
-     */
-    public static final Field MASK_COLUMN(int length) {
-        if (length <= 0) {
-            throw new IllegalArgumentException("The mask length must be positive");
-        }
-        return Field.create("column.mask.with." + length + ".chars")
-                .withValidation(Field::isInteger)
-                .withDescription("A comma-separated list of regular expressions matching fully-qualified names of columns that should "
-                        + "be masked with " + length + " asterisk ('*') characters.");
-    }
-
-    /**
-     * The set of {@link Field}s defined as part of this configuration.
-     */
-    public static Field.Set ALL_FIELDS = Field.setOf(PLUGIN_NAME, SLOT_NAME, DROP_SLOT_ON_STOP, PUBLICATION_NAME, STREAM_PARAMS, MAX_RETRIES, RETRY_DELAY_MS,
-            DATABASE_NAME, USER, PASSWORD, HOSTNAME, PORT, ON_CONNECT_STATEMENTS, RelationalDatabaseConnectorConfig.SERVER_NAME,
-            CommonConnectorConfig.MAX_BATCH_SIZE,
-            CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.POLL_INTERVAL_MS,
-            CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-            Heartbeat.HEARTBEAT_INTERVAL,
-            Heartbeat.HEARTBEAT_TOPICS_PREFIX,
-            DatabaseHeartbeatImpl.HEARTBEAT_ACTION_QUERY,
-            SCHEMA_WHITELIST,
-            SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST, MSG_KEY_COLUMNS,
-            COLUMN_BLACKLIST, SNAPSHOT_MODE, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE,
-            INTERVAL_HANDLING_MODE, SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD,
-            SSL_ROOT_CERT, SSL_CLIENT_KEY, RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS, SSL_SOCKET_FACTORY,
-            STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, INCLUDE_UNKNOWN_DATATYPES,
-            RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SCHEMA_REFRESH_MODE, CommonConnectorConfig.TOMBSTONES_ON_DELETE,
-            CommonConnectorConfig.PROVIDE_TRANSACTION_METADATA,
-            XMIN_FETCH_INTERVAL, TOASTED_VALUE_PLACEHOLDER, SNAPSHOT_MODE_CLASS, CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
-            CommonConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE);
 
     private final HStoreHandlingMode hStoreHandlingMode;
     private final IntervalHandlingMode intervalHandlingMode;
     private final SnapshotMode snapshotMode;
     private final SchemaRefreshMode schemaRefreshMode;
 
-    protected PostgresConnectorConfig(Configuration config) {
+    public PostgresConnectorConfig(Configuration config) {
         super(
                 config,
                 config.getString(RelationalDatabaseConnectorConfig.SERVER_NAME),
@@ -922,8 +920,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                 DEFAULT_SNAPSHOT_FETCH_SIZE);
 
         String hstoreHandlingModeStr = config.getString(PostgresConnectorConfig.HSTORE_HANDLING_MODE);
-        HStoreHandlingMode hStoreHandlingMode = HStoreHandlingMode.parse(hstoreHandlingModeStr);
-        this.hStoreHandlingMode = hStoreHandlingMode;
+        this.hStoreHandlingMode = HStoreHandlingMode.parse(hstoreHandlingModeStr);
         this.intervalHandlingMode = IntervalHandlingMode.parse(config.getString(PostgresConnectorConfig.INTERVAL_HANDLING_MODE));
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE));
         this.schemaRefreshMode = SchemaRefreshMode.parse(config.getString(SCHEMA_REFRESH_MODE));
@@ -937,7 +934,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return getConfig().getInteger(PORT);
     }
 
-    protected String databaseName() {
+    public String databaseName() {
         return getConfig().getString(DATABASE_NAME);
     }
 
@@ -959,6 +956,10 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     protected String publicationName() {
         return getConfig().getString(PUBLICATION_NAME);
+    }
+
+    protected AutoCreateMode publicationAutocreateMode() {
+        return AutoCreateMode.parse(getConfig().getString(PUBLICATION_AUTOCREATE_MODE));
     }
 
     protected String streamParams() {
@@ -993,28 +994,8 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return getConfig().subset(DATABASE_CONFIG_PREFIX, true);
     }
 
-    protected Map<String, ConfigValue> validate() {
+    public Map<String, ConfigValue> validate() {
         return getConfig().validate(ALL_FIELDS);
-    }
-
-    protected String schemaBlacklist() {
-        return getConfig().getString(SCHEMA_BLACKLIST);
-    }
-
-    protected String schemaWhitelist() {
-        return getConfig().getString(SCHEMA_WHITELIST);
-    }
-
-    protected String tableBlacklist() {
-        return getConfig().getString(TABLE_BLACKLIST);
-    }
-
-    protected String tableWhitelist() {
-        return getConfig().getString(TABLE_WHITELIST);
-    }
-
-    protected String columnBlacklist() {
-        return getConfig().getString(COLUMN_BLACKLIST);
     }
 
     protected Snapshotter getSnapshotter() {
@@ -1047,33 +1028,53 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         }
     }
 
-    protected static ConfigDef configDef() {
-        ConfigDef config = new ConfigDef();
-        Field.group(config, "Postgres", SLOT_NAME, PUBLICATION_NAME, PLUGIN_NAME, RelationalDatabaseConnectorConfig.SERVER_NAME, DATABASE_NAME, HOSTNAME, PORT,
-                USER, PASSWORD, ON_CONNECT_STATEMENTS, SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD, SSL_ROOT_CERT, SSL_CLIENT_KEY,
-                DROP_SLOT_ON_STOP, STREAM_PARAMS, MAX_RETRIES, RETRY_DELAY_MS, SSL_SOCKET_FACTORY, STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, XMIN_FETCH_INTERVAL);
-        Field.group(config, "Events", SCHEMA_WHITELIST, SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
-                COLUMN_BLACKLIST, MSG_KEY_COLUMNS, INCLUDE_UNKNOWN_DATATYPES, SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
-                CommonConnectorConfig.TOMBSTONES_ON_DELETE, CommonConnectorConfig.PROVIDE_TRANSACTION_METADATA, Heartbeat.HEARTBEAT_INTERVAL,
-                Heartbeat.HEARTBEAT_TOPICS_PREFIX, DatabaseHeartbeatImpl.HEARTBEAT_ACTION_QUERY,
-                CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
-                TOASTED_VALUE_PLACEHOLDER, CommonConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE);
-        Field.group(config, "Connector", CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.MAX_QUEUE_SIZE,
-                CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-                SNAPSHOT_MODE, RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE,
-                INTERVAL_HANDLING_MODE, SCHEMA_REFRESH_MODE, SNAPSHOT_MODE_CLASS);
+    private static final ConfigDefinition CONFIG_DEFINITION = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
+            .name("Postgres")
+            .type(
+                    HOSTNAME,
+                    PORT,
+                    USER,
+                    PASSWORD,
+                    DATABASE_NAME,
+                    PLUGIN_NAME,
+                    SLOT_NAME,
+                    PUBLICATION_NAME,
+                    PUBLICATION_AUTOCREATE_MODE,
+                    DROP_SLOT_ON_STOP,
+                    STREAM_PARAMS,
+                    ON_CONNECT_STATEMENTS,
+                    SSL_MODE,
+                    SSL_CLIENT_CERT,
+                    SSL_CLIENT_KEY_PASSWORD,
+                    SSL_ROOT_CERT,
+                    SSL_CLIENT_KEY,
+                    MAX_RETRIES,
+                    RETRY_DELAY_MS,
+                    SSL_SOCKET_FACTORY,
+                    STATUS_UPDATE_INTERVAL_MS,
+                    TCP_KEEPALIVE,
+                    XMIN_FETCH_INTERVAL)
+            .events(
+                    INCLUDE_UNKNOWN_DATATYPES,
+                    DatabaseHeartbeatImpl.HEARTBEAT_ACTION_QUERY,
+                    TOASTED_VALUE_PLACEHOLDER)
+            .connector(
+                    SNAPSHOT_MODE,
+                    SNAPSHOT_MODE_CLASS,
+                    HSTORE_HANDLING_MODE,
+                    BINARY_HANDLING_MODE,
+                    INTERVAL_HANDLING_MODE,
+                    SCHEMA_REFRESH_MODE)
+            .excluding(INCLUDE_SCHEMA_CHANGES)
+            .create();
 
-        return config;
-    }
+    /**
+     * The set of {@link Field}s defined as part of this configuration.
+     */
+    public static Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
 
-    private static int validateTableBlacklist(Configuration config, Field field, Field.ValidationOutput problems) {
-        String whitelist = config.getString(TABLE_WHITELIST);
-        String blacklist = config.getString(TABLE_BLACKLIST);
-        if (whitelist != null && blacklist != null) {
-            problems.accept(TABLE_BLACKLIST, blacklist, "Table whitelist is already specified");
-            return 1;
-        }
-        return 0;
+    public static ConfigDef configDef() {
+        return CONFIG_DEFINITION.configDef();
     }
 
     // Source of the validation rules - https://doxygen.postgresql.org/slot_8c.html#afac399f07320b9adfd2c599cf822aaa3
@@ -1092,6 +1093,11 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
     @Override
     public String getContextName() {
         return Module.contextName();
+    }
+
+    @Override
+    public String getConnectorName() {
+        return Module.name();
     }
 
     private static class SystemTablesPredicate implements TableFilter {

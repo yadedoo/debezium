@@ -5,13 +5,16 @@
  */
 package io.debezium.connector.mysql;
 
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -23,6 +26,7 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 
 import io.debezium.config.Configuration;
@@ -32,6 +36,9 @@ import io.debezium.data.KeyValueStore.Collection;
 import io.debezium.data.SchemaChangeHistory;
 import io.debezium.data.VerifyRecord;
 import io.debezium.heartbeat.Heartbeat;
+import io.debezium.jdbc.JdbcConnection;
+import io.debezium.junit.SkipTestRule;
+import io.debezium.junit.SkipWhenDatabaseVersion;
 import io.debezium.relational.history.DatabaseHistory;
 import io.debezium.util.Testing;
 
@@ -39,6 +46,7 @@ import io.debezium.util.Testing;
  * @author Randall Hauch
  *
  */
+@SkipWhenDatabaseVersion(check = LESS_THAN, major = 5, minor = 6, reason = "DDL uses fractional second data types, not supported until MySQL 5.6")
 public class SnapshotReaderIT {
 
     private static final Path DB_HISTORY_PATH = Testing.Files.createTestingPath("file-db-history-snapshot.txt").toAbsolutePath();
@@ -50,6 +58,9 @@ public class SnapshotReaderIT {
     private MySqlTaskContext context;
     private SnapshotReader reader;
     private CountDownLatch completed;
+
+    @Rule
+    public SkipTestRule skipRule = new SkipTestRule();
 
     @Before
     public void beforeEach() {
@@ -216,8 +227,57 @@ public class SnapshotReaderIT {
     }
 
     @Test
+    public void snapshotWithBackupLocksShouldNotWaitForReads() throws Exception {
+        final Builder builder = simpleConfig();
+        builder
+                .with(MySqlConnectorConfig.USER, "cloud")
+                .with(MySqlConnectorConfig.PASSWORD, "cloudpass")
+                .with(MySqlConnectorConfig.SNAPSHOT_LOCKING_MODE, MySqlConnectorConfig.SnapshotLockingMode.MINIMAL_PERCONA);
+
+        config = builder.build();
+        context = new MySqlTaskContext(config, new Filters.Builder(config).build());
+        context.start();
+
+        reader = new SnapshotReader("snapshot", context, true);
+        reader.generateInsertEvents();
+
+        if (!MySQLConnection.isPerconaServer()) {
+            reader.start(); // Start the reader to avoid failure in the afterEach method.
+            return; // Skip these tests for non-Percona flavours of MySQL
+        }
+
+        MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());
+        Thread t = new Thread() {
+            public void run() {
+                try {
+                    JdbcConnection connection = db.connect();
+                    connection.executeWithoutCommitting("SELECT *, SLEEP(20) FROM products_on_hand");
+                }
+                catch (Exception e) {
+                    // Do nothing.
+                }
+            }
+        };
+        t.start();
+
+        // Start the snapshot ...
+        boolean connectException = false;
+        reader.start();
+
+        List<SourceRecord> records = null;
+        try {
+            reader.poll();
+        }
+        catch (org.apache.kafka.connect.errors.ConnectException e) {
+            connectException = true;
+        }
+        t.join();
+        assertFalse(connectException);
+    }
+
+    @Test
     public void shouldCreateSnapshotOfSingleDatabaseUsingReadEvents() throws Exception {
-        config = simpleConfig().with(MySqlConnectorConfig.DATABASE_WHITELIST, "connector_(.*)_" + DATABASE.getIdentifier()).build();
+        config = simpleConfig().with(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, "connector_(.*)_" + DATABASE.getIdentifier()).build();
         context = new MySqlTaskContext(config, new Filters.Builder(config).build());
         context.start();
         reader = new SnapshotReader("snapshot", context);
@@ -494,6 +554,34 @@ public class SnapshotReaderIT {
     }
 
     @Test
+    public void shouldSnapshotTablesInOrderSpecifiedInTableIncludeList() throws Exception {
+        config = simpleConfig()
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST,
+                        "connector_test_ro_(.*).orders,connector_test_ro_(.*).Products,connector_test_ro_(.*).products_on_hand,connector_test_ro_(.*).dbz_342_timetest")
+                .build();
+        context = new MySqlTaskContext(config, new Filters.Builder(config).build());
+        context.start();
+        reader = new SnapshotReader("snapshot", context);
+        reader.uponCompletion(completed::countDown);
+        reader.generateInsertEvents();
+        // Start the snapshot ...
+        reader.start();
+        // Poll for records ...
+        List<SourceRecord> records;
+        LinkedHashSet<String> tablesInOrder = new LinkedHashSet<>();
+        LinkedHashSet<String> tablesInOrderExpected = getTableNamesInSpecifiedOrder("orders", "Products", "products_on_hand", "dbz_342_timetest");
+        while ((records = reader.poll()) != null) {
+            records.forEach(record -> {
+                VerifyRecord.isValid(record);
+                if (record.value() != null) {
+                    tablesInOrder.add(getTableNameFromSourceRecord.apply(record));
+                }
+            });
+        }
+        assertArrayEquals(tablesInOrder.toArray(), tablesInOrderExpected.toArray());
+    }
+
+    @Test
     public void shouldSnapshotTablesInOrderSpecifiedInTablesWhitelist() throws Exception {
         config = simpleConfig()
                 .with(MySqlConnectorConfig.TABLE_WHITELIST,
@@ -549,14 +637,10 @@ public class SnapshotReaderIT {
         assertArrayEquals(tablesInOrder.toArray(), tablesInOrderExpected.toArray());
     }
 
-    private Function<SourceRecord, String> getTableNameFromSourceRecord = sourceRecord -> ((Struct) sourceRecord.value()).getStruct("source").getString("table");
+    private final Function<SourceRecord, String> getTableNameFromSourceRecord = sourceRecord -> ((Struct) sourceRecord.value()).getStruct("source").getString("table");
 
     private LinkedHashSet<String> getTableNamesInSpecifiedOrder(String... tables) {
-        LinkedHashSet<String> tablesInOrderExpected = new LinkedHashSet<>();
-        for (String table : tables) {
-            tablesInOrderExpected.add(table);
-        }
-        return tablesInOrderExpected;
+        return new LinkedHashSet<>(Arrays.asList(tables));
     }
 
     @Test

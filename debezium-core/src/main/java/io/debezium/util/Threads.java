@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 import org.apache.kafka.connect.source.SourceConnector;
@@ -244,9 +245,27 @@ public class Threads {
      * @param connectorId - the identifier to differentiate between connector instances
      * @param name - the name of the thread
      * @param indexed - true if the thread name should be appended with an index
+     * @param daemon - true if the thread should be a daemon thread
      * @return the thread factory setting the correct name
      */
-    public static ThreadFactory threadFactory(Class<? extends SourceConnector> connector, String connectorId, String name, boolean indexed) {
+    public static ThreadFactory threadFactory(Class<? extends SourceConnector> connector, String connectorId, String name, boolean indexed, boolean daemon) {
+        return threadFactory(connector, connectorId, name, indexed, daemon, null);
+    }
+
+    /**
+     * Returns a thread factory that creates threads conforming to Debezium thread naming
+     * pattern {@code debezium-<connector class>-<connector-id>-<thread-name>}.
+     *
+     * @param connector - the source connector class
+     * @param connectorId - the identifier to differentiate between connector instances
+     * @param name - the name of the thread
+     * @param indexed - true if the thread name should be appended with an index
+     * @param daemon - true if the thread should be a daemon thread
+     * @param callback - a callback called on every thread created
+     * @return the thread factory setting the correct name
+     */
+    public static ThreadFactory threadFactory(Class<? extends SourceConnector> connector, String connectorId, String name, boolean indexed, boolean daemon,
+                                              Consumer<Thread> callback) {
         if (LOGGER.isInfoEnabled()) {
             LOGGER.info("Requested thread factory for connector {}, id = {} named = {}", connector.getSimpleName(), connectorId, name);
         }
@@ -266,16 +285,25 @@ public class Threads {
                     threadName.append('-').append(index.getAndIncrement());
                 }
                 LOGGER.info("Creating thread {}", threadName);
-                return new Thread(r, threadName.toString());
+                final Thread t = new Thread(r, threadName.toString());
+                t.setDaemon(daemon);
+                if (callback != null) {
+                    callback.accept(t);
+                }
+                return t;
             }
         };
     }
 
-    public static ExecutorService newSingleThreadExecutor(Class<? extends SourceConnector> connector, String connectorId, String name) {
-        return Executors.newSingleThreadExecutor(threadFactory(connector, connectorId, name, false));
+    public static ExecutorService newSingleThreadExecutor(Class<? extends SourceConnector> connector, String connectorId, String name, boolean daemon) {
+        return Executors.newSingleThreadExecutor(threadFactory(connector, connectorId, name, false, daemon));
     }
 
     public static ExecutorService newFixedThreadPool(Class<? extends SourceConnector> connector, String connectorId, String name, int threadCount) {
-        return Executors.newFixedThreadPool(threadCount, threadFactory(connector, connectorId, name, true));
+        return Executors.newFixedThreadPool(threadCount, threadFactory(connector, connectorId, name, true, false));
+    }
+
+    public static ExecutorService newSingleThreadExecutor(Class<? extends SourceConnector> connector, String connectorId, String name) {
+        return newSingleThreadExecutor(connector, connectorId, name, false);
     }
 }

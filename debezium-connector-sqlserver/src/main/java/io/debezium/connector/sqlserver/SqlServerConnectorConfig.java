@@ -17,15 +17,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
-import io.debezium.config.Field.ValidationOutput;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.document.Document;
 import io.debezium.function.Predicates;
-import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.relational.ColumnId;
 import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
@@ -34,7 +33,6 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.relational.Tables.TableFilter;
 import io.debezium.relational.history.HistoryRecordComparator;
-import io.debezium.relational.history.KafkaDatabaseHistory;
 
 /**
  * The list of configuration options for SQL Server connector
@@ -45,6 +43,7 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SqlServerConnectorConfig.class);
 
+    public static final String SOURCE_TIMESTAMP_MODE_CONFIG_NAME = "source.timestamp.mode";
     protected static final int DEFAULT_PORT = 1433;
     private static final String READ_ONLY_INTENT = "ReadOnly";
     private static final String APPLICATION_INTENT_KEY = "database.applicationIntent";
@@ -60,12 +59,9 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         INITIAL("initial", true),
 
         /**
-         * Perform a snapshot of the schema but no data upon initial startup of a connector.
-         *
-         * @deprecated to be removed in 1.1; use {@link #INITIAL_SCHEMA} instead.
+         * Perform a snapshot of data and schema upon initial startup of a connector but does not transition to streaming.
          */
-        @Deprecated
-        INITIAL_SCHEMA_ONLY("initial_schema_only", false),
+        INITIAL_ONLY("initial_only", true),
 
         /**
          * Perform a snapshot of the schema but no data upon initial startup of a connector.
@@ -262,6 +258,13 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             .withDescription("The name of the database the connector should be monitoring. When working with a "
                     + "multi-tenant set-up, must be set to the CDB name.");
 
+    public static final Field INSTANCE = Field.create(DATABASE_CONFIG_PREFIX + SqlServerConnection.INSTANCE_NAME)
+            .withDisplayName("Instance name")
+            .withType(Type.STRING)
+            .withImportance(Importance.LOW)
+            .withValidation(Field::isOptional)
+            .withDescription("The SQL Server instance name");
+
     public static final Field SERVER_TIMEZONE = Field.create(DATABASE_CONFIG_PREFIX + SqlServerConnection.SERVER_TIMEZONE_PROP_NAME)
             .withDisplayName("Server timezone")
             .withType(Type.STRING)
@@ -282,10 +285,21 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             .withDescription("The timezone of the server used to correctly shift the commit transaction timestamp on the client side"
                     + "Options include: Any valid Java ZoneId");
 
+    public static final Field SOURCE_TIMESTAMP_MODE = Field.create(SOURCE_TIMESTAMP_MODE_CONFIG_NAME)
+            .withDisplayName("Source timestamp mode")
+            .withDefault(SourceTimestampMode.COMMIT.getValue())
+            .withType(Type.STRING)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDescription("Configures the criteria of the attached timestamp within the source record (ts_ms)." +
+                    "Options include:" +
+                    "'" + SourceTimestampMode.COMMIT.getValue() + "', (default) the source timestamp is set to the instant where the record was committed in the database"
+                    +
+                    "'" + SourceTimestampMode.PROCESSING.getValue() + "', the source timestamp is set to the instant where the record was processed by Debezium.");
+
     public static final Field SNAPSHOT_MODE = Field.create("snapshot.mode")
             .withDisplayName("Snapshot mode")
             .withEnum(SnapshotMode.class, SnapshotMode.INITIAL)
-            .withValidation(SqlServerConnectorConfig::validateSnapshotMode)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The criteria for running a snapshot upon startup of the connector. "
@@ -311,79 +325,57 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
                     + "In '" + SnapshotIsolationMode.READ_UNCOMMITTED.getValue()
                     + "' mode neither table nor row-level locks are acquired, but connector does not guarantee snapshot consistency.");
 
+    private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
+            .name("SQL Server")
+            .type(
+                    DATABASE_NAME,
+                    HOSTNAME,
+                    PORT,
+                    USER,
+                    PASSWORD,
+                    SERVER_TIMEZONE,
+                    INSTANCE)
+            .connector(
+                    SNAPSHOT_MODE,
+                    SNAPSHOT_ISOLATION_MODE,
+                    SOURCE_TIMESTAMP_MODE)
+            .excluding(
+                    SCHEMA_WHITELIST,
+                    SCHEMA_INCLUDE_LIST,
+                    SCHEMA_BLACKLIST,
+                    SCHEMA_EXCLUDE_LIST)
+            .create();
+
     /**
      * The set of {@link Field}s defined as part of this configuration.
      */
-    public static Field.Set ALL_FIELDS = Field.setOf(
-            SERVER_NAME,
-            DATABASE_NAME,
-            HOSTNAME,
-            PORT,
-            USER,
-            PASSWORD,
-            SNAPSHOT_MODE,
-            SERVER_TIMEZONE,
-            RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS,
-            RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
-            HistorizedRelationalDatabaseConnectorConfig.DATABASE_HISTORY,
-            RelationalDatabaseConnectorConfig.TABLE_WHITELIST,
-            RelationalDatabaseConnectorConfig.TABLE_BLACKLIST,
-            RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN,
-            RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST,
-            RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
-            RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE,
-            RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE,
-            CommonConnectorConfig.POLL_INTERVAL_MS,
-            CommonConnectorConfig.MAX_BATCH_SIZE,
-            CommonConnectorConfig.MAX_QUEUE_SIZE,
-            CommonConnectorConfig.SNAPSHOT_DELAY_MS,
-            CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-            CommonConnectorConfig.TOMBSTONES_ON_DELETE,
-            CommonConnectorConfig.PROVIDE_TRANSACTION_METADATA,
-            Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX,
-            CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
-            CommonConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE);
+    public static Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
 
     public static ConfigDef configDef() {
-        ConfigDef config = new ConfigDef();
-
-        Field.group(config, "SQL Server", SERVER_NAME, DATABASE_NAME, HOSTNAME, PORT,
-                USER, PASSWORD, SNAPSHOT_MODE, SERVER_TIMEZONE);
-        Field.group(config, "History Storage", KafkaDatabaseHistory.BOOTSTRAP_SERVERS,
-                KafkaDatabaseHistory.TOPIC, KafkaDatabaseHistory.RECOVERY_POLL_ATTEMPTS,
-                KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS, HistorizedRelationalDatabaseConnectorConfig.DATABASE_HISTORY);
-        Field.group(config, "Events", RelationalDatabaseConnectorConfig.TABLE_WHITELIST,
-                RelationalDatabaseConnectorConfig.TABLE_BLACKLIST,
-                RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST,
-                RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
-                RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
-                RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN,
-                Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX,
-                CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
-                CommonConnectorConfig.TOMBSTONES_ON_DELETE,
-                CommonConnectorConfig.PROVIDE_TRANSACTION_METADATA,
-                CommonConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE);
-        Field.group(config, "Connector", CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE,
-                CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-                RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE, RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE,
-                RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS);
-
-        return config;
+        return CONFIG_DEFINITION.configDef();
     }
 
     private final String databaseName;
+    private final String instanceName;
     private final SnapshotMode snapshotMode;
     private final SnapshotIsolationMode snapshotIsolationMode;
+    private final SourceTimestampMode sourceTimestampMode;
     private final ColumnNameFilter columnFilter;
     private final boolean readOnlyDatabaseConnection;
 
     public SqlServerConnectorConfig(Configuration config) {
-        super(config, config.getString(SERVER_NAME), new SystemTablesPredicate(), x -> x.schema() + "." + x.table(), true);
+        super(SqlServerConnector.class, config, config.getString(SERVER_NAME), new SystemTablesPredicate(), x -> x.schema() + "." + x.table(), true);
 
         this.databaseName = config.getString(DATABASE_NAME);
+        this.instanceName = config.getString(INSTANCE);
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SNAPSHOT_MODE.defaultValueAsString());
 
-        this.columnFilter = getColumnNameFilter(config.getString(RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST));
+        if (columnIncludeList() != null) {
+            this.columnFilter = getColumnIncludeNameFilter(columnIncludeList());
+        }
+        else {
+            this.columnFilter = getColumnExcludeNameFilter(columnExcludeList());
+        }
         this.readOnlyDatabaseConnection = READ_ONLY_INTENT.equals(config.getString(APPLICATION_INTENT_KEY));
         if (readOnlyDatabaseConnection) {
             this.snapshotIsolationMode = SnapshotIsolationMode.SNAPSHOT;
@@ -392,12 +384,27 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         else {
             this.snapshotIsolationMode = SnapshotIsolationMode.parse(config.getString(SNAPSHOT_ISOLATION_MODE), SNAPSHOT_ISOLATION_MODE.defaultValueAsString());
         }
+
+        this.sourceTimestampMode = SourceTimestampMode.fromMode(config.getString(SOURCE_TIMESTAMP_MODE_CONFIG_NAME));
     }
 
-    private static ColumnNameFilter getColumnNameFilter(String excludedColumnPatterns) {
+    private static ColumnNameFilter getColumnExcludeNameFilter(String excludedColumnPatterns) {
         return new ColumnNameFilter() {
 
             Predicate<ColumnId> delegate = Predicates.excludes(excludedColumnPatterns, ColumnId::toString);
+
+            @Override
+            public boolean matches(String catalogName, String schemaName, String tableName, String columnName) {
+                // ignore database name as it's not relevant here
+                return delegate.test(new ColumnId(new TableId(null, schemaName, tableName), columnName));
+            }
+        };
+    }
+
+    private static ColumnNameFilter getColumnIncludeNameFilter(String excludedColumnPatterns) {
+        return new ColumnNameFilter() {
+
+            Predicate<ColumnId> delegate = Predicates.includes(excludedColumnPatterns, ColumnId::toString);
 
             @Override
             public boolean matches(String catalogName, String schemaName, String tableName, String columnName) {
@@ -411,12 +418,20 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         return databaseName;
     }
 
+    public String getInstanceName() {
+        return instanceName;
+    }
+
     public SnapshotIsolationMode getSnapshotIsolationMode() {
         return this.snapshotIsolationMode;
     }
 
     public SnapshotMode getSnapshotMode() {
         return snapshotMode;
+    }
+
+    public SourceTimestampMode getSourceTimestampMode() {
+        return sourceTimestampMode;
     }
 
     public ColumnNameFilter getColumnFilter() {
@@ -463,25 +478,8 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         return Module.contextName();
     }
 
-    /**
-     * Validate the time.precision.mode configuration.
-     *
-     * If {@code adaptive} is specified, this option has the potential to cause overflow which is why the
-     * option was deprecated and no longer supported for this connector.
-     */
-    private static int validateSnapshotMode(Configuration config, Field field, ValidationOutput problems) {
-        if (config.hasKey(SNAPSHOT_MODE.name())) {
-            final String snapshotMode = config.getString(SNAPSHOT_MODE.name());
-            if (SnapshotMode.INITIAL_SCHEMA_ONLY.value.equals(snapshotMode)) {
-                // this will be logged as ERROR, but returning 0 doesn't prevent start-up
-                problems.accept(SNAPSHOT_MODE, snapshotMode,
-                        "The 'initial_schema_only' snapshot.mode is no longer supported and will be removed in a future revision. Use 'schema_only' instead.");
-                return 0;
-            }
-        }
-
-        // Everything checks out ok.
-        return 0;
+    @Override
+    public String getConnectorName() {
+        return Module.name();
     }
-
 }

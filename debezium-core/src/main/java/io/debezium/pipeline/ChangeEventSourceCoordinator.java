@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.kafka.connect.source.SourceConnector;
 import org.slf4j.Logger;
@@ -20,6 +21,7 @@ import io.debezium.connector.base.ChangeEventQueueMetrics;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.pipeline.metrics.SnapshotChangeEventSourceMetrics;
 import io.debezium.pipeline.metrics.StreamingChangeEventSourceMetrics;
+import io.debezium.pipeline.metrics.spi.ChangeEventSourceMetricsFactory;
 import io.debezium.pipeline.source.spi.ChangeEventSource;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;
@@ -42,27 +44,34 @@ public class ChangeEventSourceCoordinator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ChangeEventSourceCoordinator.class);
 
-    private static final Duration SHUTDOWN_WAIT_TIMEOUT = Duration.ofSeconds(90);
+    /**
+     * Waiting period for the polling loop to finish. Will be applied twice, once gracefully, once forcefully.
+     */
+    public static final Duration SHUTDOWN_WAIT_TIMEOUT = Duration.ofSeconds(90);
 
     private final OffsetContext previousOffset;
     private final ErrorHandler errorHandler;
     private final ChangeEventSourceFactory changeEventSourceFactory;
+    private final ChangeEventSourceMetricsFactory changeEventSourceMetricsFactory;
     private final ExecutorService executor;
     private final EventDispatcher<?> eventDispatcher;
     private final DatabaseSchema<?> schema;
 
     private volatile boolean running;
     private volatile StreamingChangeEventSource streamingSource;
+    private final ReentrantLock commitOffsetLock = new ReentrantLock();
 
     private SnapshotChangeEventSourceMetrics snapshotMetrics;
     private StreamingChangeEventSourceMetrics streamingMetrics;
 
     public ChangeEventSourceCoordinator(OffsetContext previousOffset, ErrorHandler errorHandler, Class<? extends SourceConnector> connectorType,
                                         CommonConnectorConfig connectorConfig,
-                                        ChangeEventSourceFactory changeEventSourceFactory, EventDispatcher<?> eventDispatcher, DatabaseSchema<?> schema) {
+                                        ChangeEventSourceFactory changeEventSourceFactory,
+                                        ChangeEventSourceMetricsFactory changeEventSourceMetricsFactory, EventDispatcher<?> eventDispatcher, DatabaseSchema<?> schema) {
         this.previousOffset = previousOffset;
         this.errorHandler = errorHandler;
         this.changeEventSourceFactory = changeEventSourceFactory;
+        this.changeEventSourceMetricsFactory = changeEventSourceMetricsFactory;
         this.executor = Threads.newSingleThreadExecutor(connectorType, connectorConfig.getLogicalName(), "change-event-source-coordinator");
         this.eventDispatcher = eventDispatcher;
         this.schema = schema;
@@ -70,8 +79,8 @@ public class ChangeEventSourceCoordinator {
 
     public synchronized <T extends CdcSourceTaskContext> void start(T taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
                                                                     EventMetadataProvider metadataProvider) {
-        this.snapshotMetrics = new SnapshotChangeEventSourceMetrics(taskContext, changeEventQueueMetrics, metadataProvider);
-        this.streamingMetrics = new StreamingChangeEventSourceMetrics(taskContext, changeEventQueueMetrics, metadataProvider);
+        this.snapshotMetrics = changeEventSourceMetricsFactory.getSnapshotMetrics(taskContext, changeEventQueueMetrics, metadataProvider);
+        this.streamingMetrics = changeEventSourceMetricsFactory.getStreamingMetrics(taskContext, changeEventQueueMetrics, metadataProvider);
         running = true;
 
         // run the snapshot source on a separate thread so start() won't block
@@ -85,6 +94,13 @@ public class ChangeEventSourceCoordinator {
                 LOGGER.info("Context created");
 
                 SnapshotChangeEventSource snapshotSource = changeEventSourceFactory.getSnapshotChangeEventSource(previousOffset, snapshotMetrics);
+                CatchUpStreamingResult catchUpStreamingResult = executeCatchUpStreaming(previousOffset, context, snapshotSource);
+                if (catchUpStreamingResult.performedCatchUpStreaming) {
+                    streamingMetrics.connected(false);
+                    commitOffsetLock.lock();
+                    streamingSource = null;
+                    commitOffsetLock.unlock();
+                }
                 eventDispatcher.setEventListener(snapshotMetrics);
                 SnapshotResult snapshotResult = snapshotSource.execute(context);
                 LOGGER.info("Snapshot ended with {}", snapshotResult);
@@ -94,12 +110,7 @@ public class ChangeEventSourceCoordinator {
                 }
 
                 if (running && snapshotResult.isCompletedOrSkipped()) {
-                    streamingSource = changeEventSourceFactory.getStreamingChangeEventSource(snapshotResult.getOffset());
-                    eventDispatcher.setEventListener(streamingMetrics);
-                    streamingMetrics.connected(true);
-                    LOGGER.info("Starting streaming");
-                    streamingSource.execute(context);
-                    LOGGER.info("Finished streaming");
+                    streamEvents(snapshotResult.getOffset(), context);
                 }
             }
             catch (InterruptedException e) {
@@ -115,8 +126,23 @@ public class ChangeEventSourceCoordinator {
         });
     }
 
+    protected CatchUpStreamingResult executeCatchUpStreaming(OffsetContext previousOffset, ChangeEventSourceContext context,
+                                                             SnapshotChangeEventSource snapshotSource)
+            throws InterruptedException {
+        return new CatchUpStreamingResult(false);
+    }
+
+    protected void streamEvents(OffsetContext offsetContext, ChangeEventSourceContext context) throws InterruptedException {
+        streamingSource = changeEventSourceFactory.getStreamingChangeEventSource(offsetContext);
+        eventDispatcher.setEventListener(streamingMetrics);
+        streamingMetrics.connected(true);
+        LOGGER.info("Starting streaming");
+        streamingSource.execute(context);
+        LOGGER.info("Finished streaming");
+    }
+
     public void commitOffset(Map<String, ?> offset) {
-        if (streamingSource != null && offset != null) {
+        if (!commitOffsetLock.isLocked() && streamingSource != null && offset != null) {
             streamingSource.commitOffset(offset);
         }
     }
@@ -154,5 +180,15 @@ public class ChangeEventSourceCoordinator {
         public boolean isRunning() {
             return running;
         }
+    }
+
+    protected class CatchUpStreamingResult {
+
+        public boolean performedCatchUpStreaming;
+
+        public CatchUpStreamingResult(boolean performedCatchUpStreaming) {
+            this.performedCatchUpStreaming = performedCatchUpStreaming;
+        }
+
     }
 }

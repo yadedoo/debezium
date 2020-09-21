@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.sql.Types;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -42,6 +43,7 @@ public class SqlServerSnapshotChangeEventSource extends RelationalSnapshotChange
 
     private final SqlServerConnectorConfig connectorConfig;
     private final SqlServerConnection jdbcConnection;
+    private final SqlServerDatabaseSchema sqlServerDatabaseSchema;
 
     public SqlServerSnapshotChangeEventSource(SqlServerConnectorConfig connectorConfig, SqlServerOffsetContext previousOffset, SqlServerConnection jdbcConnection,
                                               SqlServerDatabaseSchema schema, EventDispatcher<TableId> dispatcher, Clock clock,
@@ -49,6 +51,7 @@ public class SqlServerSnapshotChangeEventSource extends RelationalSnapshotChange
         super(connectorConfig, previousOffset, jdbcConnection, schema, dispatcher, clock, snapshotProgressListener);
         this.connectorConfig = connectorConfig;
         this.jdbcConnection = jdbcConnection;
+        this.sqlServerDatabaseSchema = schema;
     }
 
     @Override
@@ -187,8 +190,16 @@ public class SqlServerSnapshotChangeEventSource extends RelationalSnapshotChange
 
     @Override
     protected SchemaChangeEvent getCreateTableEvent(RelationalSnapshotContext snapshotContext, Table table) throws SQLException {
-        return new SchemaChangeEvent(snapshotContext.offset.getPartition(), snapshotContext.offset.getOffset(), snapshotContext.catalogName,
-                table.id().schema(), null, table, SchemaChangeEventType.CREATE, true);
+        return new SchemaChangeEvent(
+                snapshotContext.offset.getPartition(),
+                snapshotContext.offset.getOffset(),
+                snapshotContext.offset.getSourceInfo(),
+                snapshotContext.catalogName,
+                table.id().schema(),
+                null,
+                table,
+                SchemaChangeEventType.CREATE,
+                true);
     }
 
     @Override
@@ -210,8 +221,43 @@ public class SqlServerSnapshotChangeEventSource extends RelationalSnapshotChange
      * @return a valid query string
      */
     @Override
-    protected Optional<String> getSnapshotSelect(SnapshotContext snapshotContext, TableId tableId) {
+    protected Optional<String> getSnapshotSelect(RelationalSnapshotContext snapshotContext, TableId tableId) {
+        String modifiedColumns = checkExcludedColumns(tableId);
+        if (modifiedColumns != null) {
+            return Optional.of(String.format("SELECT %s FROM [%s].[%s]", modifiedColumns, tableId.schema(), tableId.table()));
+        }
         return Optional.of(String.format("SELECT * FROM [%s].[%s]", tableId.schema(), tableId.table()));
+    }
+
+    @Override
+    protected String enhanceOverriddenSelect(RelationalSnapshotContext snapshotContext, String overriddenSelect, TableId tableId) {
+        String modifiedColumns = checkExcludedColumns(tableId);
+        if (modifiedColumns != null) {
+            overriddenSelect = overriddenSelect.replaceAll("\\*", modifiedColumns);
+        }
+        return overriddenSelect;
+    }
+
+    private String checkExcludedColumns(TableId tableId) {
+        String modifiedColumns = null;
+        String excludedColumnStr = connectorConfig.getTableFilters().getExcludeColumns();
+        if (Objects.nonNull(excludedColumnStr)
+                && excludedColumnStr.trim().length() > 0
+                && excludedColumnStr.contains(tableId.table())) {
+            Table table = sqlServerDatabaseSchema.tableFor(tableId);
+            modifiedColumns = table.retrieveColumnNames().stream()
+                    .map(s -> {
+                        StringBuilder sb = new StringBuilder();
+                        if (!s.contains(tableId.table())) {
+                            sb.append(tableId.table()).append(".").append(s);
+                        }
+                        else {
+                            sb.append(s);
+                        }
+                        return sb.toString();
+                    }).collect(Collectors.joining(","));
+        }
+        return modifiedColumns;
     }
 
     @Override

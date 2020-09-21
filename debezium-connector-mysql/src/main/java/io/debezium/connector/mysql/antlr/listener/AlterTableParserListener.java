@@ -10,6 +10,7 @@ import static io.debezium.antlr.AntlrDdlParser.getText;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.antlr.v4.runtime.tree.ParseTreeListener;
 import org.slf4j.Logger;
@@ -39,7 +40,9 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
     private final List<ParseTreeListener> listeners;
 
     private TableEditor tableEditor;
+    private ColumnEditor defaultValueColumnEditor;
     private ColumnDefinitionParserListener columnDefinitionListener;
+    private DefaultValueParserListener defaultValueListener;
 
     private List<ColumnEditor> columnEditors;
     private int parsingColumnIndex = STARTING_INDEX;
@@ -80,7 +83,7 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
         parser.runIfNotNull(() -> {
             String columnName = parser.parseName(ctx.uid(0));
             ColumnEditor columnEditor = Column.editor().name(columnName);
-            columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser.dataTypeResolver(), parser.getConverters());
+            columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser, listeners);
             listeners.add(columnDefinitionListener);
         }, tableEditor);
         super.exitAlterByAddColumn(ctx);
@@ -114,7 +117,7 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
                 String columnName = parser.parseName(uidContext);
                 columnEditors.add(Column.editor().name(columnName));
             }
-            columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditors.get(0), parser.dataTypeResolver(), parser.getConverters());
+            columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditors.get(0), parser, listeners);
             listeners.add(columnDefinitionListener);
         }, tableEditor);
         super.enterAlterByAddColumns(ctx);
@@ -164,7 +167,7 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
                 ColumnEditor columnEditor = existingColumn.edit();
                 columnEditor.unsetDefaultValue();
 
-                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser.dataTypeResolver(), parser.getConverters());
+                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser, listeners);
                 listeners.add(columnDefinitionListener);
             }
             else {
@@ -205,7 +208,7 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
                 ColumnEditor columnEditor = existingColumn.edit();
                 columnEditor.unsetDefaultValue();
 
-                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser.dataTypeResolver(), parser.getConverters());
+                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser, listeners);
                 listeners.add(columnDefinitionListener);
             }
             else {
@@ -261,11 +264,28 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
             String columnName = parser.parseName(ctx.uid());
             Column column = tableEditor.columnWithName(columnName);
             if (column != null) {
-                ColumnEditor columnEditor = column.edit();
-                columnEditor.generated(ctx.DROP() != null);
+                defaultValueColumnEditor = column.edit();
+                if (ctx.SET() != null) {
+                    defaultValueListener = new DefaultValueParserListener(defaultValueColumnEditor, parser.getConverters(),
+                            new AtomicReference<Boolean>(column.isOptional()), true);
+                    listeners.add(defaultValueListener);
+                }
+                else if (ctx.DROP() != null) {
+                    defaultValueColumnEditor.unsetDefaultValue();
+                }
             }
         }, tableEditor);
         super.enterAlterByChangeDefault(ctx);
+    }
+
+    @Override
+    public void exitAlterByChangeDefault(MySqlParser.AlterByChangeDefaultContext ctx) {
+        parser.runIfNotNull(() -> {
+            tableEditor.updateColumn(defaultValueColumnEditor.create());
+            listeners.remove(defaultValueListener);
+            defaultValueColumnEditor = null;
+        }, defaultValueColumnEditor);
+        super.exitAlterByChangeDefault(ctx);
     }
 
     @Override
@@ -309,7 +329,7 @@ public class AlterTableParserListener extends MySqlParserBaseListener {
                 ColumnEditor columnEditor = existingColumn.edit();
                 // columnEditor.unsetDefaultValue();
 
-                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser.dataTypeResolver(), parser.getConverters());
+                columnDefinitionListener = new ColumnDefinitionParserListener(tableEditor, columnEditor, parser, listeners);
                 listeners.add(columnDefinitionListener);
             }
             else {

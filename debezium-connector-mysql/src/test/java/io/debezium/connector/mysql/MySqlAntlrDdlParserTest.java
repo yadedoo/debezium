@@ -13,8 +13,10 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.io.InputStream;
 import java.sql.Types;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,6 +27,7 @@ import org.fest.assertions.Assertions;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
 import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcValueConverters;
@@ -39,6 +42,7 @@ import io.debezium.relational.ddl.DdlChanges;
 import io.debezium.relational.ddl.DdlParser;
 import io.debezium.relational.ddl.DdlParserListener.Event;
 import io.debezium.relational.ddl.SimpleDdlParserListener;
+import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.IoUtil;
 import io.debezium.util.Testing;
 
@@ -58,6 +62,108 @@ public class MySqlAntlrDdlParserTest {
         tables = new Tables();
     }
 
+    @Test
+    @FixFor("DBZ-2130")
+    public void shouldParseCharacterDatatype() {
+        String ddl = "CREATE TABLE mytable (id INT PRIMARY KEY, val1 CHARACTER, val2 CHARACTER(5));";
+        parser.parse(ddl, tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table table = tables.forTable(null, null, "mytable");
+        assertThat(table.columns()).hasSize(3);
+        assertThat(table.columnWithName("id")).isNotNull();
+        assertThat(table.columnWithName("val1")).isNotNull();
+        assertThat(table.columnWithName("val2")).isNotNull();
+        assertThat(table.columnWithName("val1").jdbcType()).isEqualTo(Types.CHAR);
+        assertThat(table.columnWithName("val1").length()).isEqualTo(-1);
+        assertThat(table.columnWithName("val2").jdbcType()).isEqualTo(Types.CHAR);
+        assertThat(table.columnWithName("val2").length()).isEqualTo(5);
+    }
+
+    @Test
+    @FixFor("DBZ-2365")
+    public void shouldParseOtherDbDatatypes() {
+        String ddl = "CREATE TABLE mytable (id INT PRIMARY KEY, mi MIDDLEINT, f4 FLOAT4, f8 FLOAT8, i1 INT1, i2 INT2, i3 INT, i4 INT4, i8 INT8, l LONG CHARSET LATIN2, lvc LONG VARCHAR, lvb LONG VARBINARY);";
+        parser.parse(ddl, tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table table = tables.forTable(null, null, "mytable");
+        assertThat(table.columnWithName("id")).isNotNull();
+        assertThat(table.columnWithName("mi")).isNotNull();
+        assertThat(table.columnWithName("f4")).isNotNull();
+        assertThat(table.columnWithName("f8")).isNotNull();
+        assertThat(table.columnWithName("i1")).isNotNull();
+        assertThat(table.columnWithName("i2")).isNotNull();
+        assertThat(table.columnWithName("i3")).isNotNull();
+        assertThat(table.columnWithName("i4")).isNotNull();
+        assertThat(table.columnWithName("i8")).isNotNull();
+        assertThat(table.columnWithName("mi").jdbcType()).isEqualTo(Types.INTEGER);
+        assertThat(table.columnWithName("f4").jdbcType()).isEqualTo(Types.FLOAT);
+        assertThat(table.columnWithName("f8").jdbcType()).isEqualTo(Types.DOUBLE);
+        assertThat(table.columnWithName("i1").jdbcType()).isEqualTo(Types.SMALLINT);
+        assertThat(table.columnWithName("i2").jdbcType()).isEqualTo(Types.SMALLINT);
+        assertThat(table.columnWithName("i3").jdbcType()).isEqualTo(Types.INTEGER);
+        assertThat(table.columnWithName("i4").jdbcType()).isEqualTo(Types.INTEGER);
+        assertThat(table.columnWithName("i8").jdbcType()).isEqualTo(Types.BIGINT);
+        assertThat(table.columnWithName("l").jdbcType()).isEqualTo(Types.VARCHAR);
+        assertThat(table.columnWithName("l").charsetName()).isEqualTo("LATIN2");
+        assertThat(table.columnWithName("lvc").jdbcType()).isEqualTo(Types.VARCHAR);
+        assertThat(table.columnWithName("lvb").jdbcType()).isEqualTo(Types.BLOB);
+    }
+
+    @Test
+    @FixFor("DBZ-2140")
+    public void shouldUpdateSchemaForRemovedDefaultValue() {
+        String ddl = "CREATE TABLE mytable (id INT PRIMARY KEY, val1 INT);"
+                + "ALTER TABLE mytable ADD COLUMN last_val INT DEFAULT 5;";
+        parser.parse(ddl, tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        parser.parse("ALTER TABLE mytable ALTER COLUMN last_val DROP DEFAULT;", tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table table = tables.forTable(null, null, "mytable");
+        assertThat(table.columns()).hasSize(3);
+        assertThat(table.columnWithName("id")).isNotNull();
+        assertThat(table.columnWithName("val1")).isNotNull();
+        assertThat(table.columnWithName("last_val")).isNotNull();
+        assertThat(table.columnWithName("last_val").defaultValue()).isNull();
+
+        parser.parse("ALTER TABLE mytable CHANGE COLUMN last_val last_val INT NOT NULL;", tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        table = tables.forTable(null, null, "mytable");
+        assertThat(table.columnWithName("last_val")).isNotNull();
+        assertThat(table.columnWithName("last_val").hasDefaultValue()).isFalse();
+    }
+
+    @Test
+    @FixFor("DBZ-2061")
+    public void shouldUpdateSchemaForChangedDefaultValue() {
+        String ddl = "CREATE TABLE mytable (id INT PRIMARY KEY, val1 INT);"
+                + "ALTER TABLE mytable ADD COLUMN last_val INT DEFAULT 5;";
+        parser.parse(ddl, tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        parser.parse("ALTER TABLE mytable ALTER COLUMN last_val SET DEFAULT 10;", tables);
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table table = tables.forTable(null, null, "mytable");
+        assertThat(table.columns()).hasSize(3);
+        assertThat(table.columnWithName("id")).isNotNull();
+        assertThat(table.columnWithName("val1")).isNotNull();
+        assertThat(table.columnWithName("last_val")).isNotNull();
+        assertThat(table.columnWithName("last_val").defaultValue()).isEqualTo(10);
+    }
+
+    @Test
     @FixFor("DBZ-1833")
     public void shouldNotUpdateExistingTable() {
         String ddl = "CREATE TABLE mytable (id INT PRIMARY KEY, val1 INT)";
@@ -208,6 +314,16 @@ public class MySqlAntlrDdlParserTest {
         parser.parse(ddl, tables);
         assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
         assertThat(tables.size()).isEqualTo(0);
+    }
+
+    @Test
+    @FixFor("DBZ-2067")
+    public void shouldSupportInstantAlgoOnAlterStatements() {
+        final String ddl = "CREATE TABLE foo (id SERIAL, c1 INT);" +
+                "ALTER TABLE foo ADD COLUMN c2 INT, ALGORITHM=INSTANT;";
+        parser.parse(ddl, tables);
+
+        assertThat(((MySqlAntlrDdlParser) parser).getParsingExceptionsFromWalker().size()).isEqualTo(0);
     }
 
     @Test
@@ -942,14 +1058,20 @@ public class MySqlAntlrDdlParserTest {
                 + " c1 INTEGER NOT NULL, " + System.lineSeparator()
                 + " c2 VARCHAR(22) " + System.lineSeparator()
                 + ") engine=Aria;";
-        parser.parse(ddl1 + ddl2 + ddl3, tables);
-        assertThat(tables.size()).isEqualTo(3);
+        String ddl4 = "CREATE TABLE escaped_foo ( " + System.lineSeparator()
+                + " c1 INTEGER NOT NULL, " + System.lineSeparator()
+                + " c2 VARCHAR(22) " + System.lineSeparator()
+                + ") engine=TokuDB `compression`=tokudb_zlib;";
+        parser.parse(ddl1 + ddl2 + ddl3 + ddl4, tables);
+        assertThat(tables.size()).isEqualTo(4);
         listener.assertNext().createTableNamed("foo").ddlStartsWith("CREATE TABLE foo (");
         listener.assertNext().createTableNamed("bar").ddlStartsWith("CREATE TABLE bar (");
         listener.assertNext().createTableNamed("baz").ddlStartsWith("CREATE TABLE baz (");
+        listener.assertNext().createTableNamed("escaped_foo").ddlStartsWith("CREATE TABLE escaped_foo (");
         parser.parse("DROP TABLE foo", tables);
         parser.parse("DROP TABLE bar", tables);
         parser.parse("DROP TABLE baz", tables);
+        parser.parse("DROP TABLE escaped_foo", tables);
         assertThat(tables.size()).isEqualTo(0);
     }
 
@@ -2323,6 +2445,54 @@ public class MySqlAntlrDdlParserTest {
         assertThat(table.columnWithName("id").defaultValue()).isEqualTo(1);
     }
 
+    @Test
+    @FixFor("DBZ-2330")
+    public void shouldNotNullPositionBeforeOrAfterDefaultValue() {
+        String ddl = "CREATE TABLE my_table (" +
+                "ts_col TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+                "ts_col2 TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL," +
+                "ts_col3 TIMESTAMP DEFAULT CURRENT_TIMESTAMP);";
+        parser.parse(ddl, tables);
+
+        Table table = tables.forTable(new TableId(null, null, "my_table"));
+        ZonedDateTime zdt = ZonedDateTime.ofInstant(Instant.EPOCH, ZoneOffset.UTC);
+        String isoEpoch = ZonedTimestamp.toIsoString(zdt, ZoneOffset.UTC, MySqlValueConverters::adjustTemporal);
+
+        assertThat(table.columnWithName("ts_col").isOptional()).isEqualTo(false);
+        assertThat(table.columnWithName("ts_col").hasDefaultValue()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col").defaultValue()).isEqualTo(isoEpoch);
+
+        assertThat(table.columnWithName("ts_col2").isOptional()).isEqualTo(false);
+        assertThat(table.columnWithName("ts_col2").hasDefaultValue()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col2").defaultValue()).isEqualTo(isoEpoch);
+
+        assertThat(table.columnWithName("ts_col3").isOptional()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col3").hasDefaultValue()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col3").defaultValue()).isNull();
+
+        final String alter1 = "ALTER TABLE my_table " +
+                " ADD ts_col4 TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL;";
+
+        parser.parse(alter1, tables);
+        table = tables.forTable(new TableId(null, null, "my_table"));
+
+        assertThat(table.columns().size()).isEqualTo(4);
+        assertThat(table.columnWithName("ts_col4").isOptional()).isEqualTo(false);
+        assertThat(table.columnWithName("ts_col4").hasDefaultValue()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col4").defaultValue()).isEqualTo(isoEpoch);
+
+        final String alter2 = "ALTER TABLE my_table " +
+                " ADD ts_col5 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP";
+
+        parser.parse(alter2, tables);
+        table = tables.forTable(new TableId(null, null, "my_table"));
+
+        assertThat(table.columns().size()).isEqualTo(5);
+        assertThat(table.columnWithName("ts_col5").isOptional()).isEqualTo(false);
+        assertThat(table.columnWithName("ts_col5").hasDefaultValue()).isEqualTo(true);
+        assertThat(table.columnWithName("ts_col5").defaultValue()).isEqualTo(isoEpoch);
+    }
+
     /**
      * Assert whether the provided {@code typeExpression} string after being parsed results in a
      * list of {@code ENUM} or {@code SET} options that match exactly to the provided list of
@@ -2475,7 +2645,8 @@ public class MySqlAntlrDdlParserTest {
                     new MySqlValueConverters(
                             JdbcValueConverters.DecimalMode.DOUBLE,
                             TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS,
-                            JdbcValueConverters.BigIntUnsignedMode.PRECISE),
+                            JdbcValueConverters.BigIntUnsignedMode.PRECISE,
+                            BinaryHandlingMode.BYTES),
                     tableFilter);
             this.ddlChanges = changesListener;
         }

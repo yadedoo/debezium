@@ -7,6 +7,7 @@ package io.debezium.pipeline.source.spi;
 
 import org.apache.kafka.connect.data.Struct;
 
+import io.debezium.pipeline.ConnectorEvent;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.schema.DataCollectionId;
@@ -25,7 +26,7 @@ public interface DataChangeEventListener {
     void onEvent(DataCollectionId source, OffsetContext offset, Object key, Struct value) throws InterruptedException;
 
     /**
-     * Invoked for events pertaining to non-whitelisted tables.
+     * Invoked for events pertaining to non-captured tables.
      */
     void onFilteredEvent(String event);
 
@@ -34,6 +35,11 @@ public interface DataChangeEventListener {
      */
     void onErroneousEvent(String event);
 
+    /**
+     * Invoked for events that represent a connector event.
+     */
+    void onConnectorEvent(ConnectorEvent event);
+
     static DataChangeEventListener NO_OP = new DataChangeEventListener() {
         @Override
         public void onFilteredEvent(String event) {
@@ -41,6 +47,10 @@ public interface DataChangeEventListener {
 
         @Override
         public void onErroneousEvent(String event) {
+        }
+
+        @Override
+        public void onConnectorEvent(ConnectorEvent event) {
         }
 
         @Override

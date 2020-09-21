@@ -1,4 +1,4 @@
--- In production you would almost certainly limit the replication user must be on the follower (slave) machine,
+-- In production you would almost certainly limit the replication user must be on the follower (replica) machine,
 -- to prevent other clients accessing the log from other machines. For example, 'replicator'@'follower.acme.com'.
 -- However, in this database we'll grant 3 users different privileges:
 --
@@ -18,3 +18,20 @@ GRANT ALL PRIVILEGES ON *.* TO 'mysqluser'@'%';
 -- DATABASE:  emptydb
 -- ----------------------------------------------------------------------------------------------------------------
 CREATE DATABASE emptydb;
+RESET MASTER;
+CREATE DATABASE testing;
+CREATE TABLE testing.testing (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY);
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();
+INSERT INTO testing.testing VALUES ();

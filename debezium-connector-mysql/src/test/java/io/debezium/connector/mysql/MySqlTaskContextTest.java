@@ -90,7 +90,7 @@ public class MySqlTaskContextTest {
                 .with(MySqlConnectorConfig.SSL_MODE, SecureConnectionMode.DISABLED)
                 .with(MySqlConnectorConfig.SERVER_ID, serverId)
                 .with(MySqlConnectorConfig.SERVER_NAME, serverName)
-                .with(MySqlConnectorConfig.DATABASE_WHITELIST, databaseName)
+                .with(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, databaseName)
                 .with(MySqlConnectorConfig.DATABASE_HISTORY, FileDatabaseHistory.class)
                 .with(FileDatabaseHistory.FILE_PATH, DB_HISTORY_PATH);
     }
@@ -117,6 +117,25 @@ public class MySqlTaskContextTest {
         assertThat("" + context.snapshotMode().getValue()).isEqualTo(SnapshotMode.WHEN_NEEDED.getValue());
         assertThat(context.isSnapshotAllowedWhenNeeded()).isEqualTo(true);
         assertThat(context.isSnapshotNeverAllowed()).isEqualTo(false);
+    }
+
+    @Test
+    public void shouldFilterInternalDmlStatementsUsingDefaultFilter() throws Exception {
+        config = simpleConfig().build();
+        context = new MySqlTaskContext(config, new Filters.Builder(config).build(), false, null);
+
+        assertThat(context.ddlFilter().test("INSERT INTO mysql.rds_heartbeat2(name) values ('innodb_txn_key') ON DUPLICATE KEY UPDATE value = 'v'")).isTrue();
+        assertThat(context.ddlFilter().test("INSERT INTO mysql.rds_sysinfo(name, value) values ('innodb_txn_key','Sat Jun 13 06:26:02 UTC 2020')")).isTrue();
+        assertThat(context.ddlFilter().test("INSERT INTO mysql.rds_monitor(name, value) values ('innodb_txn_key','Sat Jun 13 06:26:02 UTC 2020')")).isTrue();
+        assertThat(context.ddlFilter().test("INSERT INTO mysql.rds_monitor(name) values ('innodb_txn_key') ON DUPLICATE KEY UPDATE value = 'v'")).isTrue();
+        assertThat(context.ddlFilter().test("DELETE FROM mysql.rds_sysinfo")).isTrue();
+        assertThat(context.ddlFilter().test("DELETE FROM mysql.rds_monitor;")).isTrue();
+        assertThat(context.ddlFilter().test("FLUSH RELAY LOGS;")).isTrue();
+        assertThat(context.ddlFilter().test("SAVEPOINT x")).isTrue();
+        // Missing 'ON DUPLICATE ...' clause
+        assertThat(context.ddlFilter().test("INSERT INTO mysql.rds_heartbeat2(name) values ('innodb_txn_key')")).isFalse();
+        // No space after 'SAVEPOINT'
+        assertThat(context.ddlFilter().test("SAVEPOINT;")).isFalse();
     }
 
     @Test

@@ -27,6 +27,7 @@ import io.debezium.connector.mongodb.FieldSelector.FieldFilter;
 import io.debezium.data.Envelope;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.data.Json;
+import io.debezium.pipeline.txmetadata.TransactionMonitor;
 import io.debezium.schema.DataCollectionSchema;
 import io.debezium.schema.DatabaseSchema;
 import io.debezium.schema.TopicSelector;
@@ -82,11 +83,12 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
             final Schema valueSchema = SchemaBuilder.struct()
                     .name(adjuster.adjust(Envelope.schemaName(topicName)))
                     .field(FieldName.AFTER, Json.builder().optional().build())
-                    .field("patch", Json.builder().optional().build())
-                    .field("filter", Json.builder().optional().build())
+                    .field(MongoDbFieldName.PATCH, Json.builder().optional().build())
+                    .field(MongoDbFieldName.FILTER, Json.builder().optional().build())
                     .field(FieldName.SOURCE, sourceSchema)
                     .field(FieldName.OPERATION, Schema.OPTIONAL_STRING_SCHEMA)
                     .field(FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA)
+                    .field(FieldName.TRANSACTION, TransactionMonitor.TRANSACTION_BLOCK_SCHEMA)
                     .build();
 
             final Envelope envelope = Envelope.fromSchema(valueSchema);
@@ -111,7 +113,7 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
     @Override
     public void assureNonEmptySchema() {
         if (collections.isEmpty()) {
-            LOGGER.warn("After applying blacklist/whitelist filters there are no tables to monitor, please check your configuration");
+            LOGGER.warn(DatabaseSchema.NO_CAPTURED_DATA_COLLECTIONS_WARNING);
         }
     }
 

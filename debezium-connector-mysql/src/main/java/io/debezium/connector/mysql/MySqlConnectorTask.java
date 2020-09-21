@@ -178,7 +178,9 @@ public final class MySqlConnectorTask extends BaseSourceTask {
             }
 
             // Check whether the row-level binlog is enabled ...
-            final boolean rowBinlogEnabled = isRowBinlogEnabled();
+            final boolean binlogFormatRow = isBinlogFormatRow();
+            final boolean binlogRowImageFull = isBinlogRowImageFull();
+            final boolean rowBinlogEnabled = binlogFormatRow && binlogRowImageFull;
 
             ChainedReader.Builder chainedReaderBuilder = new ChainedReader.Builder();
 
@@ -205,9 +207,16 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                 }
                 else {
                     if (!rowBinlogEnabled) {
-                        throw new ConnectException("The MySQL server is not configured to use a row-level binlog, which is "
-                                + "required for this connector to work properly. Change the MySQL configuration to use a "
-                                + "row-level binlog and restart the connector.");
+                        if (!binlogFormatRow) {
+                            throw new ConnectException("The MySQL server is not configured to use a ROW binlog_format, which is "
+                                    + "required for this connector to work properly. Change the MySQL configuration to use a "
+                                    + "binlog_format=ROW and restart the connector.");
+                        }
+                        else {
+                            throw new ConnectException("The MySQL server is not configured to use a FULL binlog_row_image, which is "
+                                    + "required for this connector to work properly. Change the MySQL configuration to use a "
+                                    + "binlog_row_image=FULL and restart the connector.");
+                        }
                     }
                     BinlogReader binlogReader = new BinlogReader("binlog", taskContext, null);
                     chainedReaderBuilder.addReader(binlogReader);
@@ -376,19 +385,25 @@ public final class MySqlConnectorTask extends BaseSourceTask {
             return false;
         }
         // otherwise, we have filter info
-        // if either whitelist has been added to, then we may have new tables
+        // if either include lists has been added to, then we may have new tables
 
-        if (hasExclusiveElements.apply(config.getString(MySqlConnectorConfig.DATABASE_WHITELIST), sourceInfo.getDatabaseWhitelist())) {
+        if (hasExclusiveElements.apply(
+                config.getFallbackStringProperty(MySqlConnectorConfig.DATABASE_INCLUDE_LIST, MySqlConnectorConfig.DATABASE_WHITELIST),
+                sourceInfo.getDatabaseIncludeList())) {
             return true;
         }
-        if (hasExclusiveElements.apply(config.getString(MySqlConnectorConfig.TABLE_WHITELIST), sourceInfo.getTableWhitelist())) {
+        if (hasExclusiveElements.apply(
+                config.getFallbackStringProperty(MySqlConnectorConfig.TABLE_INCLUDE_LIST, MySqlConnectorConfig.TABLE_WHITELIST),
+                sourceInfo.getTableIncludeList())) {
             return true;
         }
         // if either blacklist has been removed from, then we may have new tables
-        if (hasExclusiveElements.apply(sourceInfo.getDatabaseBlacklist(), config.getString(MySqlConnectorConfig.DATABASE_BLACKLIST))) {
+        if (hasExclusiveElements.apply(sourceInfo.getDatabaseExcludeList(),
+                config.getFallbackStringProperty(MySqlConnectorConfig.DATABASE_EXCLUDE_LIST, MySqlConnectorConfig.DATABASE_BLACKLIST))) {
             return true;
         }
-        if (hasExclusiveElements.apply(sourceInfo.getTableBlacklist(), config.getString(MySqlConnectorConfig.TABLE_BLACKLIST))) {
+        if (hasExclusiveElements.apply(sourceInfo.getTableExcludeList(),
+                config.getFallbackStringProperty(MySqlConnectorConfig.TABLE_EXCLUDE_LIST, MySqlConnectorConfig.TABLE_BLACKLIST))) {
             return true;
         }
         // otherwise, false.
@@ -591,11 +606,39 @@ public final class MySqlConnectorTask extends BaseSourceTask {
     }
 
     /**
+     * Determine whether the MySQL server has the binlog_row_image set to 'FULL'.
+     *
+     * @return {@code true} if the server's {@code binlog_row_image} is set to {@code FULL}, or {@code false} otherwise
+     */
+    protected boolean isBinlogRowImageFull() {
+        AtomicReference<String> rowImage = new AtomicReference<String>("");
+        try {
+            connectionContext.jdbc().query("SHOW GLOBAL VARIABLES LIKE 'binlog_row_image'", rs -> {
+                if (rs.next()) {
+                    rowImage.set(rs.getString(2));
+                }
+                else {
+                    // This setting was introduced in MySQL 5.6+ with default of 'FULL'.
+                    // For older versions, assume 'FULL'.
+                    rowImage.set("FULL");
+                }
+            });
+        }
+        catch (SQLException e) {
+            throw new ConnectException("Unexpected error while connecting to MySQL and looking at BINLOG_ROW_IMAGE mode: ", e);
+        }
+
+        logger.debug("binlog_row_image={}", rowImage.get());
+
+        return "FULL".equalsIgnoreCase(rowImage.get());
+    }
+
+    /**
      * Determine whether the MySQL server has the row-level binlog enabled.
      *
      * @return {@code true} if the server's {@code binlog_format} is set to {@code ROW}, or {@code false} otherwise
      */
-    protected boolean isRowBinlogEnabled() {
+    protected boolean isBinlogFormatRow() {
         AtomicReference<String> mode = new AtomicReference<String>("");
         try {
             connectionContext.jdbc().query("SHOW GLOBAL VARIABLES LIKE 'binlog_format'", rs -> {
@@ -605,24 +648,11 @@ public final class MySqlConnectorTask extends BaseSourceTask {
             });
         }
         catch (SQLException e) {
-            throw new ConnectException("Unexpected error while connecting to MySQL and looking at BINLOG mode: ", e);
+            throw new ConnectException("Unexpected error while connecting to MySQL and looking at BINLOG_FORMAT mode: ", e);
         }
 
         logger.debug("binlog_format={}", mode.get());
 
-        AtomicReference<String> rowImage = new AtomicReference<String>("");
-        try {
-            connectionContext.jdbc().query("SHOW GLOBAL VARIABLES LIKE 'binlog_row_image'", rs -> {
-                if (rs.next()) {
-                    rowImage.set(rs.getString(2));
-                }
-            });
-        }
-        catch (SQLException e) {
-            throw new ConnectException("Unexpected error while connecting to MySQL and looking at BINLOG row image mode: ", e);
-        }
-
-        logger.debug("binlog_row_image={}", rowImage.get());
-        return "ROW".equalsIgnoreCase(mode.get()) && "FULL".equalsIgnoreCase(rowImage.get());
+        return "ROW".equalsIgnoreCase(mode.get());
     }
 }

@@ -68,7 +68,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
                         .with(MySqlConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
                         .with(MySqlConnectorConfig.DATABASE_HISTORY, FileDatabaseHistory.class)
                         .with(FileDatabaseHistory.FILE_PATH, DB_HISTORY_PATH)
-                        .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("simple"))
+                        .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("simple"))
                         .with(MySqlConnectorConfig.TABLES_IGNORE_BUILTIN, Boolean.TRUE)
                         .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, Boolean.TRUE)
                         .build());
@@ -116,7 +116,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
                         .with(MySqlConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL_ONLY)
                         .with(MySqlConnectorConfig.DATABASE_HISTORY, FileDatabaseHistory.class)
                         .with(FileDatabaseHistory.FILE_PATH, DB_HISTORY_PATH)
-                        .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("simple"))
+                        .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("simple"))
                         .with(MySqlConnectorConfig.TABLES_IGNORE_BUILTIN, Boolean.TRUE)
                         .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, Boolean.TRUE)
                         .build());
@@ -139,7 +139,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
                         .with(MySqlConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
                         .with(MySqlConnectorConfig.DATABASE_HISTORY, FileDatabaseHistory.class)
                         .with(FileDatabaseHistory.FILE_PATH, DB_HISTORY_PATH)
-                        .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("simple"))
+                        .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("simple"))
                         .with(MySqlConnectorConfig.TABLES_IGNORE_BUILTIN, Boolean.TRUE)
                         .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, Boolean.TRUE)
                         .build());
@@ -156,7 +156,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
                         .with(MySqlConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER)
                         .with(MySqlConnectorConfig.DATABASE_HISTORY, FileDatabaseHistory.class)
                         .with(FileDatabaseHistory.FILE_PATH, DB_HISTORY_PATH)
-                        .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("simple"))
+                        .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("simple"))
                         .with(MySqlConnectorConfig.TABLES_IGNORE_BUILTIN, Boolean.TRUE)
                         .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, Boolean.TRUE)
                         .build());
@@ -202,8 +202,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalTableCount")).isEqualTo(1);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "MonitoredTables"))
                 .isEqualTo(new String[]{ DATABASE.qualifiedTableName("simple") });
-        // ommitted the following because its only populated as part of the common connector framework.
-        // assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalNumberOfEventsSeen")).isEqualTo(0L);
+        assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "TotalNumberOfEventsSeen")).isEqualTo(2L);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "NumberOfEventsFiltered")).isEqualTo(0L);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "NumberOfErroneousEvents")).isEqualTo(0L);
         assertThat(mBeanServer.getAttribute(getSnapshotMetricsObjectName(), "RemainingTableCount")).isEqualTo(0);

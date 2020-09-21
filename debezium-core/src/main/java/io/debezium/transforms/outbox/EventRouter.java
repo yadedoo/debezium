@@ -45,7 +45,6 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EventRouter.class);
 
-    public static final String ENVELOPE_EVENT_TYPE = "eventType";
     private static final String ENVELOPE_PAYLOAD = "payload";
 
     private final ExtractField<R> afterExtractor = new ExtractField.Value<>();
@@ -114,6 +113,7 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
         Object eventId = eventStruct.get(fieldEventId);
         Object payload = eventStruct.get(fieldPayload);
         Object payloadId = eventStruct.get(fieldPayloadId);
+        final Field fallbackPayloadIdField = eventValueSchema.field(fieldPayloadId);
 
         final Field eventIdField = eventValueSchema.field(fieldEventId);
         if (eventIdField == null) {
@@ -125,8 +125,8 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
 
         final Schema structValueSchema = onlyHeadersInOutputMessage ? null
                 : (fieldSchemaVersion == null)
-                        ? getValueSchema(eventValueSchema)
-                        : getValueSchema(eventValueSchema, eventStruct.getInt32(fieldSchemaVersion));
+                        ? getValueSchema(eventValueSchema, eventStruct.getString(routeByField))
+                        : getValueSchema(eventValueSchema, eventStruct.getInt32(fieldSchemaVersion), eventStruct.getString(routeByField));
 
         final Struct structValue = onlyHeadersInOutputMessage ? null : new Struct(structValueSchema).put(ENVELOPE_PAYLOAD, payload);
 
@@ -167,7 +167,7 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
         R newRecord = r.newRecord(
                 eventStruct.getString(routeByField),
                 null,
-                Schema.STRING_SCHEMA,
+                defineRecordKeySchema(eventValueSchema, fallbackPayloadIdField),
                 defineRecordKey(eventStruct, payloadId),
                 updatedSchema,
                 updatedValue,
@@ -213,6 +213,19 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
             default:
                 throw new ConnectException(String.format("Unsupported field type %s for event timestamp", schemaName));
         }
+    }
+
+    private Schema defineRecordKeySchema(Schema eventStruct, Field fallbackKeyField) {
+        Field eventKeySchema = null;
+        if (fieldEventKey != null) {
+            eventKeySchema = eventStruct.field(fieldEventKey);
+        }
+
+        if (eventKeySchema != null) {
+            return eventKeySchema.schema();
+        }
+
+        return (fallbackKeyField != null) ? fallbackKeyField.schema() : Schema.STRING_SCHEMA;
     }
 
     private Object defineRecordKey(Struct eventStruct, Object fallbackKey) {
@@ -283,17 +296,17 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
         onlyHeadersInOutputMessage = !additionalFields.stream().anyMatch(field -> field.getPlacement() == EventRouterConfigDefinition.AdditionalFieldPlacement.ENVELOPE);
     }
 
-    private Schema getValueSchema(Schema debeziumEventSchema) {
+    private Schema getValueSchema(Schema debeziumEventSchema, String routedTopic) {
         if (defaultValueSchema == null) {
-            defaultValueSchema = getSchemaBuilder(debeziumEventSchema).build();
+            defaultValueSchema = getSchemaBuilder(debeziumEventSchema, routedTopic).build();
         }
 
         return defaultValueSchema;
     }
 
-    private Schema getValueSchema(Schema debeziumEventSchema, Integer version) {
+    private Schema getValueSchema(Schema debeziumEventSchema, Integer version, String routedTopic) {
         if (!versionedValueSchema.containsKey(version)) {
-            final Schema schema = getSchemaBuilder(debeziumEventSchema)
+            final Schema schema = getSchemaBuilder(debeziumEventSchema, routedTopic)
                     .version(version)
                     .build();
             versionedValueSchema.put(version, schema);
@@ -302,8 +315,8 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
         return versionedValueSchema.get(version);
     }
 
-    private SchemaBuilder getSchemaBuilder(Schema debeziumEventSchema) {
-        SchemaBuilder schemaBuilder = SchemaBuilder.struct();
+    private SchemaBuilder getSchemaBuilder(Schema debeziumEventSchema, String routedTopic) {
+        SchemaBuilder schemaBuilder = SchemaBuilder.struct().name(getSchemaName(debeziumEventSchema, routedTopic));
 
         // Add payload field
         schemaBuilder
@@ -319,5 +332,23 @@ public class EventRouter<R extends ConnectRecord<R>> implements Transformation<R
         }));
 
         return schemaBuilder;
+    }
+
+    private String getSchemaName(Schema debeziumEventSchema, String routedTopic) {
+        final String schemaName;
+        final String originalSchemaName = debeziumEventSchema.name();
+        if (originalSchemaName != null) {
+            final int lastDot = originalSchemaName.lastIndexOf('.');
+            if (lastDot != -1) {
+                schemaName = originalSchemaName.substring(0, lastDot + 1) + routedTopic + "." + originalSchemaName.substring(lastDot + 1);
+            }
+            else {
+                schemaName = routedTopic + "." + originalSchemaName;
+            }
+        }
+        else {
+            schemaName = routedTopic;
+        }
+        return schemaName;
     }
 }

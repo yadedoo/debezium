@@ -6,8 +6,9 @@
 
 package io.debezium.connector.postgresql;
 
-import static io.debezium.connector.postgresql.junit.SkipWhenDatabaseVersionLessThan.PostgresVersion.POSTGRES_10;
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static io.debezium.relational.RelationalDatabaseConnectorConfig.SCHEMA_BLACKLIST;
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.SCHEMA_EXCLUDE_LIST;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -24,12 +25,9 @@ import org.apache.kafka.connect.data.SchemaBuilder;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TestRule;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.data.Ltree;
-import io.debezium.connector.postgresql.junit.SkipTestDependingOnDatabaseVersionRule;
-import io.debezium.connector.postgresql.junit.SkipWhenDatabaseVersionLessThan;
 import io.debezium.data.Bits;
 import io.debezium.data.Json;
 import io.debezium.data.Uuid;
@@ -40,6 +38,8 @@ import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
 import io.debezium.doc.FixFor;
+import io.debezium.junit.SkipTestRule;
+import io.debezium.junit.SkipWhenDatabaseVersion;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
@@ -60,7 +60,7 @@ import io.debezium.util.Strings;
 public class PostgresSchemaIT {
 
     @Rule
-    public final TestRule skip = new SkipTestDependingOnDatabaseVersionRule();
+    public final SkipTestRule skipTest = new SkipTestRule();
 
     private static final String[] TEST_TABLES = new String[]{ "public.numeric_table", "public.numeric_decimal_table", "public.string_table",
             "public.cash_table", "public.bitbin_table", "public.network_address_table",
@@ -84,7 +84,7 @@ public class PostgresSchemaIT {
         PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
         schema = TestHelper.getSchema(config);
 
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(TEST_TABLES);
             Arrays.stream(TEST_TABLES).forEach(tableId -> assertKeySchema(tableId, "pk", Schema.INT32_SCHEMA));
@@ -106,9 +106,11 @@ public class PostgresSchemaIT {
             assertTableSchema("public.cidr_network_address_table", "i", Schema.OPTIONAL_STRING_SCHEMA);
             assertTableSchema("public.macaddr_table", "m", Schema.OPTIONAL_STRING_SCHEMA);
             assertTableSchema("public.cash_table", "csh", Decimal.builder(2).optional().build());
-            assertTableSchema("public.bitbin_table", "ba, bol, bs, bv",
-                    Schema.OPTIONAL_BYTES_SCHEMA, Schema.OPTIONAL_BOOLEAN_SCHEMA, Bits.builder(2).optional().build(),
-                    Bits.builder(2).optional().build());
+            assertTableSchema("public.bitbin_table", "ba, bol, bol2, bs, bs7, bv, bvl, bvunlimited1, bvunlimited2",
+                    Schema.OPTIONAL_BYTES_SCHEMA, Schema.OPTIONAL_BOOLEAN_SCHEMA, Schema.OPTIONAL_BOOLEAN_SCHEMA,
+                    Bits.builder(2).optional().build(), Bits.builder(7).optional().build(),
+                    Bits.builder(2).optional().build(), Bits.builder(64).optional().build(),
+                    Bits.builder(Integer.MAX_VALUE).optional().build(), Bits.builder(Integer.MAX_VALUE).optional().build());
             assertTableSchema("public.time_table", "ts, tz, date, ti, ttz, it",
                     MicroTimestamp.builder().optional().build(), ZonedTimestamp.builder().optional().build(),
                     Date.builder().optional().build(), MicroTime.builder().optional().build(), ZonedTime.builder().optional().build(),
@@ -133,8 +135,7 @@ public class PostgresSchemaIT {
     }
 
     @Test
-    // MACADDR8 Postgres type is only supported since Postgres version 10
-    @SkipWhenDatabaseVersionLessThan(POSTGRES_10)
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 10, reason = "MACADDR8 type is only supported on Postgres 10+")
     @FixFor("DBZ-1193")
     public void shouldLoadSchemaForMacaddr8PostgresType() throws Exception {
         String tableId = "public.macaddr8_table";
@@ -144,7 +145,7 @@ public class PostgresSchemaIT {
         PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
         schema = TestHelper.getSchema(config);
 
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(tableId);
             assertKeySchema(tableId, "pk", Schema.INT32_SCHEMA);
@@ -160,7 +161,7 @@ public class PostgresSchemaIT {
 
         schema = TestHelper.getSchema(config);
 
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(TEST_TABLES);
             assertTableSchema("public.custom_table", "lt", Ltree.builder().optional().build());
@@ -175,7 +176,7 @@ public class PostgresSchemaIT {
         PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
         schema = TestHelper.getSchema(config);
 
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             final String[] testTables = new String[]{ "public.postgis_table" };
             assertTablesIncluded(testTables);
@@ -199,13 +200,28 @@ public class PostgresSchemaIT {
                 "CREATE TABLE s2.A (pk SERIAL, aa integer, PRIMARY KEY(pk));" +
                 "CREATE TABLE s2.B (pk SERIAL, ba integer, PRIMARY KEY(pk));";
         TestHelper.execute(statements);
-        PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_BLACKLIST, "s1").build());
+        PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_EXCLUDE_LIST, "s1").build());
         final TypeRegistry typeRegistry = TestHelper.getTypeRegistry();
         schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded("s2.a", "s2.b");
             assertTablesExcluded("s1.a", "s1.b");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_BLACKLIST, "s1").build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertTablesIncluded("s2.a", "s2.b");
+            assertTablesExcluded("s1.a", "s1.b");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_EXCLUDE_LIST, "s.*").build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.create()) {
+            schema.refresh(connection, false);
+            assertTablesExcluded("s1.a", "s2.a", "s1.b", "s2.b");
         }
 
         config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_BLACKLIST, "s.*").build());
@@ -215,12 +231,31 @@ public class PostgresSchemaIT {
             assertTablesExcluded("s1.a", "s2.a", "s1.b", "s2.b");
         }
 
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_BLACKLIST, "s1.A,s2.A").build());
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_EXCLUDE_LIST, "s1.A,s2.A").build());
         schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded("s1.b", "s2.b");
             assertTablesExcluded("s1.a", "s2.a");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_BLACKLIST, "s1.A,s2.A").build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertTablesIncluded("s1.b", "s2.b");
+            assertTablesExcluded("s1.a", "s2.a");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig()
+                .with(SCHEMA_EXCLUDE_LIST, "s2")
+                .with(PostgresConnectorConfig.TABLE_EXCLUDE_LIST, "s1.A")
+                .build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertTablesIncluded("s1.b");
+            assertTablesExcluded("s1.a", "s2.a", "s2.b");
         }
 
         config = new PostgresConnectorConfig(TestHelper.defaultConfig()
@@ -228,15 +263,40 @@ public class PostgresSchemaIT {
                 .with(PostgresConnectorConfig.TABLE_BLACKLIST, "s1.A")
                 .build());
         schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded("s1.b");
             assertTablesExcluded("s1.a", "s2.a", "s2.b");
         }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_EXCLUDE_LIST, ".*aa")
+                .build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertColumnsExcluded("s1.a.aa", "s2.a.aa");
+        }
+
         config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_BLACKLIST, ".*aa")
                 .build());
         schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertColumnsExcluded("s1.a.aa", "s2.a.aa");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_INCLUDE_LIST, ".*bb")
+                .build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            assertColumnsExcluded("s1.a.aa", "s2.a.aa");
+        }
+
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_WHITELIST, ".*bb")
+                .build());
+        schema = TestHelper.getSchema(config, typeRegistry);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertColumnsExcluded("s1.a.aa", "s2.a.aa");
         }
@@ -250,7 +310,7 @@ public class PostgresSchemaIT {
         TestHelper.execute(statements);
         PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
         schema = TestHelper.getSchema(config);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded("public.table1");
         }
@@ -259,7 +319,7 @@ public class PostgresSchemaIT {
                 "CREATE TABLE table2 (pk SERIAL, strcol VARCHAR, PRIMARY KEY(pk));";
         TestHelper.execute(statements);
         String tableId = "public.table2";
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(tableId);
             assertTablesExcluded("public.table1");
@@ -271,7 +331,7 @@ public class PostgresSchemaIT {
                 "ALTER TABLE table2 DROP COLUMN strcol;";
 
         TestHelper.execute(statements);
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, TableId.parse(tableId, false), false);
             assertTablesIncluded(tableId);
             assertTablesExcluded("public.table1");
@@ -294,7 +354,7 @@ public class PostgresSchemaIT {
         // Before refreshing, we should have an empty array for the table
         assertTrue(schema.getToastableColumnsForTableId(tableId).isEmpty());
 
-        try (PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             // Load up initial schema info. This should not populate the toastable columns cache, as the cache is loaded
             // on-demand per-table refresh.
             schema.refresh(connection, false);

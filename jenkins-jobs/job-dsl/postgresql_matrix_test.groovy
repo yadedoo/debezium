@@ -13,7 +13,7 @@ matrixJob('debezium-postgresql-matrix-test') {
 
     axes {
         text('POSTGRES_VERSION', '10', '11', '12')
-        text('DECODER_PLUGIN', 'decoderbufs', 'wal2json', 'pgoutput')
+        text('DECODER_PLUGIN', 'decoderbufs', 'wal2json', 'wal2json_streaming', 'pgoutput')
     }
 
     properties {
@@ -72,7 +72,7 @@ else
 fi
                                
 # Run maven build
-mvn clean install -U -s $HOME/.m2/settings-snapshots.xml -pl debezium-connector-mysql -am -fae \
+mvn clean install -U -s $HOME/.m2/settings-snapshots.xml -pl debezium-connector-postgres -am -fae \
     -Dmaven.test.failure.ignore=true \
     -Dpostgres.port=55432 \
     -Dversion.postgres.server=$POSTGRES_VERSION \

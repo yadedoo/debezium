@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.mysql;
 
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.fest.assertions.Assertions.assertThat;
 
 import java.math.BigDecimal;
@@ -36,6 +37,11 @@ import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.TemporalPrecisionMode;
+import io.debezium.junit.EqualityCheck;
+import io.debezium.junit.SkipWhenDatabaseVersion;
+import io.debezium.junit.SkipWhenKafkaVersion;
+import io.debezium.junit.SkipWhenKafkaVersion.KafkaVersion;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.history.DatabaseHistory;
 import io.debezium.time.MicroTimestamp;
 import io.debezium.time.Timestamp;
@@ -45,6 +51,7 @@ import io.debezium.util.Testing;
 /**
  * @author luobo
  */
+@SkipWhenDatabaseVersion(check = LESS_THAN, major = 5, minor = 6, reason = "DDL uses fractional second data types, not supported until MySQL 5.6")
 public class MysqlDefaultValueIT extends AbstractConnectorTest {
 
     // 4 meta events (set character_set etc.) and then 15 tables with 3 events each (drop DDL, create DDL, insert)
@@ -75,6 +82,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedTinyIntTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -108,6 +116,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedSmallIntTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -147,6 +156,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedMediumIntTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -180,6 +190,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedIntTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -213,6 +224,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedBigIntToLongTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -246,6 +258,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedBigIntToBigDecimalTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -281,6 +294,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void stringTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -313,6 +327,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void unsignedBitTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -349,6 +364,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void booleanTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -374,6 +390,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void numberTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -405,6 +422,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void tinyIntBooleanTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -434,14 +452,15 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-1689")
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void intBooleanTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
                 .build();
         start(MySqlConnector.class, config);
 
-        // Testing.Print.enable();
-
+        Testing.Print.enable();
+        waitForSnapshotToBeCompleted("mysql", DATABASE.getServerName());
         consumeRecordsByTopic(EVENT_COUNT);
         try (final Connection conn = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName()).connection()) {
             conn.createStatement().execute("CREATE TABLE int_boolean_table (" +
@@ -462,6 +481,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void floatAndDoubleTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -482,6 +502,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void realTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -505,7 +526,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     public void numericAndDecimalToDoubleTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
-                .with(MySqlConnectorConfig.DECIMAL_HANDLING_MODE, JdbcValueConverters.DecimalMode.DOUBLE)
+                .with(MySqlConnectorConfig.DECIMAL_HANDLING_MODE, RelationalDatabaseConnectorConfig.DecimalHandlingMode.DOUBLE)
                 .build();
         start(MySqlConnector.class, config);
 
@@ -525,10 +546,11 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void numericAndDecimalToDecimalTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
-                .with(MySqlConnectorConfig.DECIMAL_HANDLING_MODE, JdbcValueConverters.DecimalMode.PRECISE)
+                .with(MySqlConnectorConfig.DECIMAL_HANDLING_MODE, RelationalDatabaseConnectorConfig.DecimalHandlingMode.PRECISE)
                 .build();
         start(MySqlConnector.class, config);
 
@@ -550,7 +572,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     public void dateAndTimeTest() throws InterruptedException {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("DATE_TIME_TABLE"))
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DATE_TIME_TABLE"))
                 .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, true)
                 .build();
         start(MySqlConnector.class, config);
@@ -614,10 +636,11 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void timeTypeWithConnectMode() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("DATE_TIME_TABLE"))
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DATE_TIME_TABLE"))
                 .with(MySqlConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.CONNECT)
                 .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, true)
                 .build();
@@ -675,6 +698,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-771")
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void columnTypeAndDefaultValueChange() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -714,6 +738,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
 
     @Test
     @FixFor({ "DBZ-771", "DBZ-1321" })
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void columnTypeChangeResetsDefaultValue() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
@@ -755,33 +780,34 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
-    @FixFor("DBZ-1123")
-    public void generatedValueTest() throws InterruptedException {
+    @FixFor("DBZ-2267")
+    public void alterDateAndTimeTest() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("ALTER_DATE_TIME"))
+                .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, true)
+                .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
                 .build();
         start(MySqlConnector.class, config);
 
-        // Testing.Print.enable();
+        waitForSnapshotToBeCompleted("mysql", DATABASE.getServerName());
+        Testing.Print.enable();
 
-        SourceRecords records = consumeRecordsByTopic(EVENT_COUNT);
-        SourceRecord record = records.recordsForTopic(DATABASE.topicForTable("GENERATED_TABLE")).get(0);
-        validate(record);
+        // Connect to the DB and issue our insert statement to test.
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName())) {
+            try (JdbcConnection connection = db.connect()) {
+                connection.execute("create table ALTER_DATE_TIME (ID int primary key);");
+                connection.execute("alter table ALTER_DATE_TIME add column CREATED timestamp not null default current_timestamp");
+                connection.execute("insert into ALTER_DATE_TIME values(1000, default);");
+            }
+        }
 
-        Schema schemaB = record.valueSchema().fields().get(1).schema().fields().get(1).schema();
-        Integer recordB = ((Struct) record.value()).getStruct("after").getInt32("B");
-        Schema schemaC = record.valueSchema().fields().get(1).schema().fields().get(2).schema();
-        Integer recordC = ((Struct) record.value()).getStruct("after").getInt32("C");
-
-        // Calculated default value is reported as null in schema
-        assertThat(schemaB.isOptional()).isEqualTo(true);
-        assertThat(schemaB.defaultValue()).isEqualTo(null);
-        assertThat(schemaC.isOptional()).isEqualTo(false);
-        assertThat(schemaC.defaultValue()).isEqualTo(null);
-
-        assertThat(recordB).isEqualTo(30);
-        assertThat(recordC).isEqualTo(45);
+        final SourceRecords records = consumeRecordsByTopic(1);
+        final SourceRecord record = records.allRecordsInOrder().get(0);
 
         validate(record);
+
+        final Schema columnSchema = record.valueSchema().fields().get(1).schema().fields().get(1).schema();
+        assertThat(columnSchema.defaultValue()).isEqualTo("1970-01-01T00:00:00Z");
     }
 }

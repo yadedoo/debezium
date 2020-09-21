@@ -4,13 +4,13 @@
   <parent>
     <groupId>org.jboss</groupId>
     <artifactId>jboss-parent</artifactId>
-    <version>35</version>
+    <version>36</version>
   </parent>
 
     <modelVersion>4.0.0</modelVersion>
     <groupId>io.debezium</groupId>
     <artifactId>debezium-parent</artifactId>
-    <version>1.1.0-SNAPSHOT</version>
+    <version>1.3.0-SNAPSHOT</version>
     <name>Debezium Parent POM</name>
     <description>Debezium is an open source change data capture platform</description>
     <packaging>pom</packaging>
@@ -56,23 +56,23 @@
         <release>8</release>
 
         <!-- Kafka and it's dependencies MUST reflect what the Kafka version uses -->
-        <version.kafka>2.4.0</version.kafka>
+        <version.kafka>2.6.0</version.kafka>
         <version.kafka.scala>2.12</version.kafka.scala>
         <version.curator>4.2.0</version.curator>
-        <version.zookeeper>3.5.6</version.zookeeper>
-        <version.jackson>2.10.0</version.jackson>
-        <version.org.slf4j>1.7.28</version.org.slf4j>
+        <version.zookeeper>3.5.8</version.zookeeper>
+        <version.jackson>2.10.2</version.jackson>
+        <version.org.slf4j>1.7.30</version.org.slf4j>
         <version.log4j>1.2.17</version.log4j>
         <!-- check new release version at https://github.com/confluentinc/schema-registry/releases -->
-        <version.confluent.platform>5.3.1</version.confluent.platform>
+        <version.confluent.platform>5.5.1</version.confluent.platform>
 
         <!-- Databases -->
-        <version.postgresql.driver>42.2.9</version.postgresql.driver>
+        <version.postgresql.driver>42.2.14</version.postgresql.driver>
         <version.mysql.server>5.7</version.mysql.server>
         <version.mysql.driver>8.0.16</version.mysql.driver>
-        <version.mysql.binlog>0.19.1</version.mysql.binlog>
+        <version.mysql.binlog>0.23.1</version.mysql.binlog>
         <version.mongo.server>3.6</version.mongo.server>
-        <version.mongo.driver>3.12.2</version.mongo.driver>
+        <version.mongo.driver>3.12.3</version.mongo.driver>
         <version.sqlserver.driver>7.2.2.jre8</version.sqlserver.driver>
 
         <!-- Connectors -->
@@ -82,9 +82,14 @@
         <antlr.version>4.7.2</antlr.version>
 
         <!-- Quarkus -->
-        <quarkus.version>1.2.0.Final</quarkus.version>
+        <quarkus.version>1.7.1.Final</quarkus.version>
+
         <!-- HTTP client -->
         <version.okhttp>4.2.2</version.okhttp>
+
+        <!-- Scripting -->
+        <version.groovy>3.0.2</version.groovy>
+        <version.graalvm.js>20.0.0</version.graalvm.js>
 
         <!-- Testing -->
         <version.junit>4.12</version.junit>
@@ -112,13 +117,17 @@
         <version.staging.plugin>1.6.8</version.staging.plugin>
         <version.protoc.maven.plugin>3.8.0</version.protoc.maven.plugin>
         <version.javadoc.plugin>3.1.1</version.javadoc.plugin>
-        <version.code.formatter>2.8.1</version.code.formatter>
+        <version.code.formatter>2.11.0</version.code.formatter>
         <version.surefire.plugin>3.0.0-M3</version.surefire.plugin>
-        <version.checkstyle.plugin>3.0.0</version.checkstyle.plugin>
+        <version.checkstyle.plugin>3.1.1</version.checkstyle.plugin>
         <version.release.plugin>2.5.3</version.release.plugin>
-        <version.impsort>1.2.0</version.impsort>
-        <version.surefire.plugin>2.22.2</version.surefire.plugin>
+        <version.impsort>1.3.2</version.impsort>
         <version.failsafe.plugin>${version.surefire.plugin}</version.failsafe.plugin>
+        <version.checkstyle>8.32</version.checkstyle>
+        <version.revapi.plugin>0.11.5</version.revapi.plugin>
+        <version.jandex>1.0.8</version.jandex>
+        <version.revapi-java.plugin>0.21.0</version.revapi-java.plugin>
+        <version.build-helper.plugin>1.9.1</version.build-helper.plugin>
 
         <!-- Dockerfiles -->
         <docker.maintainer>Debezium community</docker.maintainer>
@@ -150,11 +159,15 @@
 
         <!-- Needed for pre jdk 9 -->
         <useSystemClassLoader>true</useSystemClassLoader>
+
+        <!-- Skip the API checks by default. Let the modules opt in. -->
+        <revapi.skip>true</revapi.skip>
     </properties>
 
     <modules>
         <module>support/checkstyle</module>
         <module>support/ide-configs</module>
+        <module>support/revapi</module>
         <module>debezium-api</module>
         <module>debezium-ddl-parser</module>
         <module>debezium-assembly-descriptors</module>
@@ -166,6 +179,8 @@
         <module>debezium-connector-sqlserver</module>
         <module>debezium-microbenchmark</module>
         <module>debezium-quarkus-outbox</module>
+        <module>debezium-scripting</module>
+        <module>debezium-server</module>
         <module>debezium-testing</module>
     </modules>
 
@@ -213,6 +228,16 @@
             <dependency>
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-core</artifactId>
+                <version>${version.jackson}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.datatype</groupId>
+                <artifactId>jackson-datatype-joda</artifactId>
+                <version>${version.jackson}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.dataformat</groupId>
+                <artifactId>jackson-dataformat-yaml</artifactId>
                 <version>${version.jackson}</version>
             </dependency>
             <dependency>
@@ -316,7 +341,7 @@
                 <version>${version.mysql.driver}</version>
             </dependency>
             <dependency>
-                <groupId>com.github.shyiko</groupId>
+                <groupId>com.zendesk</groupId>
                 <artifactId>mysql-binlog-connector-java</artifactId>
                 <version>${version.mysql.binlog}</version>
             </dependency>
@@ -355,6 +380,33 @@
                 <groupId>log4j</groupId>
                 <artifactId>log4j</artifactId>
                 <version>${version.log4j}</version>
+            </dependency>
+
+            <!-- Scripting -->
+            <dependency>
+                <groupId>org.codehaus.groovy</groupId>
+                <artifactId>groovy</artifactId>
+                <version>${version.groovy}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.codehaus.groovy</groupId>
+                <artifactId>groovy-json</artifactId>
+                <version>${version.groovy}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.codehaus.groovy</groupId>
+                <artifactId>groovy-jsr223</artifactId>
+                <version>${version.groovy}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.graalvm.js</groupId>
+                <artifactId>js</artifactId>
+                <version>${version.graalvm.js}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.graalvm.js</groupId>
+                <artifactId>js-scriptengine</artifactId>
+                <version>${version.graalvm.js}</version>
             </dependency>
 
             <!-- Testing utilities -->
@@ -421,6 +473,11 @@
             </dependency>
             <dependency>
                 <groupId>io.debezium</groupId>
+                <artifactId>debezium-scripting</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.debezium</groupId>
                 <artifactId>debezium-embedded</artifactId>
                 <version>${project.version}</version>
             </dependency>
@@ -447,6 +504,16 @@
             <dependency>
                 <groupId>io.debezium</groupId>
                 <artifactId>debezium-ddl-parser</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-connector-mongodb</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-connector-sqlserver</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
@@ -599,6 +666,33 @@
                         <removeUnused>true</removeUnused>
                     </configuration>
                 </plugin>
+               <plugin>
+                    <groupId>org.jboss.jandex</groupId>
+                    <artifactId>jandex-maven-plugin</artifactId>
+                    <version>${version.jandex}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.revapi</groupId>
+                    <artifactId>revapi-maven-plugin</artifactId>
+                    <version>${version.revapi.plugin}</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>io.debezium</groupId>
+                            <artifactId>debezium-revapi</artifactId>
+                            <version>${project.version}</version>
+                        </dependency>
+                        <dependency>
+                            <groupId>org.revapi</groupId>
+                            <artifactId>revapi-java</artifactId>
+                            <version>${version.revapi-java.plugin}</version>
+                        </dependency>
+                    </dependencies>
+                </plugin>
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>build-helper-maven-plugin</artifactId>
+                    <version>${version.build-helper.plugin}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
         <plugins>
@@ -702,7 +796,7 @@
                         <configuration>
                             <rules>
                                 <requireMavenVersion>
-                                    <version>3.0.5</version>
+                                    <version>3.6.3</version>
                                 </requireMavenVersion>
                             </rules>
                         </configuration>
@@ -779,6 +873,56 @@
                         <phase>verify</phase>
                         <goals>
                             <goal>checkstyle</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <!-- Serves as support for configuring Revapi -->
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>parse-version</id>
+                        <goals>
+                            <!-- This defines the ${parsedVersion.*} properties used in the Revapi config. -->
+                            <goal>parse-version</goal>
+                        </goals>
+                        <phase>validate</phase>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.revapi</groupId>
+                <artifactId>revapi-maven-plugin</artifactId>
+                <configuration>
+                    <failOnMissingConfigurationFiles>false</failOnMissingConfigurationFiles>
+                    <!-- Consider changes from the latest .Final version, not from the latest non-snapshot. -->
+                    <versionFormat>\d+\.\d+\.\d+\.Final</versionFormat>
+                    <ignoreSuggestionsFormat>xml</ignoreSuggestionsFormat>
+                    <analysisConfigurationFiles>
+                        <configurationFile>
+                            <!-- common API checking configuration -->
+                            <resource>revapi/revapi-configuration.xml</resource>
+                        </configurationFile>
+                        <configurationFile>
+                            <!-- API changes recorded in the support/revapi module -->
+                            <resource>revapi/debezium-api-changes.xml</resource>
+                            <roots>
+                                <!--
+                                    The XML file has "<analysisConfiguration>" root node, underneath which
+                                    there are nodes named after each version.
+                                    This way we only need a single file for all releases of Debezium.
+                                -->
+                                <root>analysisConfiguration/version-${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.incrementalVersion}</root>
+                            </roots>
+                        </configurationFile>
+                    </analysisConfigurationFiles>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>check</goal>
                         </goals>
                     </execution>
                 </executions>

@@ -9,7 +9,9 @@ import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.source.SourceConnector;
 
+import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.relational.Selectors.TableIdToStringMapper;
@@ -27,7 +29,10 @@ import io.debezium.relational.history.KafkaDatabaseHistory;
 public abstract class HistorizedRelationalDatabaseConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 2_000;
+
     private boolean useCatalogBeforeSchema;
+    private final String logicalName;
+    private final Class<? extends SourceConnector> connectorClass;
 
     /**
      * The database history class is hidden in the {@link #configDef()} since that is designed to work with a user interface,
@@ -44,15 +49,30 @@ public abstract class HistorizedRelationalDatabaseConnectorConfig extends Relati
                     + DatabaseHistory.CONFIGURATION_FIELD_PREFIX_STRING + "' string.")
             .withDefault(KafkaDatabaseHistory.class.getName());
 
-    protected HistorizedRelationalDatabaseConnectorConfig(Configuration config, String logicalName, TableFilter systemTablesFilter, boolean useCatalogBeforeSchema) {
+    protected static final ConfigDefinition CONFIG_DEFINITION = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
+            .history(
+                    DATABASE_HISTORY,
+                    KafkaDatabaseHistory.BOOTSTRAP_SERVERS,
+                    KafkaDatabaseHistory.TOPIC,
+                    KafkaDatabaseHistory.RECOVERY_POLL_ATTEMPTS,
+                    KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS)
+            .create();
+
+    protected HistorizedRelationalDatabaseConnectorConfig(Class<? extends SourceConnector> connectorClass, Configuration config, String logicalName,
+                                                          TableFilter systemTablesFilter, boolean useCatalogBeforeSchema) {
         super(config, logicalName, systemTablesFilter, TableId::toString, DEFAULT_SNAPSHOT_FETCH_SIZE);
         this.useCatalogBeforeSchema = useCatalogBeforeSchema;
+        this.logicalName = logicalName;
+        this.connectorClass = connectorClass;
     }
 
-    protected HistorizedRelationalDatabaseConnectorConfig(Configuration config, String logicalName, TableFilter systemTablesFilter, TableIdToStringMapper tableIdMapper,
+    protected HistorizedRelationalDatabaseConnectorConfig(Class<? extends SourceConnector> connectorClass, Configuration config, String logicalName,
+                                                          TableFilter systemTablesFilter, TableIdToStringMapper tableIdMapper,
                                                           boolean useCatalogBeforeSchema) {
         super(config, logicalName, systemTablesFilter, tableIdMapper, DEFAULT_SNAPSHOT_FETCH_SIZE);
         this.useCatalogBeforeSchema = useCatalogBeforeSchema;
+        this.logicalName = logicalName;
+        this.connectorClass = connectorClass;
     }
 
     /**
@@ -71,6 +91,8 @@ public abstract class HistorizedRelationalDatabaseConnectorConfig extends Relati
         Configuration dbHistoryConfig = config.subset(DatabaseHistory.CONFIGURATION_FIELD_PREFIX_STRING, false)
                 .edit()
                 .withDefault(DatabaseHistory.NAME, getLogicalName() + "-dbhistory")
+                .withDefault(KafkaDatabaseHistory.INTERNAL_CONNECTOR_CLASS, connectorClass.getName())
+                .withDefault(KafkaDatabaseHistory.INTERNAL_CONNECTOR_ID, logicalName)
                 .build();
 
         HistoryRecordComparator historyComparator = getHistoryRecordComparator();

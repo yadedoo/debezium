@@ -8,6 +8,7 @@ package io.debezium.transforms.outbox;
 import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
 import static org.fest.assertions.Assertions.assertThat;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
@@ -272,7 +273,7 @@ public class EventRouterTest {
         final SourceRecord eventRouted = router.apply(eventRecord);
 
         assertThat(eventRouted).isNotNull();
-        assertThat(((Struct) eventRouted.value()).getString("payload")).isEqualTo("{}");
+        assertThat(eventRouted.value()).isEqualTo("{}");
 
         assertThat(eventRouted.valueSchema().version()).isNull();
     }
@@ -438,7 +439,7 @@ public class EventRouterTest {
         final SourceRecord eventRouted = router.apply(eventRecord);
 
         assertThat(eventRouted).isNotNull();
-        assertThat(((Struct) eventRouted.value()).getString("payload")).isEqualTo("{}");
+        assertThat(eventRouted.value()).isEqualTo("{}");
 
         Headers headers = eventRouted.headers();
         assertThat(headers.size()).isEqualTo(1);
@@ -492,7 +493,6 @@ public class EventRouterTest {
 
         // validate the valueSchema
         Schema valueSchema = eventRouted.valueSchema();
-        assertThat(valueSchema.field("eventType").schema().type()).isEqualTo(SchemaBuilder.bytes().type());
         assertThat(valueSchema.field("payload").schema().type()).isEqualTo(SchemaBuilder.bytes().type());
         assertThat(valueSchema.field("bool").schema().type()).isEqualTo(SchemaBuilder.bool().type());
 
@@ -507,10 +507,11 @@ public class EventRouterTest {
     }
 
     @Test
-    public void canSetSchemaVersion() {
+    public void canSetSchemaVersionWhenMoreThanPayloadIsInEnvelope() {
         final EventRouter<SourceRecord> router = new EventRouter<>();
         final Map<String, String> config = new HashMap<>();
         config.put(EventRouterConfigDefinition.FIELD_SCHEMA_VERSION.name(), "version");
+        config.put(EventRouterConfigDefinition.FIELDS_ADDITIONAL_PLACEMENT.name(), "type:envelope:eventType");
         router.configure(config);
 
         Map<String, Schema> extraFields = new HashMap<>();
@@ -560,6 +561,60 @@ public class EventRouterTest {
         assertThat(eventRoutedV1E2.valueSchema().version()).isEqualTo(1);
 
         assertThat(eventRoutedV1.valueSchema()).isSameAs(eventRoutedV1E2.valueSchema());
+    }
+
+    @Test
+    public void shouldNotSetSchemaVersionByDefault() {
+        final EventRouter<SourceRecord> router = new EventRouter<>();
+        final Map<String, String> config = new HashMap<>();
+        config.put(EventRouterConfigDefinition.FIELD_SCHEMA_VERSION.name(), "version");
+        router.configure(config);
+
+        Map<String, Schema> extraFields = new HashMap<>();
+        extraFields.put("version", Schema.INT32_SCHEMA);
+
+        Map<String, Object> extraValuesV1 = new HashMap<>();
+        extraValuesV1.put("version", 1);
+
+        final SourceRecord eventRecordV1 = createEventRecord(
+                "166080d9-3b0e-4a04-81fe-2058a7386f1f",
+                "UserCreated",
+                "420b186d",
+                "User",
+                "{}",
+                extraFields,
+                extraValuesV1);
+        final SourceRecord eventRoutedV1 = router.apply(eventRecordV1);
+
+        assertThat(eventRoutedV1.valueSchema().version()).isNull();
+
+        Map<String, Object> extraValuesV3 = new HashMap<>();
+        extraValuesV3.put("version", 3);
+
+        final SourceRecord eventRecordV3 = createEventRecord(
+                "166080d9-3b0e-4a04-81fe-2058a7386f1f",
+                "UserCreated",
+                "420b186d",
+                "User",
+                "{}",
+                extraFields,
+                extraValuesV3);
+        final SourceRecord eventRoutedV3 = router.apply(eventRecordV3);
+
+        assertThat(eventRoutedV3.valueSchema().version()).isNull();
+
+        // This one will now use the cached version
+        final SourceRecord eventRecordV1E2 = createEventRecord(
+                "18f94a39-b931-41b7-837c-6fc23b013597",
+                "UserCreated",
+                "1b10b70b",
+                "User",
+                "{}",
+                extraFields,
+                extraValuesV1);
+        final SourceRecord eventRoutedV1E2 = router.apply(eventRecordV1E2);
+
+        assertThat(eventRoutedV1E2.valueSchema().version()).isNull();
     }
 
     @Test
@@ -636,6 +691,116 @@ public class EventRouterTest {
         final Map<String, String> config = new HashMap<>();
         config.put(EventRouterConfigDefinition.OPERATION_INVALID_BEHAVIOR.name(), "invalidOption");
         router.configure(config);
+    }
+
+    @Test
+    @FixFor("DBZ-2152")
+    public void canPassStringKey() {
+        // canSetDefaultMessageKey() duplicates this logic, as the current test assumes the key will be a String
+        final EventRouter<SourceRecord> router = new EventRouter<>();
+        final Map<String, String> config = new HashMap<>();
+        router.configure(config);
+
+        final SourceRecord eventRecord = createEventRecord();
+        final SourceRecord eventRouted = router.apply(eventRecord);
+
+        assertThat(eventRouted).isNotNull();
+        assertThat(eventRouted.keySchema().type()).isEqualTo(Schema.Type.STRING);
+    }
+
+    @Test
+    @FixFor("DBZ-2152")
+    public void canSetBinaryMessageKey() {
+        final byte[] eventType = "a UserCreated".getBytes(StandardCharsets.UTF_8);
+        final EventRouter<SourceRecord> router = new EventRouter<>();
+        final Map<String, String> config = new HashMap<>();
+        // This is not a good example of message key, this is just for test
+        config.put(EventRouterConfigDefinition.FIELD_EVENT_KEY.name(), "type");
+        router.configure(config);
+
+        final SourceRecord eventRecord = createEventRecord(
+                "da8d6de6-3b77-45ff-8f44-57db55a7a06c",
+                SchemaBuilder.bytes(),
+                eventType,
+                SchemaBuilder.string(),
+                "Some other payload id",
+                "User",
+                SchemaBuilder.string(),
+                "{}",
+                new HashMap<>(),
+                new HashMap<>());
+
+        final SourceRecord eventRouted = router.apply(eventRecord);
+
+        assertThat(eventRouted).isNotNull();
+        assertThat(eventRouted.keySchema().type()).isEqualTo(Schema.Type.BYTES);
+        assertThat(eventRouted.key()).isEqualTo(eventType);
+    }
+
+    @Test
+    @FixFor("DBZ-2152")
+    public void canPassBinaryKey() {
+        final byte[] key = "a binary key".getBytes(StandardCharsets.UTF_8);
+        canPassKeyByType(SchemaBuilder.bytes(), key);
+    }
+
+    @Test
+    @FixFor("DBZ-2152")
+    public void canPassIntKey() {
+        final int key = 54321;
+        canPassKeyByType(SchemaBuilder.int32(), key);
+    }
+
+    private void canPassKeyByType(SchemaBuilder keyType, Object key) {
+        final EventRouter<SourceRecord> router = new EventRouter<>();
+        final Map<String, String> config = new HashMap<>();
+        router.configure(config);
+
+        final SourceRecord eventRecord = createEventRecord(
+                "da8d6de6-3b77-45ff-8f44-57db55a7a06c",
+                SchemaBuilder.string(),
+                "UserCreated",
+                keyType,
+                key,
+                "User",
+                SchemaBuilder.string(),
+                "{}",
+                new HashMap<>(),
+                new HashMap<>());
+        final SourceRecord eventRouted = router.apply(eventRecord);
+
+        assertThat(eventRouted).isNotNull();
+        assertThat(eventRouted.keySchema().type()).isEqualTo(keyType.type());
+        assertThat(eventRouted.key()).isEqualTo(key);
+    }
+
+    @Test
+    @FixFor("DBZ-2152")
+    public void canPassBinaryMessage() {
+        final byte[] value = "a binary message".getBytes(StandardCharsets.UTF_8);
+        final String key = "a key";
+        final EventRouter<SourceRecord> router = new EventRouter<>();
+        final Map<String, String> config = new HashMap<>();
+        router.configure(config);
+
+        final SourceRecord eventRecord = createEventRecord(
+                "da8d6de6-3b77-45ff-8f44-57db55a7a06c",
+                SchemaBuilder.string(),
+                "UserCreated",
+                SchemaBuilder.string(),
+                key,
+                "User",
+                SchemaBuilder.bytes(),
+                value,
+                new HashMap<>(),
+                new HashMap<>());
+        final SourceRecord eventRouted = router.apply(eventRecord);
+
+        assertThat(eventRouted).isNotNull();
+        assertThat(eventRouted.keySchema().type()).isEqualTo(Schema.Type.STRING);
+        assertThat(eventRouted.key()).isEqualTo(key);
+        assertThat(eventRouted.valueSchema().type()).isEqualTo(Schema.Type.BYTES);
+        assertThat(eventRouted.value()).isEqualTo(value);
     }
 
     @Test
@@ -765,12 +930,36 @@ public class EventRouterTest {
                                            String payload,
                                            Map<String, Schema> extraFields,
                                            Map<String, Object> extraValues) {
+        return createEventRecord(
+                eventId,
+                SchemaBuilder.string(),
+                eventType,
+                SchemaBuilder.string(),
+                payloadId,
+                payloadType,
+                SchemaBuilder.string(),
+                payload,
+                extraFields,
+                extraValues);
+    }
+
+    private SourceRecord createEventRecord(
+                                           String eventId,
+                                           SchemaBuilder eventTypeSchemaType,
+                                           Object eventType,
+                                           SchemaBuilder payloadIdSchemaType,
+                                           Object payloadId,
+                                           String payloadType,
+                                           SchemaBuilder payloadSchemaType,
+                                           Object payload,
+                                           Map<String, Schema> extraFields,
+                                           Map<String, Object> extraValues) {
         SchemaBuilder schemaBuilder = SchemaBuilder.struct()
                 .field("id", SchemaBuilder.string())
                 .field("aggregatetype", SchemaBuilder.string())
-                .field("aggregateid", SchemaBuilder.string())
-                .field("type", SchemaBuilder.string())
-                .field("payload", SchemaBuilder.string())
+                .field("aggregateid", payloadIdSchemaType)
+                .field("type", eventTypeSchemaType)
+                .field("payload", payloadSchemaType)
                 .field("is_deleted", SchemaBuilder.bool().optional());
 
         extraFields.forEach(schemaBuilder::field);

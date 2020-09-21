@@ -37,7 +37,7 @@ import io.debezium.util.Threads.Timer;
  * the queue.
  * <p>
  * If an exception occurs on the producer side, the producer should make that
- * exception known by calling {@link #producerFailure} before stopping its
+ * exception known by calling {@link #producerException(RuntimeException)} before stopping its
  * operation. Upon the next call to {@link #poll()}, that exception will be
  * raised, causing Kafka Connect to stop the connector and mark it as
  * {@code FAILED}.
@@ -145,7 +145,7 @@ public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
         try {
             LOGGER.debug("polling records...");
             List<T> records = new ArrayList<>();
-            final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.max(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
+            final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
             while (!timeout.expired() && queue.drainTo(records, maxBatchSize) == 0) {
                 throwProducerExceptionIfPresent();
 

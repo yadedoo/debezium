@@ -32,6 +32,10 @@ public class MongoDbEventMetadataProvider implements EventMetadataProvider {
         if (source == null) {
             return null;
         }
+        if (sourceInfo.schema().field(SourceInfo.TIMESTAMP) != null) {
+            final Integer timestamp = sourceInfo.getInt32(SourceInfo.TIMESTAMP);
+            return timestamp == null ? null : Instant.ofEpochSecond(timestamp);
+        }
         final Long timestamp = sourceInfo.getInt64(SourceInfo.TIMESTAMP_KEY);
         return timestamp == null ? null : Instant.ofEpochMilli(timestamp);
     }
@@ -59,10 +63,16 @@ public class MongoDbEventMetadataProvider implements EventMetadataProvider {
         if (source == null) {
             return null;
         }
-        final Long txOrder = sourceInfo.getInt64(SourceInfo.TX_ORD);
-        if (txOrder == null) {
+        if (sourceInfo.schema().field(SourceInfo.SESSION_TXN_ID) != null) {
+            final String sessionTxnId = sourceInfo.getString(SourceInfo.SESSION_TXN_ID);
+            if (sessionTxnId != null) {
+                return sessionTxnId;
+            }
+        }
+        final Long operationId = sourceInfo.getInt64(SourceInfo.OPERATION_ID);
+        if (operationId == null) {
             return null;
         }
-        return Long.toString(txOrder);
+        return Long.toString(operationId);
     }
 }

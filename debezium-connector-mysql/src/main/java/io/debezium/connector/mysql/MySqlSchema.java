@@ -37,6 +37,7 @@ import io.debezium.relational.ddl.DdlParser;
 import io.debezium.relational.history.DatabaseHistory;
 import io.debezium.relational.history.DatabaseHistoryMetrics;
 import io.debezium.relational.history.HistoryRecordComparator;
+import io.debezium.relational.history.KafkaDatabaseHistory;
 import io.debezium.schema.TopicSelector;
 import io.debezium.text.MultipleParsingExceptions;
 import io.debezium.text.ParsingException;
@@ -46,7 +47,7 @@ import io.debezium.util.SchemaNameAdjuster;
 /**
  * Component that records the schema history for databases hosted by a MySQL database server. The schema information includes
  * the {@link Tables table definitions} and the Kafka Connect {@link #schemaFor(TableId) Schema}s for each table, where the
- * {@link Schema} excludes any columns that have been {@link MySqlConnectorConfig#COLUMN_BLACKLIST specified} in the
+ * {@link Schema} excludes any columns that have been {@link MySqlConnectorConfig#COLUMN_EXCLUDE_LIST specified} in the
  * configuration.
  * <p>
  * The history is changed by {@link #applyDdl(SourceInfo, String, String, DatabaseStatementStringConsumer) applying DDL
@@ -112,6 +113,8 @@ public class MySqlSchema extends RelationalDatabaseSchema {
         Configuration dbHistoryConfig = config.subset(DatabaseHistory.CONFIGURATION_FIELD_PREFIX_STRING, false)
                 .edit()
                 .withDefault(DatabaseHistory.NAME, connectorName + "-dbhistory")
+                .with(KafkaDatabaseHistory.INTERNAL_CONNECTOR_CLASS, MySqlConnector.class.getName())
+                .with(KafkaDatabaseHistory.INTERNAL_CONNECTOR_ID, configuration.getLogicalName())
                 .build();
         this.skipUnparseableDDL = dbHistoryConfig.getBoolean(DatabaseHistory.SKIP_UNPARSEABLE_DDL_STATEMENTS);
         this.storeOnlyMonitoredTablesDdl = dbHistoryConfig.getBoolean(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL);
@@ -148,7 +151,8 @@ public class MySqlSchema extends RelationalDatabaseSchema {
         BigIntUnsignedMode bigIntUnsignedMode = bigIntUnsignedHandlingMode.asBigIntUnsignedMode();
 
         final boolean timeAdjusterEnabled = configuration.getConfig().getBoolean(MySqlConnectorConfig.ENABLE_TIME_ADJUSTER);
-        return new MySqlValueConverters(decimalMode, timePrecisionMode, bigIntUnsignedMode, timeAdjusterEnabled ? MySqlValueConverters::adjustTemporal : x -> x);
+        return new MySqlValueConverters(decimalMode, timePrecisionMode, bigIntUnsignedMode, timeAdjusterEnabled ? MySqlValueConverters::adjustTemporal : x -> x,
+                configuration.binaryHandlingMode());
     }
 
     protected HistoryRecordComparator historyComparator() {
@@ -265,7 +269,9 @@ public class MySqlSchema extends RelationalDatabaseSchema {
      * Initialize permanent storage for database history
      */
     public void intializeHistoryStorage() {
-        dbHistory.initializeStorage();
+        if (!dbHistory.storageExists()) {
+            dbHistory.initializeStorage();
+        }
     }
 
     /**

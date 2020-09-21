@@ -35,7 +35,7 @@ DEBEZIUM_INCUBATOR_DIR = 'debezium-incubator'
 IMAGES_DIR = 'images'
 POSTGRES_DECODER_DIR = 'postgres-decoder'
 ORACLE_ARTIFACT_DIR = "$HOME_DIR/oracle-libs/12.2.0.1.0"
-ORACLE_ARTIFACT_VERSION = '12.1.0.2'
+ORACLE_ARTIFACT_VERSION = '12.2.0.1'
 
 VERSION_TAG = "v$RELEASE_VERSION"
 VERSION_PARTS = RELEASE_VERSION.split('\\.')
@@ -48,14 +48,18 @@ CORE_CONNECTORS_PER_VERSION = [
     '0.9': ['mongodb','mysql','postgres','sqlserver'],
     '0.10': ['mongodb','mysql','postgres','sqlserver'],
     '1.0': ['mongodb','mysql','postgres','sqlserver'],
-    '1.1': ['mongodb','mysql','postgres','sqlserver']
+    '1.1': ['mongodb','mysql','postgres','sqlserver'],
+    '1.2': ['mongodb','mysql','postgres','sqlserver'],
+    '1.3': ['mongodb','mysql','postgres','sqlserver']
 ]
 INCUBATOR_CONNECTORS_PER_VERSION = [
     '0.8': ['oracle'],
     '0.9': ['oracle'],
     '0.10': ['oracle'],
     '1.0': ['oracle','cassandra'],
-    '1.1': ['oracle','cassandra','db2']
+    '1.1': ['oracle','cassandra','db2'],
+    '1.2': ['oracle','cassandra','db2'],
+    '1.3': ['oracle','cassandra','db2']
 ]
 
 CORE_CONNECTORS = CORE_CONNECTORS_PER_VERSION[VERSION_MAJOR_MINOR]
@@ -367,6 +371,7 @@ node('Slave') {
             }
         }
         echo "MD5 sums calculated: ${sums}"
+        def serverSum = sh (script: "md5sum -b $LOCAL_MAVEN_REPO/io/debezium/debezium-server-dist/$RELEASE_VERSION/debezium-server-dist-${RELEASE_VERSION}.tar.gz | awk '{print \$1}'", returnStdout: true).trim()
         dir ("$IMAGES_DIR/connect/$IMAGE_TAG") {
             echo "Modifying main Dockerfile"
             modifyFile('Dockerfile') {
@@ -388,6 +393,14 @@ node('Slave') {
         dir ("$IMAGES_DIR/connect/snapshot") {
             modifyFile('Dockerfile') {
                 it.replaceFirst('DEBEZIUM_VERSION=\\S+', "DEBEZIUM_VERSION=$DEVELOPMENT_VERSION")
+            }
+        }
+        echo "Modifying Server Dockerfile"
+        dir ("$IMAGES_DIR/server/$IMAGE_TAG") {
+            modifyFile('Dockerfile') {
+                it
+                    .replaceFirst('DEBEZIUM_VERSION=\\S+', "DEBEZIUM_VERSION=$RELEASE_VERSION")
+                    .replaceFirst('SERVER_MD5=\\S+', "SERVER_MD5=$serverSum")
             }
         }
         dir ("$IMAGES_DIR") {
@@ -421,7 +434,7 @@ node('Slave') {
                     "database.password": "dbz",
                     "database.server.id": "184054",
                     "database.server.name": "dbserver1",
-                    "database.whitelist": "inventory",
+                    "database.include.list": "inventory",
                     "database.history.kafka.bootstrap.servers": "kafka:9092",
                     "database.history.kafka.topic": "schema-changes.inventory"
                 }
@@ -467,10 +480,8 @@ node('Slave') {
                     failed = false
                     for (i = 0; i < CONNECTORS.size(); i++) {
                         def connector = CONNECTORS[i]
-                        try {
-                            new URL("https://repo1.maven.org/maven2/io/debezium/debezium-connector-$connector/${RELEASE_VERSION}/debezium-connector-$connector-${RELEASE_VERSION}-plugin.tar.gz").bytes
-                        }
-                        catch (FileNotFoundException e) {
+                        def curl = sh(returnStatus: true, script: "curl -IfskL -o /dev/null https://repo1.maven.org/maven2/io/debezium/debezium-connector-$connector/${RELEASE_VERSION}/debezium-connector-$connector-${RELEASE_VERSION}-plugin.tar.gz")
+                        if (curl) {
                             echo "Connector $connector not yet in Maven Central"
                             failed = true
                         }

@@ -8,7 +8,7 @@ package io.debezium.connector.postgresql;
 
 import static io.debezium.connector.postgresql.TestHelper.PK_FIELD;
 import static io.debezium.connector.postgresql.TestHelper.topicName;
-import static io.debezium.connector.postgresql.junit.SkipWhenDatabaseVersionLessThan.PostgresVersion.POSTGRES_10;
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -34,12 +34,10 @@ import org.fest.assertions.Assertions;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TestRule;
 
+import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
-import io.debezium.connector.postgresql.junit.SkipTestDependingOnDatabaseVersionRule;
-import io.debezium.connector.postgresql.junit.SkipWhenDatabaseVersionLessThan;
 import io.debezium.data.Bits;
 import io.debezium.data.Enum;
 import io.debezium.data.Envelope;
@@ -47,6 +45,8 @@ import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.TemporalPrecisionMode;
+import io.debezium.junit.SkipTestRule;
+import io.debezium.junit.SkipWhenDatabaseVersion;
 import io.debezium.relational.RelationalDatabaseConnectorConfig.DecimalHandlingMode;
 import io.debezium.spi.converter.CustomConverter;
 import io.debezium.spi.converter.RelationalColumn;
@@ -61,7 +61,7 @@ import io.debezium.util.Testing;
 public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
     @Rule
-    public final TestRule skip = new SkipTestDependingOnDatabaseVersionRule();
+    public final SkipTestRule skip = new SkipTestRule();
 
     @Before
     public void before() throws Exception {
@@ -112,6 +112,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         }
     }
 
+    @Override
     protected List<SchemaAndValueField> schemasAndValuesForCustomConverterTypes() {
         return Arrays.asList(new SchemaAndValueField("i",
                 SchemaBuilder.string().name("io.debezium.postgresql.type.Isbn").build(), "0-393-04002-X"));
@@ -282,7 +283,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
         waitForStreamingToStart();
 
-        TestHelper.noTransactionActive();
+        TestHelper.assertNoOpenTransactions();
 
         stopConnector();
     }
@@ -375,7 +376,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
     @Test
     @FixFor("DBZ-1118")
-    @SkipWhenDatabaseVersionLessThan(POSTGRES_10)
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 10, reason = "Database version is less than 10.0")
     public void shouldGenerateSnapshotsForPartitionedTables() throws Exception {
         TestHelper.dropAllSchemas();
 
@@ -408,7 +409,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         // then start the producer and validate all records are there
         buildNoStreamProducer(TestHelper.defaultConfig());
 
-        TestConsumer consumer = testConsumer(1 + 2 * 30); // Every record comes once from partitioned table and from partition
+        TestConsumer consumer = testConsumer(1 + 30);
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
 
         Set<Integer> ids = new HashSet<>();
@@ -434,7 +435,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
 
         // verify each topic contains exactly the number of input records
         assertEquals(1, topicCounts.get("test_server.public.first_table").intValue());
-        assertEquals(30, topicCounts.get("test_server.public.partitioned").intValue());
+        assertEquals(0, topicCounts.get("test_server.public.partitioned").intValue());
         assertEquals(10, topicCounts.get("test_server.public.partitioned_1_100").intValue());
         assertEquals(20, topicCounts.get("test_server.public.partitioned_101_200").intValue());
 
@@ -491,8 +492,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
     }
 
     @Test
-    // MACADDR8 Postgres type is only supported since Postgres version 10
-    @SkipWhenDatabaseVersionLessThan(POSTGRES_10)
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 10, reason = "MACADDR8 data type is only supported since Postgres 10+")
     @FixFor("DBZ-1193")
     public void shouldGenerateSnapshotForMacaddr8Datatype() throws Exception {
         TestHelper.dropAllSchemas();
@@ -578,7 +578,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         // insert money
         TestHelper.execute(INSERT_NEGATIVE_CASH_TYPES_STMT);
 
-        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_WHITELIST, "public.cash_table"));
+        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.cash_table"));
 
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
@@ -596,7 +596,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         // insert money
         TestHelper.execute(INSERT_NULL_CASH_TYPES_STMT);
 
-        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_WHITELIST, "public.cash_table"));
+        buildNoStreamProducer(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.cash_table"));
 
         TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
@@ -668,7 +668,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
                         .parameter(TestHelper.TYPE_NAME_PARAMETER_KEY, "VARBIT2")
                         .parameter(TestHelper.TYPE_LENGTH_PARAMETER_KEY, "3")
                         .parameter(TestHelper.TYPE_SCALE_PARAMETER_KEY, "0")
-                        .build(), new byte[]{ 5, 0 }));
+                        .build(), new byte[]{ 5 }));
 
         consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.alias_table", expected)));
     }
@@ -821,7 +821,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.DECIMAL_HANDLING_MODE, DecimalHandlingMode.DOUBLE)
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
-                .with(PostgresConnectorConfig.TABLE_WHITELIST, "public.alias_table"));
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.alias_table"));
 
         final TestConsumer consumer = testConsumer(1, "public");
         consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
@@ -861,7 +861,7 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
         // type, length, and scale values are resolved correctly when paired with Enum types.
         buildNoStreamProducer(TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
-                .with(PostgresConnectorConfig.TABLE_WHITELIST, "public.enum_table")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.enum_table")
                 .with("column.propagate.source.type", "public.enum_table.value"));
 
         final TestConsumer consumer = testConsumer(1, "public");
@@ -875,6 +875,167 @@ public class RecordsSnapshotProducerIT extends AbstractRecordsProducerTest {
                         .build(), "V1"));
 
         consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.enum_table", expected)));
+    }
+
+    @Test
+    @FixFor("DBZ-1969")
+    public void shouldSnapshotEnumArrayAsKnownType() throws Exception {
+        TestHelper.execute("CREATE TYPE test_type AS ENUM ('V1', 'V2');");
+        TestHelper.execute("CREATE TABLE enum_array_table (pk SERIAL, value test_type[] NOT NULL, primary key(pk));");
+        TestHelper.execute("INSERT INTO enum_array_table (value) values ('{V1, V2}');");
+
+        // Specifically enable `column.propagate.source.type` here to validate later that the actual
+        // type, length, and scale values are resolved correctly when paired with Enum types.
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, false)
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.enum_array_table")
+                .with("column.propagate.source.type", "public.enum_array_table.value"));
+
+        final TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        List<SchemaAndValueField> expected = Collections.singletonList(
+                new SchemaAndValueField("value", SchemaBuilder.array(Enum.builder("V1,V2"))
+                        .parameter(TestHelper.TYPE_NAME_PARAMETER_KEY, "_TEST_TYPE")
+                        .parameter(TestHelper.TYPE_LENGTH_PARAMETER_KEY, String.valueOf(Integer.MAX_VALUE))
+                        .parameter(TestHelper.TYPE_SCALE_PARAMETER_KEY, "0")
+                        .build(), Arrays.asList("V1", "V2")));
+
+        consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.enum_array_table", expected)));
+    }
+
+    @Test
+    @FixFor("DBZ-1969")
+    public void shouldSnapshotTimeArrayTypesAsKnownTypes() throws Exception {
+        TestHelper.execute("CREATE TABLE time_array_table (pk SERIAL, "
+                + "timea time[] NOT NULL, "
+                + "timetza timetz[] NOT NULL, "
+                + "timestampa timestamp[] NOT NULL, "
+                + "timestamptza timestamptz[] NOT NULL, primary key(pk));");
+        TestHelper.execute("INSERT INTO time_array_table (timea, timetza, timestampa, timestamptza) "
+                + "values ("
+                + "'{00:01:02,01:02:03}', "
+                + "'{13:51:02+0200,14:51:03+0200}', "
+                + "'{2020-04-01 00:01:02,2020-04-01 01:02:03}', "
+                + "'{2020-04-01 13:51:02+0200,2020-04-01 14:51:03+0200}')");
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, false)
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "public.time_array_table"));
+
+        final TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        consumer.process(record -> assertReadRecord(record, Collect.hashMapOf("public.time_array_table", schemaAndValuesForTimeArrayTypes())));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForByteaAsBytes() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_BYTEA_BINMODE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig());
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.bytea_binmode_table", schemaAndValueForByteaBytes());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForByteaAsBase64String() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_BYTEA_BINMODE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.BINARY_HANDLING_MODE, PostgresConnectorConfig.BinaryHandlingMode.BASE64));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.bytea_binmode_table", schemaAndValueForByteaBase64());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForByteaAsHexString() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_BYTEA_BINMODE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.BINARY_HANDLING_MODE, PostgresConnectorConfig.BinaryHandlingMode.HEX));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.bytea_binmode_table", schemaAndValueForByteaHex());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForUnknownColumnAsBytes() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_CIRCLE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBytes());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForUnknownColumnAsBase64() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_CIRCLE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
+                .with(PostgresConnectorConfig.BINARY_HANDLING_MODE, BinaryHandlingMode.BASE64));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnBase64());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
+    }
+
+    @Test
+    @FixFor("DBZ-1814")
+    public void shouldGenerateSnapshotForUnknownColumnAsHex() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(INSERT_CIRCLE_STMT);
+
+        buildNoStreamProducer(TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, true)
+                .with(PostgresConnectorConfig.BINARY_HANDLING_MODE, BinaryHandlingMode.HEX));
+
+        TestConsumer consumer = testConsumer(1, "public");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+
+        final Map<String, List<SchemaAndValueField>> expectedValueByTopicName = Collect.hashMapOf("public.circle_table", schemaAndValueForUnknownColumnHex());
+
+        consumer.process(record -> assertReadRecord(record, expectedValueByTopicName));
     }
 
     private void buildNoStreamProducer(Configuration.Builder config) {

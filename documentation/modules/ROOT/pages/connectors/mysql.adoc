@@ -1,7 +1,11 @@
-include::../_attributes.adoc[]
+:toc:
+:toc-placement: macro
+:linkattrs:
+:icons: font
+:source-highlighter: highlight.js
+:context: debezium
 
-:context: cdc
-
+[id="debezium-connector-for-mysql"]
 = {prodname} Connector for MySQL
 
 MySQL has a binary log (binlog) that records all operations in the order in which they are committed to the database. This includes changes to table schemas and the data within tables. MySQL uses the binlog for replication and recovery.
@@ -12,8 +16,10 @@ As MySQL is typically set up to purge binlogs after a specified period of time, 
 
 The following sections provide more detailed information on how the {prodname} MySQL connector functions, instructs you on how to set it up, as well as deploy and troubleshoot the connector.
 
-* xref:assemblies/cdc-mysql-connector/as_overview-of-how-the-mysql-connector-works.adoc[Overview of how the MySQL connector works]
-* xref:assemblies/cdc-mysql-connector/as_setup-the-mysql-server.adoc[Set up MySQL Server]
-* xref:assemblies/cdc-mysql-connector/as_deploy-the-mysql-connector.adoc[Deploy the MySQL connector]
-* xref:assemblies/cdc-mysql-connector/as_connector-common-issues.adoc[Common issues]
+include::{partialsdir}/assemblies/mysql-connector/assembly-overview-of-how-the-mysql-connector-works.adoc[leveloffset=+1]
 
+include::{partialsdir}/assemblies/mysql-connector/assembly-setup-the-mysql-server.adoc[leveloffset=+1]
+
+include::{partialsdir}/assemblies/mysql-connector/assembly-deploy-the-mysql-connector.adoc[leveloffset=+1]
+
+include::{partialsdir}/assemblies/mysql-connector/assembly-connector-common-issues.adoc[leveloffset=+1]

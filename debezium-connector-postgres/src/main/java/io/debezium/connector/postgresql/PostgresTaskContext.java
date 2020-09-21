@@ -66,10 +66,6 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
 
     protected void refreshSchema(PostgresConnection connection, boolean printReplicaIdentityInfo) throws SQLException {
         schema.refresh(connection, printReplicaIdentityInfo);
-        // Open transaction unnecessary during task execution
-        if (!connection.connection().getAutoCommit()) {
-            connection.connection().commit();
-        }
     }
 
     Long getSlotXmin(PostgresConnection connection) throws SQLException {
@@ -99,7 +95,7 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
         return connection.getReplicationSlotState(config.slotName(), config.plugin().getPostgresPluginName());
     }
 
-    protected ReplicationConnection createReplicationConnection(boolean exportSnapshot) throws SQLException {
+    protected ReplicationConnection createReplicationConnection(boolean exportSnapshot, boolean doSnapshot) throws SQLException {
         final boolean dropSlotOnStop = config.dropSlotOnStop();
         if (dropSlotOnStop) {
             LOGGER.warn(
@@ -111,18 +107,17 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
         return ReplicationConnection.builder(config.jdbcConfig())
                 .withSlot(config.slotName())
                 .withPublication(config.publicationName())
+                .withTableFilter(config.getTableFilters())
+                .withPublicationAutocreateMode(config.publicationAutocreateMode())
                 .withPlugin(config.plugin())
                 .dropSlotOnClose(dropSlotOnStop)
                 .streamParams(config.streamParams())
                 .statusUpdateInterval(config.statusUpdateInterval())
                 .withTypeRegistry(schema.getTypeRegistry())
                 .exportSnapshotOnCreate(exportSnapshot)
+                .doSnapshot(doSnapshot)
                 .withSchema(schema)
                 .build();
-    }
-
-    protected PostgresConnection createConnection() {
-        return new PostgresConnection(config.jdbcConfig());
     }
 
     PostgresConnectorConfig getConfig() {

@@ -63,7 +63,7 @@ public class TablesWithoutPrimaryKeyIT extends AbstractConnectorTest {
 
         start(SqlServerConnector.class, TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.t[123]")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.t[123]")
                 .build());
         assertConnectorIsRunning();
 
@@ -97,6 +97,9 @@ public class TablesWithoutPrimaryKeyIT extends AbstractConnectorTest {
 
         consumeRecordsByTopic(1);
 
+        TestHelper.waitForStreamingStarted();
+        TestHelper.waitForMaxLsnAvailable(connection);
+
         connection.execute(DDL_STATEMENTS);
 
         Testing.Print.enable();
@@ -111,6 +114,10 @@ public class TablesWithoutPrimaryKeyIT extends AbstractConnectorTest {
         connection.execute("INSERT INTO t1 VALUES (1,10);");
         connection.execute("INSERT INTO t2 VALUES (2,20);");
         connection.execute("INSERT INTO t3 VALUES (3,30);");
+
+        TestHelper.waitForCdcRecord(connection, "t1", rs -> rs.getInt("pk") == 1);
+        TestHelper.waitForCdcRecord(connection, "t2", rs -> rs.getInt("pk") == 2);
+        TestHelper.waitForCdcRecord(connection, "t3", rs -> rs.getInt("pk") == 3);
 
         final int expectedRecordsCount = 1 + 1 + 1;
 

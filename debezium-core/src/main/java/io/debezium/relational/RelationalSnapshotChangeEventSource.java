@@ -24,6 +24,7 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.EventDispatcher.SnapshotReceiver;
@@ -98,8 +99,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
                 LOGGER.info("Previous snapshot was cancelled before completion; a new snapshot will be taken.");
             }
 
-            connection = jdbcConnection.connection();
-            connection.setAutoCommit(false);
+            connection = createSnapshotConnection();
             connectionCreated(ctx);
 
             LOGGER.info("Snapshot step 2 - Determining captured tables");
@@ -124,7 +124,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
             if (snapshottingTask.snapshotSchema()) {
                 LOGGER.info("Snapshot step 6 - Persisting schema history");
 
-                createSchemaChangeEventsForTables(context, ctx);
+                createSchemaChangeEventsForTables(context, ctx, snapshottingTask);
 
                 // if we've been interrupted before, the TX rollback will cause any locks to be released
                 releaseSchemaSnapshotLocks(ctx);
@@ -152,6 +152,12 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
         }
     }
 
+    public Connection createSnapshotConnection() throws SQLException {
+        Connection connection = jdbcConnection.connection();
+        connection.setAutoCommit(false);
+        return connection;
+    }
+
     /**
      * Executes steps which have to be taken just after the database connection is created.
      */
@@ -166,9 +172,9 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
     }
 
     private Set<TableId> sort(Set<TableId> capturedTables) throws Exception {
-        String value = connectorConfig.getConfig().getString(RelationalDatabaseConnectorConfig.TABLE_WHITELIST);
-        if (value != null) {
-            return Strings.listOfRegex(value, Pattern.CASE_INSENSITIVE)
+        String tableIncludeList = connectorConfig.tableIncludeList();
+        if (tableIncludeList != null) {
+            return Strings.listOfRegex(tableIncludeList, Pattern.CASE_INSENSITIVE)
                     .stream()
                     .flatMap(pattern -> toTableIds(capturedTables, pattern))
                     .collect(Collectors.toCollection(LinkedHashSet::new));
@@ -226,8 +232,11 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
      */
     protected abstract void releaseSchemaSnapshotLocks(RelationalSnapshotContext snapshotContext) throws Exception;
 
-    private void createSchemaChangeEventsForTables(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext) throws Exception {
-        for (TableId tableId : snapshotContext.capturedTables) {
+    private void createSchemaChangeEventsForTables(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext, SnapshottingTask snapshottingTask)
+            throws Exception {
+        tryStartingSnapshot(snapshotContext);
+        for (Iterator<TableId> iterator = snapshotContext.capturedTables.iterator(); iterator.hasNext();) {
+            final TableId tableId = iterator.next();
             if (!sourceContext.isRunning()) {
                 throw new InterruptedException("Interrupted while capturing schema of table " + tableId);
             }
@@ -237,7 +246,20 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
             Table table = snapshotContext.tables.forTable(tableId);
 
             if (schema != null) {
-                schema.applySchemaChange(getCreateTableEvent(snapshotContext, table));
+                snapshotContext.offset.event(tableId, getClock().currentTime());
+
+                // If data are not snapshotted then the last schema change must set last snapshot flag
+                if (!snapshottingTask.snapshotData() && !iterator.hasNext()) {
+                    snapshotContext.offset.markLastSnapshotRecord();
+                }
+                dispatcher.dispatchSchemaChangeEvent(table.id(), (receiver) -> {
+                    try {
+                        receiver.schemaChangeEvent(getCreateTableEvent(snapshotContext, table));
+                    }
+                    catch (Exception e) {
+                        throw new DebeziumException(e);
+                    }
+                });
             }
         }
     }
@@ -249,7 +271,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
 
     private void createDataEvents(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext) throws InterruptedException {
         SnapshotReceiver snapshotReceiver = dispatcher.getSnapshotChangeEventReceiver();
-        snapshotContext.offset.preSnapshotStart();
+        tryStartingSnapshot(snapshotContext);
 
         for (Iterator<TableId> tableIdIterator = snapshotContext.capturedTables.iterator(); tableIdIterator.hasNext();) {
             final TableId tableId = tableIdIterator.next();
@@ -269,6 +291,12 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
         snapshotContext.offset.postSnapshotCompletion();
     }
 
+    private void tryStartingSnapshot(RelationalSnapshotContext snapshotContext) {
+        if (!snapshotContext.offset.isSnapshotRunning()) {
+            snapshotContext.offset.preSnapshotStart();
+        }
+    }
+
     /**
      * Dispatches the data change events for the records of a single table.
      */
@@ -282,6 +310,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
         final Optional<String> selectStatement = determineSnapshotSelect(snapshotContext, table.id());
         if (!selectStatement.isPresent()) {
             LOGGER.warn("For table '{}' the select statement was not provided, skipping table", table.id());
+            snapshotProgressListener.dataCollectionSnapshotCompleted(table.id(), 0);
             return;
         }
         LOGGER.info("\t For table '{}' using select statement: '{}'", table.id(), selectStatement.get());
@@ -355,7 +384,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
      * @param tableId the table to generate a query for
      * @return a valid query string or empty if table will not be snapshotted
      */
-    private Optional<String> determineSnapshotSelect(SnapshotContext snapshotContext, TableId tableId) {
+    private Optional<String> determineSnapshotSelect(RelationalSnapshotContext snapshotContext, TableId tableId) {
         String overriddenSelect = connectorConfig.getSnapshotSelectOverridesByTable().get(tableId);
 
         // try without catalog id, as this might or might not be populated based on the given connector
@@ -363,7 +392,17 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
             overriddenSelect = connectorConfig.getSnapshotSelectOverridesByTable().get(new TableId(null, tableId.schema(), tableId.table()));
         }
 
-        return overriddenSelect != null ? Optional.of(overriddenSelect) : getSnapshotSelect(snapshotContext, tableId);
+        return overriddenSelect != null ? Optional.of(enhanceOverriddenSelect(snapshotContext, overriddenSelect, tableId)) : getSnapshotSelect(snapshotContext, tableId);
+    }
+
+    /**
+     * This method is overridden for Oracle to implement "as of SCN" predicate
+     * @param snapshotContext snapshot context, used for getting offset SCN
+     * @param overriddenSelect conditional snapshot select
+     * @return enhanced select statement. By default it just returns original select statements.
+     */
+    protected String enhanceOverriddenSelect(RelationalSnapshotContext snapshotContext, String overriddenSelect, TableId tableId) {
+        return overriddenSelect;
     }
 
     /**
@@ -373,7 +412,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
     // TODO Should it be Statement or similar?
     // TODO Handle override option generically; a problem will be how to handle the dynamic part (Oracle's "... as of
     // scn xyz")
-    protected abstract Optional<String> getSnapshotSelect(SnapshotContext snapshotContext, TableId tableId);
+    protected abstract Optional<String> getSnapshotSelect(RelationalSnapshotContext snapshotContext, TableId tableId);
 
     private Column[] getColumnsForResultSet(Table table, ResultSet rs) throws SQLException {
         ResultSetMetaData metaData = rs.getMetaData();

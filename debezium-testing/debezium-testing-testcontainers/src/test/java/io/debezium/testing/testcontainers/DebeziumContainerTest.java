@@ -24,6 +24,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.awaitility.Awaitility;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.rnorth.ducttape.unreliables.Unreliables;
@@ -55,7 +56,7 @@ public class DebeziumContainerTest {
             .withNetwork(network)
             .withNetworkAliases("postgres");
 
-    public static DebeziumContainer debeziumContainer = new DebeziumContainer("1.1.0.Beta1")
+    public static DebeziumContainer debeziumContainer = new DebeziumContainer("debezium/connect:1.1.1.Final")
             .withNetwork(network)
             .withKafka(kafkaContainer)
             .withLogConsumer(new Slf4jLogConsumer(LOGGER))
@@ -71,11 +72,18 @@ public class DebeziumContainerTest {
     public void canRegisterConnector() throws Exception {
         debeziumContainer.registerConnector("my-connector-1", getConfiguration(1));
 
-        String status = executeHttpRequest(debeziumContainer.getConnectorStatus("my-connector-1"));
+        // task initialization happens asynchronously, so we might have to retry until the task is RUNNING
+        Awaitility.await()
+                .pollInterval(Duration.ofMillis(250))
+                .atMost(Duration.ofSeconds(30))
+                .untilAsserted(
+                        () -> {
+                            String status = executeHttpRequest(debeziumContainer.getConnectorStatus("my-connector-1"));
 
-        assertThat(JsonPath.<String> read(status, "$.name")).isEqualTo("my-connector-1");
-        assertThat(JsonPath.<String> read(status, "$.connector.state")).isEqualTo("RUNNING");
-        assertThat(JsonPath.<String> read(status, "$.tasks[0].state")).isEqualTo("RUNNING");
+                            assertThat(JsonPath.<String> read(status, "$.name")).isEqualTo("my-connector-1");
+                            assertThat(JsonPath.<String> read(status, "$.connector.state")).isEqualTo("RUNNING");
+                            assertThat(JsonPath.<String> read(status, "$.tasks[0].state")).isEqualTo("RUNNING");
+                        });
     }
 
     @Test
@@ -136,7 +144,7 @@ public class DebeziumContainerTest {
         List<ConsumerRecord<String, String>> allRecords = new ArrayList<>();
 
         Unreliables.retryUntilTrue(10, TimeUnit.SECONDS, () -> {
-            consumer.poll(Duration.ofMillis(50))
+            consumer.poll(Duration.ofMillis(50).toMillis())
                     .iterator()
                     .forEachRemaining(allRecords::add);
 

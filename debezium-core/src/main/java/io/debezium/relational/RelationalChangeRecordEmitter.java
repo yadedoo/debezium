@@ -8,6 +8,7 @@ package io.debezium.relational;
 import java.util.Objects;
 
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.header.ConnectHeaders;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,6 +25,9 @@ import io.debezium.util.Clock;
  * @author Gunnar Morling
  */
 public abstract class RelationalChangeRecordEmitter extends AbstractChangeRecordEmitter<TableSchema> {
+
+    public static final String PK_UPDATE_OLDKEY_FIELD = "__debezium.oldkey";
+    public static final String PK_UPDATE_NEWKEY_FIELD = "__debezium.newkey";
 
     protected final Logger logger = LoggerFactory.getLogger(getClass());
 
@@ -63,10 +67,11 @@ public abstract class RelationalChangeRecordEmitter extends AbstractChangeRecord
         Struct envelope = tableSchema.getEnvelopeSchema().create(newValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
 
         if (skipEmptyMessages() && (newColumnValues == null || newColumnValues.length == 0)) {
+            // This case can be hit on UPDATE / DELETE when there's no primary key defined while using certain decoders
             logger.warn("no new values found for table '{}' from create message at '{}'; skipping record", tableSchema, getOffset().getSourceInfo());
             return;
         }
-        receiver.changeRecord(tableSchema, Operation.CREATE, newKey, envelope, getOffset());
+        receiver.changeRecord(tableSchema, Operation.CREATE, newKey, envelope, getOffset(), null);
     }
 
     @Override
@@ -77,7 +82,7 @@ public abstract class RelationalChangeRecordEmitter extends AbstractChangeRecord
         Struct newValue = tableSchema.valueFromColumnData(newColumnValues);
         Struct envelope = tableSchema.getEnvelopeSchema().read(newValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
 
-        receiver.changeRecord(tableSchema, Operation.READ, newKey, envelope, getOffset());
+        receiver.changeRecord(tableSchema, Operation.READ, newKey, envelope, getOffset(), null);
     }
 
     @Override
@@ -100,15 +105,21 @@ public abstract class RelationalChangeRecordEmitter extends AbstractChangeRecord
         // in this case we handle all updates as regular ones
         if (oldKey == null || Objects.equals(oldKey, newKey)) {
             Struct envelope = tableSchema.getEnvelopeSchema().update(oldValue, newValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-            receiver.changeRecord(tableSchema, Operation.UPDATE, newKey, envelope, getOffset());
+            receiver.changeRecord(tableSchema, Operation.UPDATE, newKey, envelope, getOffset(), null);
         }
         // PK update -> emit as delete and re-insert with new key
         else {
+            ConnectHeaders headers = new ConnectHeaders();
+            headers.add(PK_UPDATE_NEWKEY_FIELD, newKey, tableSchema.keySchema());
+
             Struct envelope = tableSchema.getEnvelopeSchema().delete(oldValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-            receiver.changeRecord(tableSchema, Operation.DELETE, oldKey, envelope, getOffset());
+            receiver.changeRecord(tableSchema, Operation.DELETE, oldKey, envelope, getOffset(), headers);
+
+            headers = new ConnectHeaders();
+            headers.add(PK_UPDATE_OLDKEY_FIELD, oldKey, tableSchema.keySchema());
 
             envelope = tableSchema.getEnvelopeSchema().create(newValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-            receiver.changeRecord(tableSchema, Operation.CREATE, newKey, envelope, getOffset());
+            receiver.changeRecord(tableSchema, Operation.CREATE, newKey, envelope, getOffset(), headers);
         }
     }
 
@@ -124,7 +135,7 @@ public abstract class RelationalChangeRecordEmitter extends AbstractChangeRecord
         }
 
         Struct envelope = tableSchema.getEnvelopeSchema().delete(oldValue, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-        receiver.changeRecord(tableSchema, Operation.DELETE, oldKey, envelope, getOffset());
+        receiver.changeRecord(tableSchema, Operation.DELETE, oldKey, envelope, getOffset(), null);
     }
 
     /**

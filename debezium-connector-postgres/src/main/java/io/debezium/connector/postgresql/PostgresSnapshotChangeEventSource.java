@@ -17,9 +17,10 @@ import org.postgresql.util.PGmoney;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
-import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.connector.postgresql.spi.SlotCreationResult;
+import io.debezium.connector.postgresql.spi.SlotState;
 import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.data.SpecialValueDecimal;
 import io.debezium.pipeline.EventDispatcher;
@@ -42,16 +43,18 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     private final PostgresSchema schema;
     private final Snapshotter snapshotter;
     private final SlotCreationResult slotCreatedInfo;
+    private final SlotState startingSlotInfo;
 
     public PostgresSnapshotChangeEventSource(PostgresConnectorConfig connectorConfig, Snapshotter snapshotter, PostgresOffsetContext previousOffset,
                                              PostgresConnection jdbcConnection, PostgresSchema schema, EventDispatcher<TableId> dispatcher, Clock clock,
-                                             SnapshotProgressListener snapshotProgressListener, SlotCreationResult slotCreatedInfo) {
+                                             SnapshotProgressListener snapshotProgressListener, SlotCreationResult slotCreatedInfo, SlotState startingSlotInfo) {
         super(connectorConfig, previousOffset, jdbcConnection, dispatcher, clock, snapshotProgressListener);
         this.connectorConfig = connectorConfig;
         this.jdbcConnection = jdbcConnection;
         this.schema = schema;
         this.snapshotter = snapshotter;
         this.slotCreatedInfo = slotCreatedInfo;
+        this.startingSlotInfo = startingSlotInfo;
     }
 
     @Override
@@ -78,10 +81,15 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
 
     @Override
     protected void connectionCreated(RelationalSnapshotContext snapshotContext) throws Exception {
-        LOGGER.info("Setting isolation level");
-        String transactionStatement = snapshotter.snapshotTransactionIsolationLevelStatement(slotCreatedInfo);
-        LOGGER.info("Opening transaction with statement {}", transactionStatement);
-        jdbcConnection.executeWithoutCommitting(transactionStatement);
+        // If using catch up streaming, the connector opens the transaction that the snapshot will eventually use
+        // before the catch up streaming starts. By looking at the current wal location, the transaction can determine
+        // where the catch up streaming should stop. The transaction is held open throughout the catch up
+        // streaming phase so that the snapshot is performed from a consistent view of the data. Since the isolation
+        // level on the transaction used in catch up streaming has already set the isolation level and executed
+        // statements, the transaction does not need to get set the level again here.
+        if (snapshotter.shouldStreamEventsStartingFromSnapshot() && startingSlotInfo == null) {
+            setSnapshotTransactionIsolationLevel();
+        }
         schema.refresh(jdbcConnection, false);
     }
 
@@ -121,19 +129,29 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     @Override
     protected void determineSnapshotOffset(RelationalSnapshotContext ctx) throws Exception {
         PostgresOffsetContext offset = (PostgresOffsetContext) ctx.offset;
-        final long xlogStart = getTransactionStartLsn();
-        final long txId = jdbcConnection.currentTransactionId().longValue();
-        LOGGER.info("Read xlogStart at '{}' from transaction '{}'", ReplicationConnection.format(xlogStart), txId);
         if (offset == null) {
             offset = PostgresOffsetContext.initialContext(connectorConfig, jdbcConnection, getClock());
             ctx.offset = offset;
         }
 
-        // use the old xmin, as we don't want to update it if in xmin recovery
-        offset.updateWalPosition(xlogStart, null, clock.currentTime(), txId, null, offset.xmin());
+        updateOffsetForSnapshot(offset);
     }
 
-    private long getTransactionStartLsn() throws SQLException {
+    private void updateOffsetForSnapshot(PostgresOffsetContext offset) throws SQLException {
+        final Lsn xlogStart = getTransactionStartLsn();
+        final long txId = jdbcConnection.currentTransactionId().longValue();
+        LOGGER.info("Read xlogStart at '{}' from transaction '{}'", xlogStart, txId);
+
+        // use the old xmin, as we don't want to update it if in xmin recovery
+        offset.updateWalPosition(xlogStart, offset.lastCompletelyProcessedLsn(), clock.currentTime(), txId, null, offset.xmin());
+    }
+
+    protected void updateOffsetForPreSnapshotCatchUpStreaming(PostgresOffsetContext offset) throws SQLException {
+        updateOffsetForSnapshot(offset);
+        offset.setStreamingStoppingLsn(Lsn.valueOf(jdbcConnection.currentXLogLocation()));
+    }
+
+    private Lsn getTransactionStartLsn() throws SQLException {
         if (snapshotter.exportSnapshot() && slotCreatedInfo != null) {
             // When performing an exported snapshot based on a newly created replication slot, the txLogStart position
             // should be based on the replication slot snapshot transaction point. This is crucial so that if any
@@ -141,7 +159,14 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
             // they'll be lost.
             return slotCreatedInfo.startLsn();
         }
-        return jdbcConnection.currentXLogLocation();
+        else if (!snapshotter.shouldStreamEventsStartingFromSnapshot() && startingSlotInfo != null) {
+            // Allow streaming to resume from where streaming stopped last rather than where the current snapshot starts.
+            SlotState currentSlotState = jdbcConnection.getReplicationSlotState(connectorConfig.slotName(),
+                    connectorConfig.plugin().getPostgresPluginName());
+            return currentSlotState.slotLastFlushedLsn();
+        }
+
+        return Lsn.valueOf(jdbcConnection.currentXLogLocation());
     }
 
     @Override
@@ -175,6 +200,7 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
         return new SchemaChangeEvent(
                 snapshotContext.offset.getPartition(),
                 snapshotContext.offset.getOffset(),
+                snapshotContext.offset.getSourceInfo(),
                 snapshotContext.catalogName,
                 table.id().schema(),
                 null,
@@ -188,7 +214,7 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     }
 
     @Override
-    protected Optional<String> getSnapshotSelect(SnapshotContext snapshotContext, TableId tableId) {
+    protected Optional<String> getSnapshotSelect(RelationalSnapshotContext snapshotContext, TableId tableId) {
         return snapshotter.buildSnapshotQuery(tableId);
     }
 
@@ -248,6 +274,13 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
             // not a known type
             return super.getColumnValue(rs, columnIndex, column);
         }
+    }
+
+    protected void setSnapshotTransactionIsolationLevel() throws SQLException {
+        LOGGER.info("Setting isolation level");
+        String transactionStatement = snapshotter.snapshotTransactionIsolationLevelStatement(slotCreatedInfo);
+        LOGGER.info("Opening transaction with statement {}", transactionStatement);
+        jdbcConnection.executeWithoutCommitting(transactionStatement);
     }
 
     /**

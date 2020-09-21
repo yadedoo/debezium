@@ -5,6 +5,7 @@
  */
 package io.debezium.testing.openshift.tools;
 
+import static io.debezium.testing.openshift.tools.WaitConditions.scaled;
 import static org.awaitility.Awaitility.await;
 
 import java.util.ArrayList;
@@ -20,9 +21,11 @@ import org.slf4j.LoggerFactory;
 
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.EnvVar;
+import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.LocalObjectReference;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.networking.NetworkPolicy;
@@ -69,6 +72,22 @@ public class OpenShiftUtils {
                 .endSpec()
                 .done();
         return route;
+    }
+
+    public Service createService(String project, String name, String portName, int port, Map<String, String> selector, Map<String, String> labels) {
+        Service service = client.services().inNamespace(project).createOrReplaceWithNew()
+                .withNewMetadata()
+                .withName(name)
+                .withLabels(labels)
+                .endMetadata()
+                .withNewSpec()
+                .addNewPort()
+                .withAppProtocol("tcp")
+                .withName(portName).withPort(port).withTargetPort(new IntOrString(port))
+                .endPort()
+                .withSelector(selector)
+                .endSpec().done();
+        return service;
     }
 
     /**
@@ -160,7 +179,7 @@ public class OpenShiftUtils {
      */
     public PodList podsWithLabels(String project, Map<String, String> labels) {
         Supplier<PodList> podListSupplier = () -> client.pods().inNamespace(project).withLabels(labels).list();
-        await().atMost(5, TimeUnit.MINUTES).until(() -> podListSupplier.get().getItems().size() > 0);
+        await().atMost(scaled(5), TimeUnit.MINUTES).until(() -> podListSupplier.get().getItems().size() > 0);
         PodList pods = podListSupplier.get();
 
         if (pods.getItems().isEmpty()) {
@@ -183,7 +202,7 @@ public class OpenShiftUtils {
 
         for (Pod p : pods.getItems()) {
             try {
-                client.resource(p).waitUntilReady(5, TimeUnit.MINUTES);
+                client.resource(p).waitUntilReady(scaled(5), TimeUnit.MINUTES);
             }
             catch (InterruptedException e) {
                 throw new IllegalStateException("Error when waiting for pod " + p.getMetadata().getName() + " to get ready", e);

@@ -11,7 +11,6 @@ import static org.junit.Assert.fail;
 import java.lang.management.ManagementFactory;
 
 import javax.management.InstanceNotFoundException;
-import javax.management.MBeanAttributeInfo;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
@@ -28,7 +27,7 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         this.config = TestHelper.getConfiguration()
                 .edit()
                 .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.INITIAL)
-                .with(MongoDbConnectorConfig.COLLECTION_WHITELIST, "dbit.*")
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
                 .build();
         this.context = new MongoDbTaskContext(config);
 
@@ -69,7 +68,7 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         this.config = TestHelper.getConfiguration()
                 .edit()
                 .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.INITIAL)
-                .with(MongoDbConnectorConfig.COLLECTION_WHITELIST, "dbit.*")
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
                 .build();
         this.context = new MongoDbTaskContext(config);
 
@@ -90,10 +89,6 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
         final ObjectName objectName = getSnapshotMetricsObjectName("mongodb", "mongo1");
 
-        for (MBeanAttributeInfo info : mBeanServer.getMBeanInfo(objectName).getAttributes()) {
-            System.out.println(info.getName() + " => " + mBeanServer.getAttribute(objectName, info.getName()));
-        }
-
         assertThat(mBeanServer.getAttribute(objectName, "TotalTableCount")).isEqualTo(1);
         assertThat(mBeanServer.getAttribute(objectName, "RemainingTableCount")).isEqualTo(0);
         assertThat(mBeanServer.getAttribute(objectName, "SnapshotRunning")).isEqualTo(false);
@@ -104,6 +99,7 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         assertThat(mBeanServer.getAttribute(objectName, "NumberOfErroneousEvents")).isEqualTo(0L);
         assertThat(mBeanServer.getAttribute(objectName, "MonitoredTables")).isEqualTo(new String[]{ "rs0.dbit.restaurants" });
         assertThat(mBeanServer.getAttribute(objectName, "LastEvent")).isNotNull();
+        assertThat(mBeanServer.getAttribute(objectName, "NumberOfDisconnects")).isEqualTo(0L);
     }
 
     @Test
@@ -112,7 +108,7 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         this.config = TestHelper.getConfiguration()
                 .edit()
                 .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.NEVER)
-                .with(MongoDbConnectorConfig.COLLECTION_WHITELIST, "dbit.*")
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
                 .build();
         this.context = new MongoDbTaskContext(config);
 
@@ -133,13 +129,9 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
         final ObjectName objectName = getStreamingMetricsObjectName("mongodb", "mongo1");
 
-        for (MBeanAttributeInfo info : mBeanServer.getMBeanInfo(objectName).getAttributes()) {
-            System.out.println(info.getName() + " => " + mBeanServer.getAttribute(objectName, info.getName()));
-        }
-
         assertThat(mBeanServer.getAttribute(objectName, "SourceEventPosition")).isNotNull();
-        assertThat(mBeanServer.getAttribute(objectName, "NumberOfCommittedTransactions")).isEqualTo(0L);
-        assertThat(mBeanServer.getAttribute(objectName, "LastTransactionId")).isNull();
+        assertThat(mBeanServer.getAttribute(objectName, "NumberOfCommittedTransactions")).isEqualTo(6L);
+        assertThat(mBeanServer.getAttribute(objectName, "LastTransactionId")).isNotNull();
         assertThat(mBeanServer.getAttribute(objectName, "Connected")).isEqualTo(true);
         assertThat(mBeanServer.getAttribute(objectName, "MonitoredTables")).isEqualTo(new String[]{});
         assertThat(mBeanServer.getAttribute(objectName, "LastEvent")).isNotNull();
@@ -148,5 +140,7 @@ public class MongoMetricsIT extends AbstractMongoConnectorIT {
         assertThat(mBeanServer.getAttribute(objectName, "NumberOfErroneousEvents")).isEqualTo(0L);
         assertThat((Long) mBeanServer.getAttribute(objectName, "MilliSecondsSinceLastEvent")).isGreaterThanOrEqualTo(0);
         assertThat((Long) mBeanServer.getAttribute(objectName, "MilliSecondsBehindSource")).isGreaterThanOrEqualTo(0);
+        assertThat(mBeanServer.getAttribute(objectName, "NumberOfDisconnects")).isEqualTo(0L);
+        assertThat(mBeanServer.getAttribute(objectName, "NumberOfPrimaryElections")).isEqualTo(0L);
     }
 }

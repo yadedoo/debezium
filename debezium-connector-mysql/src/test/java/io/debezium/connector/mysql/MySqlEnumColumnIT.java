@@ -7,6 +7,7 @@ package io.debezium.connector.mysql;
 
 import static io.debezium.data.Enum.LOGICAL_NAME;
 import static io.debezium.data.Enum.VALUES_FIELD;
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.fest.assertions.Assertions.assertThat;
 
 import java.nio.file.Path;
@@ -22,11 +23,13 @@ import io.debezium.config.Configuration;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.junit.SkipWhenDatabaseVersion;
 import io.debezium.util.Testing;
 
 /**
  * @author Chris Cranford
  */
+@SkipWhenDatabaseVersion(check = LESS_THAN, major = 5, minor = 6, patch = 5, reason = "MySQL does not support CURRENT_TIMESTAMP on DATETIME and only a single column can specify default CURRENT_TIMESTAMP, lifted in MySQL 5.6.5")
 public class MySqlEnumColumnIT extends AbstractConnectorTest {
 
     private static final String TYPE_NAME_PARAMETER_KEY = "__debezium.source.column.type";
@@ -62,7 +65,7 @@ public class MySqlEnumColumnIT extends AbstractConnectorTest {
 
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NEVER)
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("test_stations_10"))
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("test_stations_10"))
                 .build();
 
         start(MySqlConnector.class, config);
@@ -91,7 +94,7 @@ public class MySqlEnumColumnIT extends AbstractConnectorTest {
     public void shouldPropagateColumnSourceType() throws Exception {
         config = DATABASE.defaultConfig()
                 .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NEVER)
-                .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("test_stations_10"))
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("test_stations_10"))
                 .with("column.propagate.source.type", DATABASE.qualifiedTableName("test_stations_10") + ".type")
                 .build();
 

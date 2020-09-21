@@ -6,28 +6,31 @@
 
 package io.debezium.connector.postgresql;
 
+import static java.time.ZoneId.systemDefault;
+
 import java.io.StringWriter;
 import java.io.UnsupportedEncodingException;
 import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.sql.SQLException;
 import java.sql.Timestamp;
-import java.time.Duration;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.OffsetTime;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Decimal;
@@ -44,6 +47,7 @@ import org.postgresql.util.PGobject;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 
+import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.HStoreHandlingMode;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.IntervalHandlingMode;
 import io.debezium.connector.postgresql.data.Ltree;
@@ -62,6 +66,9 @@ import io.debezium.relational.Column;
 import io.debezium.relational.ValueConverter;
 import io.debezium.time.Interval;
 import io.debezium.time.MicroDuration;
+import io.debezium.time.MicroTime;
+import io.debezium.time.MicroTimestamp;
+import io.debezium.time.NanoTime;
 import io.debezium.time.ZonedTime;
 import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.NumberConversions;
@@ -110,9 +117,6 @@ public class PostgresValueConverter extends JdbcValueConverters {
             .appendPattern("[XXX][XX][X]")
             .toFormatter();
 
-    private static final Duration ONE_DAY = Duration.ofDays(1);
-    private static final long NANO_SECONDS_PER_DAY = TimeUnit.DAYS.toNanos(1);
-
     /**
      * {@code true} if fields of data type not know should be handle as opaque binary;
      * {@code false} if they should be omitted
@@ -136,8 +140,9 @@ public class PostgresValueConverter extends JdbcValueConverters {
     protected PostgresValueConverter(Charset databaseCharset, DecimalMode decimalMode,
                                      TemporalPrecisionMode temporalPrecisionMode, ZoneOffset defaultOffset,
                                      BigIntUnsignedMode bigIntUnsignedMode, boolean includeUnknownDatatypes, TypeRegistry typeRegistry,
-                                     HStoreHandlingMode hStoreMode, IntervalHandlingMode intervalMode, byte[] toastPlaceholder) {
-        super(decimalMode, temporalPrecisionMode, defaultOffset, null, bigIntUnsignedMode);
+                                     HStoreHandlingMode hStoreMode, BinaryHandlingMode binaryMode, IntervalHandlingMode intervalMode,
+                                     byte[] toastPlaceholder) {
+        super(decimalMode, temporalPrecisionMode, defaultOffset, null, bigIntUnsignedMode, binaryMode);
         this.databaseCharset = databaseCharset;
         this.jsonFactory = new JsonFactory();
         this.includeUnknownDatatypes = includeUnknownDatatypes;
@@ -190,7 +195,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.NUMERIC:
                 return numericSchema(column);
             case PgOid.BYTEA:
-                return SchemaBuilder.bytes();
+                return binaryMode.getSchema();
             case PgOid.INT2_ARRAY:
                 return SchemaBuilder.array(SchemaBuilder.OPTIONAL_INT16_SCHEMA);
             case PgOid.INT4_ARRAY:
@@ -227,10 +232,26 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 return SchemaBuilder.array(org.apache.kafka.connect.data.Date.builder().optional().build());
             case PgOid.UUID_ARRAY:
                 return SchemaBuilder.array(Uuid.builder().optional().build());
+            case PgOid.JSONB_ARRAY:
+            case PgOid.JSON_ARRAY:
+                return SchemaBuilder.array(Json.builder().optional().build());
             case PgOid.TIME_ARRAY:
+                return SchemaBuilder.array(MicroTime.builder().optional().build());
             case PgOid.TIMETZ_ARRAY:
+                return SchemaBuilder.array(ZonedTime.builder().optional().build());
             case PgOid.TIMESTAMP_ARRAY:
+                if (adaptiveTimePrecisionMode || adaptiveTimeMicrosecondsPrecisionMode) {
+                    if (getTimePrecision(column) <= 3) {
+                        return SchemaBuilder.array(io.debezium.time.Timestamp.builder().optional().build());
+                    }
+                    if (getTimePrecision(column) <= 6) {
+                        return SchemaBuilder.array(MicroTimestamp.builder().optional().build());
+                    }
+                    return SchemaBuilder.array(NanoTime.builder().optional().build());
+                }
+                return SchemaBuilder.array(org.apache.kafka.connect.data.Timestamp.builder().optional().build());
             case PgOid.TIMESTAMPTZ_ARRAY:
+                return SchemaBuilder.array(ZonedTimestamp.builder().optional().build());
             case PgOid.BYTEA_ARRAY:
             case PgOid.OID_ARRAY:
             case PgOid.MONEY_ARRAY:
@@ -239,8 +260,6 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.VARBIT_ARRAY:
             case PgOid.XML_ARRAY:
             case PgOid.POINT_ARRAY:
-            case PgOid.JSONB_ARRAY:
-            case PgOid.JSON_ARRAY:
             case PgOid.REF_CURSOR_ARRAY:
                 // These array types still need to be implemented. The superclass won't handle them so
                 // we return null here until we can code schema implementations for them.
@@ -282,10 +301,14 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 if (resolvedType.isEnumType()) {
                     return io.debezium.data.Enum.builder(Strings.join(",", resolvedType.getEnumValues()));
                 }
+                else if (resolvedType.isArrayType() && resolvedType.getElementType().isEnumType()) {
+                    List<String> enumValues = resolvedType.getElementType().getEnumValues();
+                    return SchemaBuilder.array(io.debezium.data.Enum.builder(Strings.join(",", enumValues)));
+                }
 
                 final SchemaBuilder jdbcSchemaBuilder = super.schemaBuilder(column);
                 if (jdbcSchemaBuilder == null) {
-                    return includeUnknownDatatypes ? SchemaBuilder.bytes() : null;
+                    return includeUnknownDatatypes ? binaryMode.getSchema() : null;
                 }
                 else {
                     return jdbcSchemaBuilder;
@@ -297,7 +320,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
         if (decimalMode == DecimalMode.PRECISE && isVariableScaleDecimal(column)) {
             return VariableScaleDecimal.builder();
         }
-        return SpecialValueDecimal.builder(decimalMode, column.length(), column.scale().get());
+        return SpecialValueDecimal.builder(decimalMode, column.length(), column.scale().orElseGet(() -> 0));
     }
 
     private SchemaBuilder hstoreSchema() {
@@ -352,7 +375,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.NUMERIC:
                 return (data) -> convertDecimal(column, fieldDefn, data, decimalMode);
             case PgOid.BYTEA:
-                return data -> convertBinary(column, fieldDefn, data);
+                return data -> convertBinary(column, fieldDefn, data, binaryMode);
             case PgOid.INT2_ARRAY:
             case PgOid.INT4_ARRAY:
             case PgOid.INT8_ARRAY:
@@ -376,14 +399,16 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.NUM_RANGE_ARRAY:
             case PgOid.INT8RANGE_ARRAY:
             case PgOid.UUID_ARRAY:
-                return createArrayConverter(column, fieldDefn);
-
-            // TODO DBZ-459 implement support for these array types; for now we just fall back to the default, i.e.
-            // having no converter, so to be consistent with the schema definitions above
+            case PgOid.JSONB_ARRAY:
+            case PgOid.JSON_ARRAY:
             case PgOid.TIME_ARRAY:
             case PgOid.TIMETZ_ARRAY:
             case PgOid.TIMESTAMP_ARRAY:
             case PgOid.TIMESTAMPTZ_ARRAY:
+                return createArrayConverter(column, fieldDefn);
+
+            // TODO DBZ-459 implement support for these array types; for now we just fall back to the default, i.e.
+            // having no converter, so to be consistent with the schema definitions above
             case PgOid.BYTEA_ARRAY:
             case PgOid.OID_ARRAY:
             case PgOid.MONEY_ARRAY:
@@ -392,8 +417,6 @@ public class PostgresValueConverter extends JdbcValueConverters {
             case PgOid.VARBIT_ARRAY:
             case PgOid.XML_ARRAY:
             case PgOid.POINT_ARRAY:
-            case PgOid.JSONB_ARRAY:
-            case PgOid.JSON_ARRAY:
             case PgOid.REF_CURSOR_ARRAY:
                 return super.converter(column, fieldDefn);
 
@@ -423,9 +446,14 @@ public class PostgresValueConverter extends JdbcValueConverters {
                     return createArrayConverter(column, fieldDefn);
                 }
 
+                final PostgresType resolvedType = typeRegistry.get(oidValue);
+                if (resolvedType.isArrayType()) {
+                    return createArrayConverter(column, fieldDefn);
+                }
+
                 final ValueConverter jdbcConverter = super.converter(column, fieldDefn);
                 if (jdbcConverter == null) {
-                    return includeUnknownDatatypes ? data -> convertBinary(column, fieldDefn, data) : null;
+                    return includeUnknownDatatypes ? data -> convertBinary(column, fieldDefn, data, binaryMode) : null;
                 }
                 else {
                     return jdbcConverter;
@@ -455,7 +483,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
         final Field elementField = new Field(elementColumnName, 0, elementSchema);
         final ValueConverter elementConverter = converter(elementColumn, elementField);
 
-        return data -> convertArray(column, fieldDefn, elementConverter, data);
+        return data -> convertArray(column, fieldDefn, elementType, elementConverter, data);
     }
 
     @Override
@@ -529,6 +557,14 @@ public class PostgresValueConverter extends JdbcValueConverters {
                 // remove '{' and '}'
                 s = s.substring(1, s.length() - 1);
                 List<String> ltrees = Arrays.asList(s.split(","));
+                r.deliver(ltrees);
+            }
+            else if (data instanceof List) {
+                List<Object> list = (List<Object>) data;
+                List<String> ltrees = new ArrayList<>(list.size());
+                for (Object value : list) {
+                    ltrees.add(value.toString());
+                }
                 r.deliver(ltrees);
             }
             else if (data instanceof PgArray) {
@@ -632,17 +668,24 @@ public class PostgresValueConverter extends JdbcValueConverters {
             data = ((PGobject) data).getValue();
         }
         if (data instanceof String) {
-            long longValue = Long.parseLong((String) data, 2);
-            // return the smallest possible value
-            if (Short.MIN_VALUE <= longValue && longValue <= Short.MAX_VALUE) {
-                data = (short) longValue;
+            String dataStr = (String) data;
+            BitSet bitset = new BitSet(dataStr.length());
+            int len = dataStr.length();
+            for (int i = len - 1; i >= 0; i--) {
+                if (dataStr.charAt(i) == '1') {
+                    bitset.set(len - i - 1);
+                }
             }
-            else if (Integer.MIN_VALUE <= longValue && longValue <= Integer.MAX_VALUE) {
-                data = (int) longValue;
-            }
-            else {
-                data = longValue;
-            }
+            /*
+             * Instead of passing the default field precision/length value (= number of bits) divided by 8 = number of bytes
+             * see {@link JdbcValueConverters#convertBits}, we re-calculate the length / number of bytes based on the actual
+             * content. For example if we have only 3 bits set (b'101') but the field type is BIT VARYING (33) instead of
+             * sending 5 bytes (b'10100000' plus 25 zero bits/4 zero bytes) we only pass one little-endian padded byte
+             * (b'10100000').
+             */
+            int numBits = bitset.length();
+            int bitBytes = numBits / Byte.SIZE + (numBits % Byte.SIZE == 0 ? 0 : 1);
+            return super.convertBits(column, fieldDefn, bitset, bitBytes);
         }
         return super.convertBits(column, fieldDefn, data, numBytes);
     }
@@ -816,10 +859,11 @@ public class PostgresValueConverter extends JdbcValueConverters {
         });
     }
 
-    protected Object convertArray(Column column, Field fieldDefn, ValueConverter elementConverter, Object data) {
+    protected Object convertArray(Column column, Field fieldDefn, PostgresType elementType, ValueConverter elementConverter, Object data) {
         return convertValue(column, fieldDefn, data, Collections.emptyList(), (r) -> {
             if (data instanceof List) {
                 r.deliver(((List<?>) data).stream()
+                        .map(value -> resolveArrayValue(value, elementType))
                         .map(elementConverter::convert)
                         .collect(Collectors.toList()));
             }
@@ -828,7 +872,7 @@ public class PostgresValueConverter extends JdbcValueConverters {
                     final Object[] values = (Object[]) ((PgArray) data).getArray();
                     final List<Object> converted = new ArrayList<>(values.length);
                     for (Object value : values) {
-                        converted.add(elementConverter.convert(value));
+                        converted.add(elementConverter.convert(resolveArrayValue(value, elementType)));
                     }
                     r.deliver(converted);
                 }
@@ -839,9 +883,36 @@ public class PostgresValueConverter extends JdbcValueConverters {
         });
     }
 
+    private Object resolveArrayValue(Object value, PostgresType elementType) {
+        // PostgreSQL time data types with time-zones are handled differently when included in an array.
+        // The values are automatically translated to the local JVM time-zone and need to be converted back to GMT
+        // before delegating the value to the element converter.
+        switch (elementType.getOid()) {
+            case PgOid.TIMETZ: {
+                if (value instanceof java.sql.Time) {
+                    ZonedDateTime zonedDateTime = ZonedDateTime.of(LocalDate.now(), ((java.sql.Time) value).toLocalTime(), systemDefault());
+                    // Daylight savings gets applied by PgArray, need to account for that here
+                    zonedDateTime = zonedDateTime.plus(systemDefault().getRules().getDaylightSavings(zonedDateTime.toInstant()));
+                    return OffsetTime.of(zonedDateTime.withZoneSameInstant(ZoneOffset.UTC).toLocalTime(), ZoneOffset.UTC);
+                }
+                break;
+            }
+            case PgOid.TIMESTAMPTZ: {
+                if (value instanceof java.sql.Timestamp) {
+                    // Daylight savings isn't applied here, no need to account for it
+                    ZonedDateTime zonedDateTime = ZonedDateTime.of(((java.sql.Timestamp) value).toLocalDateTime(), systemDefault());
+                    return OffsetDateTime.of(zonedDateTime.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime(), ZoneOffset.UTC);
+                }
+            }
+        }
+
+        // no special handling is needed, return value as-is
+        return value;
+    }
+
     private boolean isVariableScaleDecimal(final Column column) {
-        return (column.scale().isPresent() && column.scale().get() == 0 && column.length() == VARIABLE_SCALE_DECIMAL_LENGTH)
-                || (!column.scale().isPresent() && column.length() == -1);
+        return column.length() == VARIABLE_SCALE_DECIMAL_LENGTH &&
+                column.scale().orElseGet(() -> 0) == 0;
     }
 
     public static Optional<SpecialValueDecimal> toSpecialValue(String value) {
@@ -884,14 +955,24 @@ public class PostgresValueConverter extends JdbcValueConverters {
      * @throws IllegalArgumentException if the value could not be converted but the column does not allow nulls
      */
     @Override
-    protected Object convertBinary(Column column, Field fieldDefn, Object data) {
+    protected Object convertBinaryToBytes(Column column, Field fieldDefn, Object data) {
         if (data == UnchangedToastedReplicationMessageColumn.UNCHANGED_TOAST_VALUE) {
             return toastPlaceholderBinary;
         }
         if (data instanceof PgArray) {
             data = ((PgArray) data).toString();
         }
-        return super.convertBinary(column, fieldDefn, (data instanceof PGobject) ? ((PGobject) data).getValue() : data);
+        return super.convertBinaryToBytes(column, fieldDefn, (data instanceof PGobject) ? ((PGobject) data).getValue() : data);
+    }
+
+    @Override
+    protected Object convertBinaryToBase64(Column column, Field fieldDefn, Object data) {
+        return super.convertBinaryToBase64(column, fieldDefn, (data instanceof PGobject) ? ((PGobject) data).getValue() : data);
+    }
+
+    @Override
+    protected Object convertBinaryToHex(Column column, Field fieldDefn, Object data) {
+        return super.convertBinaryToHex(column, fieldDefn, (data instanceof PGobject) ? ((PGobject) data).getValue() : data);
     }
 
     /**

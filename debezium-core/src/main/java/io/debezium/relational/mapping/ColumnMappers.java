@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.kafka.connect.errors.ConnectException;
 
@@ -18,7 +20,9 @@ import io.debezium.config.Configuration;
 import io.debezium.function.Predicates;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnId;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.Selectors;
+import io.debezium.relational.Selectors.TableIdToStringMapper;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.ValueConverter;
@@ -38,20 +42,30 @@ public class ColumnMappers {
      * @return the builder; never null
      */
     public static Builder build() {
-        return new Builder();
+        return new Builder(null);
     }
 
     /**
      * Builds a new {@link ColumnMappers} instance based on the given configuration.
      */
-    public static ColumnMappers create(Configuration config) {
-        Builder builder = new Builder();
+    public static ColumnMappers create(RelationalDatabaseConnectorConfig connectorConfig) {
+        final Builder builder = new Builder(connectorConfig.getTableIdMapper());
+        final Configuration config = connectorConfig.getConfig();
 
         // Define the truncated, masked, and mapped columns ...
         config.forEachMatchingFieldNameWithInteger("column\\.truncate\\.to\\.(\\d+)\\.chars", builder::truncateStrings);
         config.forEachMatchingFieldNameWithInteger("column\\.mask\\.with\\.(\\d+)\\.chars", builder::maskStrings);
         config.forEachMatchingFieldName("column\\.propagate\\.source\\.type", builder::propagateSourceTypeToSchemaParameter);
         config.forEachMatchingFieldName("datatype\\.propagate\\.source\\.type", builder::propagateSourceTypeToSchemaParameterByDatatype);
+
+        final Pattern hashAlgorithmAndSaltExtractPattern = Pattern.compile("((?<hashAlgorithm>[^.]+)\\.with\\.salt\\.(?<salt>.+))");
+        config.forEachMatchingFieldNameWithString("column\\.mask\\.hash\\." + hashAlgorithmAndSaltExtractPattern.pattern(),
+                (fullyQualifiedColumnNames, hashAlgorithmAndSalt) -> {
+                    Matcher matcher = hashAlgorithmAndSaltExtractPattern.matcher(hashAlgorithmAndSalt);
+                    if (matcher.matches()) {
+                        builder.maskStringsByHashing(fullyQualifiedColumnNames, matcher.group("hashAlgorithm"), matcher.group("salt"));
+                    }
+                });
 
         return builder.build();
     }
@@ -64,6 +78,11 @@ public class ColumnMappers {
     public static class Builder {
 
         private final List<MapperRule> rules = new ArrayList<>();
+        private final TableIdToStringMapper tableIdMapper;
+
+        public Builder(TableIdToStringMapper tableIdMapper) {
+            this.tableIdMapper = tableIdMapper;
+        }
 
         /**
          * Set a mapping function for the columns with fully-qualified names that match the given comma-separated list of regular
@@ -77,22 +96,39 @@ public class ColumnMappers {
         public Builder map(String fullyQualifiedColumnNames, ColumnMapper mapper) {
             BiPredicate<TableId, Column> columnMatcher = Predicates.includes(fullyQualifiedColumnNames, (tableId, column) -> fullyQualifiedColumnName(tableId, column));
             rules.add(new MapperRule(columnMatcher, mapper));
+            if (tableIdMapper != null) {
+                columnMatcher = Predicates.includes(fullyQualifiedColumnNames, (tableId, column) -> mappedTableColumnName(tableId, column));
+                rules.add(new MapperRule(columnMatcher, mapper));
+            }
             return this;
         }
 
-        public static String fullyQualifiedColumnName(TableId tableId, Column column) {
+        public String fullyQualifiedColumnName(TableId tableId, Column column) {
             ColumnId id = new ColumnId(tableId, column.name());
+            return id.toString();
+        }
+
+        public String mappedTableColumnName(TableId tableId, Column column) {
+            ColumnId id = new ColumnId(mappedTableId(tableId), column.name());
             return id.toString();
         }
 
         public Builder mapByDatatype(String columnDatatypes, ColumnMapper mapper) {
             BiPredicate<TableId, Column> columnMatcher = Predicates.includes(columnDatatypes, (tableId, column) -> fullyQualifiedColumnDatatype(tableId, column));
             rules.add(new MapperRule(columnMatcher, mapper));
+            if (tableIdMapper != null) {
+                columnMatcher = Predicates.includes(columnDatatypes, (tableId, column) -> mappedTableColumnDatatype(tableId, column));
+                rules.add(new MapperRule(columnMatcher, mapper));
+            }
             return this;
         }
 
-        public static String fullyQualifiedColumnDatatype(TableId tableId, Column column) {
+        public String fullyQualifiedColumnDatatype(TableId tableId, Column column) {
             return tableId.toString() + "." + column.typeName();
+        }
+
+        public String mappedTableColumnDatatype(TableId tableId, Column column) {
+            return mappedTableId(tableId).toString() + "." + column.typeName();
         }
 
         /**
@@ -171,6 +207,10 @@ public class ColumnMappers {
             return map(fullyQualifiedColumnNames, new MaskStrings(maskValue));
         }
 
+        public Builder maskStringsByHashing(String fullyQualifiedColumnNames, String hashAlgorithm, String salt) {
+            return map(fullyQualifiedColumnNames, new MaskStrings(salt.getBytes(), hashAlgorithm));
+        }
+
         public Builder propagateSourceTypeToSchemaParameter(String fullyQualifiedColumnNames, String value) {
             return map(value, new PropagateSourceTypeToSchemaParameter());
         }
@@ -230,6 +270,10 @@ public class ColumnMappers {
          */
         public ColumnMappers build() {
             return new ColumnMappers(rules);
+        }
+
+        private TableId mappedTableId(TableId tableId) {
+            return new TableId(tableId.catalog(), tableId.schema(), tableId.table(), tableIdMapper);
         }
     }
 

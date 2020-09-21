@@ -12,6 +12,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -22,8 +23,10 @@ import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
 import io.debezium.annotation.VisibleForTesting;
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.spi.SlotState;
@@ -49,7 +52,7 @@ public class PostgresConnection extends JdbcConnection {
             + JdbcConfiguration.PORT + "}/${" + JdbcConfiguration.DATABASE + "}";
     protected static final ConnectionFactory FACTORY = JdbcConnection.patternBasedFactory(URL_PATTERN,
             org.postgresql.Driver.class.getName(),
-            PostgresConnection.class.getClassLoader());
+            PostgresConnection.class.getClassLoader(), JdbcConfiguration.PORT.withDefault(PostgresConnectorConfig.PORT.defaultValueAsString()));
 
     /**
      * Obtaining a replication slot may fail if there's a pending transaction. We're retrying to get a slot for 30 min.
@@ -60,17 +63,27 @@ public class PostgresConnection extends JdbcConnection {
 
     private final TypeRegistry typeRegistry;
 
-    private final Charset databaseCharset;
+    /**
+     * Creates a Postgres connection using the supplied configuration.
+     * If necessary this connection is able to resolve data type mappings.
+     * Usually only one such connection per connector is needed.
+     *
+     * @param config {@link Configuration} instance, may not be null.
+     * @param provideTypeRegistry {@code true} if type registry should be created
+     */
+    public PostgresConnection(Configuration config, boolean provideTypeRegistry) {
+        super(config, FACTORY, PostgresConnection::validateServerVersion, PostgresConnection::defaultSettings);
+        this.typeRegistry = provideTypeRegistry ? new TypeRegistry(this) : null;
+    }
 
     /**
      * Creates a Postgres connection using the supplied configuration.
+     * The connector is the regular one without datatype resolution capabilities.
      *
      * @param config {@link Configuration} instance, may not be null.
      */
     public PostgresConnection(Configuration config) {
-        super(config, FACTORY, PostgresConnection::validateServerVersion, PostgresConnection::defaultSettings);
-        this.typeRegistry = new TypeRegistry(this);
-        databaseCharset = determineDatabaseCharset();
+        this(config, false);
     }
 
     /**
@@ -148,15 +161,15 @@ public class PostgresConnection extends JdbcConnection {
                 rs -> {
                     if (rs.next()) {
                         boolean active = rs.getBoolean("active");
-                        Long confirmedFlushedLsn = parseConfirmedFlushLsn(slotName, pluginName, database, rs);
+                        final Lsn confirmedFlushedLsn = parseConfirmedFlushLsn(slotName, pluginName, database, rs);
                         if (confirmedFlushedLsn == null) {
                             return null;
                         }
-                        Long restartLsn = parseRestartLsn(slotName, pluginName, database, rs);
+                        Lsn restartLsn = parseRestartLsn(slotName, pluginName, database, rs);
                         if (restartLsn == null) {
                             return null;
                         }
-                        Long xmin = rs.getLong("catalog_xmin");
+                        final Long xmin = rs.getLong("catalog_xmin");
                         return new ServerInfo.ReplicationSlot(active, confirmedFlushedLsn, restartLsn, xmin);
                     }
                     else {
@@ -215,8 +228,8 @@ public class PostgresConnection extends JdbcConnection {
      * Obtains the LSN to resume streaming from. On PG 9.5 there is no confirmed_flushed_lsn yet, so restart_lsn will be
      * read instead. This may result in more records to be re-read after a restart.
      */
-    private Long parseConfirmedFlushLsn(String slotName, String pluginName, String database, ResultSet rs) {
-        Long confirmedFlushedLsn = null;
+    private Lsn parseConfirmedFlushLsn(String slotName, String pluginName, String database, ResultSet rs) {
+        Lsn confirmedFlushedLsn = null;
 
         try {
             confirmedFlushedLsn = tryParseLsn(slotName, pluginName, database, rs, "confirmed_flush_lsn");
@@ -234,8 +247,8 @@ public class PostgresConnection extends JdbcConnection {
         return confirmedFlushedLsn;
     }
 
-    private Long parseRestartLsn(String slotName, String pluginName, String database, ResultSet rs) {
-        Long restartLsn = null;
+    private Lsn parseRestartLsn(String slotName, String pluginName, String database, ResultSet rs) {
+        Lsn restartLsn = null;
         try {
             restartLsn = tryParseLsn(slotName, pluginName, database, rs, "restart_lsn");
         }
@@ -246,15 +259,15 @@ public class PostgresConnection extends JdbcConnection {
         return restartLsn;
     }
 
-    private Long tryParseLsn(String slotName, String pluginName, String database, ResultSet rs, String column) throws ConnectException, SQLException {
-        Long lsn = null;
+    private Lsn tryParseLsn(String slotName, String pluginName, String database, ResultSet rs, String column) throws ConnectException, SQLException {
+        Lsn lsn = null;
 
         String lsnStr = rs.getString(column);
         if (lsnStr == null) {
             return null;
         }
         try {
-            lsn = LogSequenceNumber.valueOf(lsnStr).asLong();
+            lsn = Lsn.valueOf(lsnStr);
         }
         catch (Exception e) {
             throw new ConnectException("Value " + column + " in the pg_replication_slots table for slot = '"
@@ -262,7 +275,7 @@ public class PostgresConnection extends JdbcConnection {
                     + pluginName + "', database = '"
                     + database + "' is not valid. This is an abnormal situation and the database status should be checked.");
         }
-        if (lsn == LogSequenceNumber.INVALID_LSN.asLong()) {
+        if (!lsn.isValid()) {
             throw new ConnectException("Invalid LSN returned from database");
         }
         return lsn;
@@ -275,25 +288,39 @@ public class PostgresConnection extends JdbcConnection {
      * @return {@code true} if the slot was dropped, {@code false} otherwise
      */
     public boolean dropReplicationSlot(String slotName) {
-        try {
-            execute("select pg_drop_replication_slot('" + slotName + "')");
-            return true;
+        final int ATTEMPTS = 3;
+        for (int i = 0; i < ATTEMPTS; i++) {
+            try {
+                execute("select pg_drop_replication_slot('" + slotName + "')");
+                return true;
+            }
+            catch (SQLException e) {
+                // slot is active
+                if (PSQLState.OBJECT_IN_USE.getState().equals(e.getSQLState())) {
+                    if (i < ATTEMPTS - 1) {
+                        LOGGER.debug("Cannot drop replication slot '{}' because it's still in use", slotName);
+                    }
+                    else {
+                        LOGGER.warn("Cannot drop replication slot '{}' because it's still in use", slotName);
+                        return false;
+                    }
+                }
+                else if (PSQLState.UNDEFINED_OBJECT.getState().equals(e.getSQLState())) {
+                    LOGGER.debug("Replication slot {} has already been dropped", slotName);
+                    return false;
+                }
+                else {
+                    LOGGER.error("Unexpected error while attempting to drop replication slot", e);
+                    return false;
+                }
+            }
+            try {
+                Metronome.parker(Duration.ofSeconds(1), Clock.system()).pause();
+            }
+            catch (InterruptedException e) {
+            }
         }
-        catch (SQLException e) {
-            // slot is active
-            if (PSQLState.OBJECT_IN_USE.getState().equals(e.getSQLState())) {
-                LOGGER.warn("Cannot drop replication slot '{}' because it's still in use", slotName);
-                return false;
-            }
-            else if (PSQLState.UNDEFINED_OBJECT.getState().equals(e.getSQLState())) {
-                LOGGER.debug("Replication slot {} has already been dropped", slotName);
-                return false;
-            }
-            else {
-                LOGGER.error("Unexpected error while attempting to drop replication slot", e);
-            }
-            return false;
-        }
+        return false;
     }
 
     /**
@@ -395,15 +422,11 @@ public class PostgresConnection extends JdbcConnection {
     }
 
     public Charset getDatabaseCharset() {
-        return databaseCharset;
-    }
-
-    private Charset determineDatabaseCharset() {
         try {
             return Charset.forName(((BaseConnection) connection()).getEncoding().name());
         }
         catch (SQLException e) {
-            throw new RuntimeException("Couldn't obtain encoding for database " + database(), e);
+            throw new DebeziumException("Couldn't obtain encoding for database " + database(), e);
         }
     }
 
@@ -483,6 +506,7 @@ public class PostgresConnection extends JdbcConnection {
     }
 
     public TypeRegistry getTypeRegistry() {
+        Objects.requireNonNull(typeRegistry, "Connection does not provide type registry");
         return typeRegistry;
     }
 }

@@ -6,6 +6,7 @@
 package io.debezium.connector.sqlserver;
 
 import static io.debezium.connector.sqlserver.SqlServerConnectorConfig.SNAPSHOT_ISOLATION_MODE;
+import static io.debezium.relational.RelationalDatabaseConnectorConfig.TABLE_INCLUDE_LIST;
 import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertNull;
 
@@ -202,6 +203,10 @@ public class SnapshotIT extends AbstractConnectorTest {
                     String.format("INSERT INTO table1 VALUES(%s, '%s', %s, '%s')", id, "name" + id, new BigDecimal(id + ".23"), "2018-07-18 13:28:56"));
         }
 
+        // Wait for last written CDC entry
+        final int lastId = INITIAL_RECORDS_PER_TABLE + (STREAMING_RECORDS_PER_TABLE - 1);
+        TestHelper.waitForCdcRecord(connection, "table1", rs -> rs.getInt("id") == lastId);
+
         final SourceRecords records = consumeRecordsByTopic(STREAMING_RECORDS_PER_TABLE);
         final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
 
@@ -234,7 +239,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndStartStreaming() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL_SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -260,7 +265,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         Testing.Files.delete(TestHelper.DB_HISTORY_PATH);
 
         final Configuration config = TestHelper.defaultConfig()
-                .with("table.whitelist", "dbo.User")
+                .with(TABLE_INCLUDE_LIST, "dbo.User")
                 .build();
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
@@ -292,7 +297,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndSendHeartbeat() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL_SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
                 .with(Heartbeat.HEARTBEAT_INTERVAL, 300_000)
                 .build();
 
@@ -307,7 +312,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-1067")
-    public void blacklistColumn() throws Exception {
+    public void testBlacklistColumn() throws Exception {
         connection.execute(
                 "CREATE TABLE blacklist_column_table_a (id int, name varchar(30), amount integer primary key(id))",
                 "CREATE TABLE blacklist_column_table_b (id int, name varchar(30), amount integer primary key(id))");
@@ -365,6 +370,65 @@ public class SnapshotIT extends AbstractConnectorTest {
     }
 
     @Test
+    @FixFor("DBZ-1067")
+    public void testColumnExcludeList() throws Exception {
+        connection.execute(
+                "CREATE TABLE blacklist_column_table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE blacklist_column_table_b (id int, name varchar(30), amount integer primary key(id))");
+        connection.execute("INSERT INTO blacklist_column_table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO blacklist_column_table_b VALUES(11, 'some_name', 447)");
+        TestHelper.enableTableCdc(connection, "blacklist_column_table_a");
+        TestHelper.enableTableCdc(connection, "blacklist_column_table_b");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(SqlServerConnectorConfig.COLUMN_EXCLUDE_LIST, "dbo.blacklist_column_table_a.amount")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.blacklist_column_table_a,dbo.blacklist_column_table_b")
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+
+        final SourceRecords records = consumeRecordsByTopic(2);
+        final List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.blacklist_column_table_a");
+        final List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.blacklist_column_table_b");
+
+        Schema expectedSchemaA = SchemaBuilder.struct()
+                .optional()
+                .name("server1.dbo.blacklist_column_table_a.Value")
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        Struct expectedValueA = new Struct(expectedSchemaA)
+                .put("id", 10)
+                .put("name", "some_name");
+
+        Schema expectedSchemaB = SchemaBuilder.struct()
+                .optional()
+                .name("server1.dbo.blacklist_column_table_b.Value")
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("amount", Schema.OPTIONAL_INT32_SCHEMA)
+                .build();
+        Struct expectedValueB = new Struct(expectedSchemaB)
+                .put("id", 11)
+                .put("name", "some_name")
+                .put("amount", 447);
+
+        Assertions.assertThat(tableA).hasSize(1);
+        SourceRecordAssert.assertThat(tableA.get(0))
+                .valueAfterFieldIsEqualTo(expectedValueA)
+                .valueAfterFieldSchemaIsEqualTo(expectedSchemaA);
+
+        Assertions.assertThat(tableB).hasSize(1);
+        SourceRecordAssert.assertThat(tableB.get(0))
+                .valueAfterFieldIsEqualTo(expectedValueB)
+                .valueAfterFieldSchemaIsEqualTo(expectedSchemaB);
+
+        stopConnector();
+    }
+
+    @Test
     public void reoderCapturedTables() throws Exception {
         connection.execute(
                 "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
@@ -376,7 +440,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.table_b,dbo.table_a")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.table_b,dbo.table_a")
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -411,7 +475,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.table_ab,dbo.table_(.*)")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.table_ab,dbo.table_(.*)")
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -453,7 +517,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.TABLE_BLACKLIST, "dbo.table1")
+                .with(SqlServerConnectorConfig.TABLE_EXCLUDE_LIST, "dbo.table1")
 
                 .build();
 

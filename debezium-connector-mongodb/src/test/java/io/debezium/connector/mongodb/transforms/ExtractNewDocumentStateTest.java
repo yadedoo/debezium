@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.mongodb.transforms;
 
+import static io.debezium.junit.EqualityCheck.GREATER_THAN_OR_EQUAL;
+import static io.debezium.junit.EqualityCheck.LESS_THAN;
+import static io.debezium.junit.SkipWhenKafkaVersion.KafkaVersion.KAFKA_241;
 import static org.fest.assertions.Assertions.assertThat;
 
 import java.util.ArrayList;
@@ -21,6 +24,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.junit.rules.TestRule;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.AbstractSourceInfo;
@@ -31,6 +35,8 @@ import io.debezium.connector.mongodb.MongoDbConnectorConfig;
 import io.debezium.connector.mongodb.MongoDbTopicSelector;
 import io.debezium.connector.mongodb.SourceInfo;
 import io.debezium.doc.FixFor;
+import io.debezium.junit.SkipTestRule;
+import io.debezium.junit.SkipWhenKafkaVersion;
 import io.debezium.schema.TopicSelector;
 
 /**
@@ -41,12 +47,6 @@ import io.debezium.schema.TopicSelector;
 public class ExtractNewDocumentStateTest {
 
     private static final String SERVER_NAME = "serverX";
-    private static final String FLATTEN_STRUCT = "flatten.struct";
-    private static final String DELIMITER = "flatten.struct.delimiter";
-    private static final String OPERATION_HEADER = "operation.header";
-    private static final String HANDLE_DELETES = "delete.handling.mode";
-    private static final String DROP_TOMBSTONE = "drop.tombstones";
-    private static final String ADD_SOURCE_FIELDS = "add.source.fields";
 
     private Filters filters;
     private SourceInfo source;
@@ -54,6 +54,9 @@ public class ExtractNewDocumentStateTest {
     private List<SourceRecord> produced;
 
     private ExtractNewDocumentState<SourceRecord> transformation;
+
+    @Rule
+    public TestRule skipTestRule = new SkipTestRule();
 
     @Rule
     public ExpectedException exceptionRule = ExpectedException.none();
@@ -206,7 +209,8 @@ public class ExtractNewDocumentStateTest {
 
     @Test
     @FixFor("DBZ-1430")
-    public void shouldFailWhenTheSchemaLooksValidButDoesNotHaveTheCorrectFields() {
+    @SkipWhenKafkaVersion(check = GREATER_THAN_OR_EQUAL, value = KAFKA_241, description = "Kafka throws IllegalArgumentException after 2.4.1")
+    public void shouldFailWhenTheSchemaLooksValidButDoesNotHaveTheCorrectFieldsPreKafka241() {
         Schema valueSchema = SchemaBuilder.struct()
                 .name("io.debezium.connector.common.Heartbeat.Envelope")
                 .field(AbstractSourceInfo.TIMESTAMP_KEY, Schema.INT64_SCHEMA)
@@ -231,6 +235,41 @@ public class ExtractNewDocumentStateTest {
                 value);
 
         exceptionRule.expect(NullPointerException.class);
+
+        // when
+        SourceRecord transformed = transformation.apply(eventRecord);
+
+        assertThat(transformed).isNull();
+    }
+
+    @Test
+    @FixFor("DBZ-1430")
+    @SkipWhenKafkaVersion(check = LESS_THAN, value = KAFKA_241, description = "Kafka throws NullPointerException prior to 2.4.1")
+    public void shouldFailWhenTheSchemaLooksValidButDoesNotHaveTheCorrectFieldsPostKafka241() {
+        Schema valueSchema = SchemaBuilder.struct()
+                .name("io.debezium.connector.common.Heartbeat.Envelope")
+                .field(AbstractSourceInfo.TIMESTAMP_KEY, Schema.INT64_SCHEMA)
+                .build();
+
+        Struct value = new Struct(valueSchema);
+
+        Schema keySchema = SchemaBuilder.struct()
+                .name("op.with.heartbeat.Key")
+                .field("id", Schema.STRING_SCHEMA)
+                .build();
+
+        Struct key = new Struct(keySchema).put("id", "123");
+
+        final SourceRecord eventRecord = new SourceRecord(
+                new HashMap<>(),
+                new HashMap<>(),
+                "op.with.heartbeat",
+                keySchema,
+                key,
+                valueSchema,
+                value);
+
+        exceptionRule.expect(IllegalArgumentException.class);
 
         // when
         SourceRecord transformed = transformation.apply(eventRecord);

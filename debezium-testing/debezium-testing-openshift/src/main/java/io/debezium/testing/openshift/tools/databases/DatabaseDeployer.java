@@ -23,7 +23,7 @@ import io.fabric8.openshift.client.OpenShiftClient;
 /**
  * @author Jakub Cechacek
  */
-public abstract class DatabaseDeployer<T> {
+public abstract class DatabaseDeployer<T extends DatabaseDeployer, C extends DatabaseController> {
     private static final Logger LOGGER = LoggerFactory.getLogger(DatabaseDeployer.class);
 
     private final OpenShiftClient ocp;
@@ -64,25 +64,27 @@ public abstract class DatabaseDeployer<T> {
         return getThis();
     }
 
-    public DatabaseController deploy() {
+    public C deploy() {
         if (deployment == null) {
             throw new IllegalStateException("Deployment configuration not available");
         }
         LOGGER.info("Deploying database");
         Deployment dep = ocp.apps().deployments().inNamespace(project).createOrReplace(deployment);
 
+        ocpUtils.waitForPods(project, dep.getMetadata().getLabels());
+
         List<Service> svcs = services.stream()
                 .map(s -> ocp.services().inNamespace(project).createOrReplace(s))
                 .collect(Collectors.toList());
-
-        ocpUtils.waitForPods(project, dep.getMetadata().getLabels());
         LOGGER.info("Database deployed successfully");
 
         this.deployment = dep;
         this.services = svcs;
 
-        return new DatabaseController(dep, services, dbType, ocp);
+        return getController(dep, services, dbType, ocp);
     }
 
     public abstract T getThis();
+
+    public abstract C getController(Deployment deployment, List<Service> services, String dbType, OpenShiftClient ocp);
 }

@@ -23,11 +23,12 @@ import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.header.Headers;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.codehaus.jackson.JsonNode;
-import org.codehaus.jackson.map.ObjectMapper;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
@@ -131,9 +132,11 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
         assertThat(routedEvent).isNotNull();
         assertThat(routedEvent.topic()).isEqualTo("outbox.event.User");
 
-        Struct valueStruct = requireStruct(routedEvent.value(), "test payload");
-        assertThat(valueStruct.getString("eventType")).isEqualTo("UserCreated");
-        JsonNode payload = (new ObjectMapper()).readTree(valueStruct.getString("payload"));
+        assertThat(routedEvent.keySchema()).isEqualTo(Schema.STRING_SCHEMA);
+        assertThat(routedEvent.key()).isEqualTo("10711fa5");
+
+        assertThat(routedEvent.value()).isInstanceOf(String.class);
+        JsonNode payload = (new ObjectMapper()).readTree((String) routedEvent.value());
         assertThat(payload.get("email")).isEqualTo(null);
 
     }
@@ -169,7 +172,41 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
         assertThat(routedEvent.headers().lastWithName("eventType").value()).isEqualTo("UserCreated");
         assertThat(value).isInstanceOf(String.class);
         JsonNode payload = (new ObjectMapper()).readTree((String) value);
-        assertThat(payload.get("email").getTextValue()).isEqualTo("gh@mefi.in");
+        assertThat(payload.get("email").asText()).isEqualTo("gh@mefi.in");
+    }
+
+    @Test
+    @FixFor("DBZ-2014")
+    public void shouldSendEventTypeAsValue() throws Exception {
+        startConnectorWithInitialSnapshotRecord();
+
+        TestHelper.execute(createEventInsert(
+                UUID.fromString("d4da2428-8b19-11ea-bc55-0242ac130003"),
+                "UserCreated",
+                "User",
+                "9948fcad",
+                "{\"email\": \"gh@mefi.in\"}",
+                ""));
+
+        final Map<String, String> config = new HashMap<>();
+        config.put(
+                "table.fields.additional.placement",
+                "type:envelope:eventType");
+        outboxEventRouter.configure(config);
+
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+        assertThat(actualRecords.topics().size()).isEqualTo(1);
+
+        SourceRecord newEventRecord = actualRecords.recordsForTopic(topicName("outboxsmtit.outbox")).get(0);
+        SourceRecord routedEvent = outboxEventRouter.apply(newEventRecord);
+
+        assertThat(routedEvent).isNotNull();
+        assertThat(routedEvent.topic()).isEqualTo("outbox.event.User");
+
+        Struct valueStruct = requireStruct(routedEvent.value(), "test payload");
+        assertThat(valueStruct.getString("eventType")).isEqualTo("UserCreated");
+        JsonNode payload = (new ObjectMapper()).readTree(valueStruct.getString("payload"));
+        assertThat(payload.get("email").asText()).isEqualTo("gh@mefi.in");
     }
 
     @Test
@@ -189,10 +226,9 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
 
         SourceRecord newEventRecord = actualRecords.recordsForTopic(topicName("outboxsmtit.outbox")).get(0);
         SourceRecord routedEvent = outboxEventRouter.apply(newEventRecord);
-        Struct valueStruct = requireStruct(routedEvent.value(), "test payload");
-        assertThat(valueStruct.getString("eventType")).isEqualTo("UserCreated");
-        JsonNode payload = (new ObjectMapper()).readTree(valueStruct.getString("payload"));
-        assertThat(payload.get("email").getTextValue()).isEqualTo("gh@mefi.in");
+        assertThat(routedEvent.value()).isInstanceOf(String.class);
+        JsonNode payload = (new ObjectMapper()).readTree((String) routedEvent.value());
+        assertThat(payload.get("email").asText()).isEqualTo("gh@mefi.in");
     }
 
     @Test
@@ -234,8 +270,8 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
         // Validate metadata
         Schema expectedSchema = SchemaBuilder.struct()
                 .version(1)
+                .name("test_server.outboxsmtit.outbox.UserEmail.Value")
                 .field("payload", Json.builder().optional().build())
-                .field("eventType", Schema.STRING_SCHEMA)
                 .field("eventVersion", Schema.INT32_SCHEMA)
                 .field("aggregateType", Schema.STRING_SCHEMA)
                 .field("someBoolType", Schema.BOOLEAN_SCHEMA)
@@ -263,7 +299,6 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
 
         // Validate message body
         Struct valueStruct = requireStruct(eventRouted.value(), "test envelope");
-        assertThat(valueStruct.getString("eventType")).isEqualTo("UserUpdated");
         assertThat(valueStruct.getString("aggregateType")).isEqualTo("UserEmail");
         assertThat(valueStruct.getInt32("eventVersion")).isEqualTo(1);
         assertThat(valueStruct.getBoolean("someBoolType")).isEqualTo(true);
@@ -360,7 +395,6 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
 
         // Validate message body
         assertThat(eventRouted.value()).isNotNull();
-        assertThat(((Struct) eventRouted.value()).get("eventType")).isEqualTo("UserUpdated");
         assertThat(((Struct) eventRouted.value()).get("payload")).isNull();
     }
 
@@ -500,7 +534,7 @@ public class OutboxEventRouterIT extends AbstractConnectorTest {
         return TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, snapshotMode.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
-                .with(PostgresConnectorConfig.SCHEMA_WHITELIST, "outboxsmtit")
-                .with(PostgresConnectorConfig.TABLE_WHITELIST, "outboxsmtit\\.outbox");
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "outboxsmtit")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "outboxsmtit\\.outbox");
     }
 }

@@ -6,6 +6,7 @@
 package io.debezium.testing.testcontainers;
 
 import java.io.IOException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import org.awaitility.Awaitility;
@@ -29,9 +30,19 @@ public class DebeziumContainer extends GenericContainer<DebeziumContainer> {
     private final OkHttpClient client = new OkHttpClient();
     public static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
-    public DebeziumContainer(final String version) {
-        super("debezium/connect:" + version);
+    public DebeziumContainer(final String containerImageName) {
+        super(containerImageName);
 
+        defaultConfig();
+    }
+
+    public DebeziumContainer(final Future<String> image) {
+        super(image);
+
+        defaultConfig();
+    }
+
+    private void defaultConfig() {
         setWaitStrategy(
                 Wait.forHttp("/connectors")
                         .forPort(KAFKA_CONNECT_PORT)
@@ -45,11 +56,6 @@ public class DebeziumContainer extends GenericContainer<DebeziumContainer> {
         withEnv("CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE", "false");
 
         withExposedPorts(8083);
-    }
-
-    public DebeziumContainer(final String version, final KafkaContainer kafkaContainer) {
-        this(version);
-        withKafka(kafkaContainer);
     }
 
     public DebeziumContainer withKafka(final KafkaContainer kafkaContainer) {

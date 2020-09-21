@@ -10,7 +10,6 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Optional;
 
-import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
 
 import io.debezium.annotation.NotThreadSafe;
@@ -19,6 +18,7 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresSchema;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.spi.SlotCreationResult;
+import io.debezium.relational.RelationalTableFilters;
 
 /**
  * A Postgres logical streaming replication connection. Replication connections are established for a slot and a given plugin
@@ -41,7 +41,7 @@ public interface ReplicationConnection extends AutoCloseable {
      * @return a {@link PGReplicationStream} from which data is read; never null
      * @throws SQLException if there is a problem obtaining the replication stream
      */
-    ReplicationStream startStreaming() throws SQLException, InterruptedException;
+    ReplicationStream startStreaming(WalPositionLocator walPosition) throws SQLException, InterruptedException;
 
     /**
      * Opens a stream for reading logical replication changes from a given LSN position.
@@ -56,7 +56,7 @@ public interface ReplicationConnection extends AutoCloseable {
      * @see org.postgresql.replication.LogSequenceNumber
      * @throws SQLException if anything fails
      */
-    ReplicationStream startStreaming(Long offset) throws SQLException, InterruptedException;
+    ReplicationStream startStreaming(Lsn offset, WalPositionLocator walPosition) throws SQLException, InterruptedException;
 
     /**
      * Creates a new replication slot with the given option and returns the result of the command, which
@@ -92,15 +92,7 @@ public interface ReplicationConnection extends AutoCloseable {
         return new PostgresReplicationConnection.ReplicationConnectionBuilder(jdbcConfig);
     }
 
-    /**
-     * Formats a LSN long value as a String value which can be used for outputting user-friendly LSN values.
-     *
-     * @param lsn the LSN value
-     * @return a String format of the value, never {@code null}
-     */
-    static String format(long lsn) {
-        return LogSequenceNumber.valueOf(lsn).asString();
-    }
+    public void reconnect() throws SQLException;
 
     /**
      * A builder for {@link ReplicationConnection}
@@ -132,6 +124,24 @@ public interface ReplicationConnection extends AutoCloseable {
          * @see #DEFAULT_PUBLICATION_NAME
          */
         Builder withPublication(final String publicationName);
+
+        /**
+         * Sets the publication tables to watch for the PG logical publication
+         *
+         * @param tableFilter the configured table filters
+         * @return this instance
+         * @see #config.getTableFilters()
+         */
+        Builder withTableFilter(final RelationalTableFilters tableFilter);
+
+        /**
+         * Sets the publication autocreate mode for the PG logical publication
+         *
+         * @param publicationAutocreateMode the name of the publication, may not be null.
+         * @return this instance
+         * @see #PostgresConnectorConfig.PublicationAutocreateMode.ALL_TABLES
+         */
+        Builder withPublicationAutocreateMode(final PostgresConnectorConfig.AutoCreateMode publicationAutocreateMode);
 
         /**
          * Sets the instance for the PG logical decoding plugin
@@ -186,6 +196,13 @@ public interface ReplicationConnection extends AutoCloseable {
          * @see #DEFAULT_EXPORT_SNAPSHOT
          */
         Builder exportSnapshotOnCreate(final boolean exportSnapshot);
+
+        /**
+         * Whether or not the snapshot is executed
+         * @param doSnapshot true if a snapshot is going to be executed, false if otherwise
+         * @return this instance
+         */
+        Builder doSnapshot(final boolean doSnapshot);
 
         /**
          * Creates a new {@link ReplicationConnection} instance
