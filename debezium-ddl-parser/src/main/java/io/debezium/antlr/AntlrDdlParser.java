@@ -52,12 +52,8 @@ public abstract class AntlrDdlParser<L extends Lexer, P extends Parser> extends 
     protected Tables databaseTables;
     protected DataTypeResolver dataTypeResolver;
 
-    public AntlrDdlParser(boolean throwErrorsFromTreeWalk) {
-        this(throwErrorsFromTreeWalk, false);
-    }
-
-    public AntlrDdlParser(boolean throwErrorsFromTreeWalk, boolean includeViews) {
-        super(";", includeViews);
+    public AntlrDdlParser(boolean throwErrorsFromTreeWalk, boolean includeViews, boolean includeComments) {
+        super(includeViews, includeComments);
         this.throwErrorsFromTreeWalk = throwErrorsFromTreeWalk;
     }
 
@@ -74,7 +70,7 @@ public abstract class AntlrDdlParser<L extends Lexer, P extends Parser> extends 
         // remove default console output printing error listener
         parser.removeErrorListener(ConsoleErrorListener.INSTANCE);
 
-        ParsingErrorListener parsingErrorListener = new ParsingErrorListener(AbstractDdlParser::accumulateParsingFailure);
+        ParsingErrorListener parsingErrorListener = new ParsingErrorListener(ddlContent, AbstractDdlParser::accumulateParsingFailure);
         parser.addErrorListener(parsingErrorListener);
 
         ParseTree parseTree = parseTree(parser);
@@ -143,8 +139,6 @@ public abstract class AntlrDdlParser<L extends Lexer, P extends Parser> extends 
 
     /**
      * Initialize DB to JDBC data types mapping for resolver.
-     *
-     * @param dataTypeResolver data type resolver
      */
     protected abstract DataTypeResolver initializeDataTypeResolver();
 
@@ -193,8 +187,12 @@ public abstract class AntlrDdlParser<L extends Lexer, P extends Parser> extends 
         return skipViews;
     }
 
-    public void signalSetVariable(String variableName, String variableValue, ParserRuleContext ctx) {
-        signalSetVariable(variableName, variableValue, getText(ctx));
+    public boolean skipComments() {
+        return skipComments;
+    }
+
+    public void signalSetVariable(String variableName, String variableValue, int order, ParserRuleContext ctx) {
+        signalSetVariable(variableName, variableValue, order, getText(ctx));
     }
 
     public void signalUseDatabase(ParserRuleContext ctx) {

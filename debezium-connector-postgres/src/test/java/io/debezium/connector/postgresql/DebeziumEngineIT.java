@@ -6,7 +6,7 @@
 
 package io.debezium.connector.postgresql;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
 import org.apache.kafka.connect.storage.FileOffsetBackingStore;
 import org.apache.kafka.connect.util.Callback;
-import org.fest.assertions.Assertions;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -37,12 +36,15 @@ import org.slf4j.LoggerFactory;
 import io.debezium.doc.FixFor;
 import io.debezium.document.Document;
 import io.debezium.document.DocumentReader;
+import io.debezium.embedded.KafkaConnectUtil;
 import io.debezium.engine.ChangeEvent;
 import io.debezium.engine.DebeziumEngine;
 import io.debezium.engine.DebeziumEngine.CompletionCallback;
 import io.debezium.engine.format.Avro;
+import io.debezium.engine.format.Binary;
 import io.debezium.engine.format.CloudEvents;
 import io.debezium.engine.format.Json;
+import io.debezium.engine.format.SimpleString;
 import io.debezium.junit.EqualityCheck;
 import io.debezium.junit.SkipTestRule;
 import io.debezium.junit.SkipWhenKafkaVersion;
@@ -68,6 +70,7 @@ public class DebeziumEngineIT {
     public void before() throws SQLException {
         OFFSET_STORE_PATH.getParent().toFile().mkdirs();
         OFFSET_STORE_PATH.toFile().delete();
+        TestHelper.dropDefaultReplicationSlot();
         TestHelper.dropAllSchemas();
         TestHelper.execute(
                 "CREATE SCHEMA engine;",
@@ -90,18 +93,18 @@ public class DebeziumEngineIT {
         CountDownLatch allLatch = new CountDownLatch(1);
 
         final ExecutorService executor = Executors.newFixedThreadPool(1);
-        try (final DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class).using(props)
+        try (DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class).using(props)
                 .notifying((records, committer) -> {
 
                     for (ChangeEvent<String, String> r : records) {
-                        Assertions.assertThat(r.key()).isNotNull();
-                        Assertions.assertThat(r.value()).isNotNull();
+                        assertThat(r.key()).isNotNull();
+                        assertThat(r.value()).isNotNull();
                         try {
                             final Document key = DocumentReader.defaultReader().read(r.key());
                             final Document value = DocumentReader.defaultReader().read(r.value());
-                            Assertions.assertThat(key.getInteger("id")).isEqualTo(1);
-                            Assertions.assertThat(value.getDocument("after").getInteger("id")).isEqualTo(1);
-                            Assertions.assertThat(value.getDocument("after").getString("val")).isEqualTo("value1");
+                            assertThat(key.getInteger("id")).isEqualTo(1);
+                            assertThat(value.getDocument("after").getInteger("id")).isEqualTo(1);
+                            assertThat(value.getDocument("after").getString("val")).isEqualTo("value1");
                         }
                         catch (IOException e) {
                             throw new IllegalStateException(e);
@@ -138,7 +141,7 @@ public class DebeziumEngineIT {
         CountDownLatch allLatch = new CountDownLatch(1);
 
         final ExecutorService executor = Executors.newFixedThreadPool(1);
-        try (final DebeziumEngine<ChangeEvent<byte[], byte[]>> engine = DebeziumEngine.create(Avro.class).using(props)
+        try (DebeziumEngine<ChangeEvent<byte[], byte[]>> engine = DebeziumEngine.create(Avro.class).using(props)
                 .notifying((records, committer) -> {
                     Assert.fail("Should not be invoked due to serialization error");
                 })
@@ -146,8 +149,8 @@ public class DebeziumEngineIT {
 
                     @Override
                     public void handle(boolean success, String message, Throwable error) {
-                        Assertions.assertThat(success).isFalse();
-                        Assertions.assertThat(message).contains("Failed to serialize Avro data from topic debezium");
+                        assertThat(success).isFalse();
+                        assertThat(message).contains("Failed to serialize Avro data from topic test_server.engine.test");
                         allLatch.countDown();
                     }
                 })
@@ -177,19 +180,19 @@ public class DebeziumEngineIT {
         CountDownLatch allLatch = new CountDownLatch(1);
 
         final ExecutorService executor = Executors.newFixedThreadPool(1);
-        try (final DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class, CloudEvents.class).using(props)
+        try (DebeziumEngine<ChangeEvent<String, String>> engine = DebeziumEngine.create(Json.class, CloudEvents.class).using(props)
                 .notifying((records, committer) -> {
 
                     for (ChangeEvent<String, String> r : records) {
                         try {
                             final Document key = DocumentReader.defaultReader().read(r.key());
-                            Assertions.assertThat(key.getInteger("id")).isEqualTo(1);
-                            Assertions.assertThat(r.value()).isNotNull();
+                            assertThat(key.getInteger("id")).isEqualTo(1);
+                            assertThat(r.value()).isNotNull();
 
                             final Document value = DocumentReader.defaultReader().read(r.value());
-                            Assertions.assertThat(value.getString("id")).contains("txId");
-                            Assertions.assertThat(value.getDocument("data").getDocument("payload").getDocument("after").getInteger("id")).isEqualTo(1);
-                            Assertions.assertThat(value.getDocument("data").getDocument("payload").getDocument("after").getString("val")).isEqualTo("value1");
+                            assertThat(value.getString("id")).contains("txId");
+                            assertThat(value.getDocument("data").getDocument("payload").getDocument("after").getInteger("id")).isEqualTo(1);
+                            assertThat(value.getDocument("data").getDocument("payload").getDocument("after").getString("val")).isEqualTo("value1");
                         }
                         catch (IOException e) {
                             throw new IllegalStateException(e);
@@ -209,9 +212,55 @@ public class DebeziumEngineIT {
         }
     }
 
+    @Test
+    public void shouldSerializeArbitraryPayloadFromOutbox() throws Exception {
+        TestHelper.execute(
+                "CREATE TABLE engine.outbox (id INT PRIMARY KEY, aggregateid TEXT, aggregatetype TEXT, payload BYTEA);",
+                "INSERT INTO engine.outbox VALUES(1, 'key1', 'event', 'value1'::BYTEA);");
+
+        final Properties props = new Properties();
+        props.putAll(TestHelper.defaultConfig().build().asMap());
+        props.setProperty("name", "debezium-engine");
+        props.setProperty("connector.class", "io.debezium.connector.postgresql.PostgresConnector");
+        props.setProperty(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG,
+                OFFSET_STORE_PATH.toAbsolutePath().toString());
+        props.setProperty("offset.flush.interval.ms", "0");
+        props.setProperty("converter.schemas.enable", "false");
+        props.setProperty("table.include.list", "engine.outbox");
+        props.setProperty("key.converter.schemas.enable", "false");
+        props.setProperty("transforms", "outbox");
+        props.setProperty("transforms.outbox.type", "io.debezium.transforms.outbox.EventRouter");
+
+        CountDownLatch allLatch = new CountDownLatch(1);
+
+        final ExecutorService executor = Executors.newFixedThreadPool(1);
+        try (DebeziumEngine<ChangeEvent<String, Object>> engine = DebeziumEngine.create(SimpleString.class, Binary.class).using(props)
+                .notifying((records, committer) -> {
+                    for (ChangeEvent<String, Object> r : records) {
+                        assertThat(r.key()).isEqualTo("key1");
+                        assertThat(r.value()).isEqualTo("value1".getBytes());
+                        allLatch.countDown();
+                        committer.markProcessed(r);
+                    }
+                    committer.markBatchFinished();
+                }).using(this.getClass().getClassLoader()).build()) {
+
+            executor.execute(() -> {
+                LoggingContext.forConnector(getClass().getSimpleName(), "debezium-engine", "engine");
+                engine.run();
+            });
+            allLatch.await(5000, TimeUnit.MILLISECONDS);
+            assertThat(allLatch.getCount()).isEqualTo(0);
+        }
+    }
+
     private static final AtomicInteger offsetStoreSetCalls = new AtomicInteger();
 
     public static class TestOffsetStore extends FileOffsetBackingStore {
+
+        public TestOffsetStore() {
+            super(KafkaConnectUtil.converterForOffsetStore());
+        }
 
         @Override
         public Future<Map<ByteBuffer, ByteBuffer>> get(Collection<ByteBuffer> keys) {
@@ -244,6 +293,7 @@ public class DebeziumEngineIT {
                 OFFSET_STORE_PATH.toAbsolutePath().toString());
         props.setProperty("offset.flush.interval.ms", "3000");
         props.setProperty("converter.schemas.enable", "false");
+        props.setProperty("slot.drop.on.stop", "false");
         props.setProperty("offset.storage",
                 TestOffsetStore.class.getName());
 
@@ -278,7 +328,7 @@ public class DebeziumEngineIT {
         }
         engine.close();
 
-        Assertions.assertThat(offsetStoreSetCalls.get()).isGreaterThanOrEqualTo(1);
+        assertThat(offsetStoreSetCalls.get()).isGreaterThanOrEqualTo(1);
         offsetStoreSetCalls.set(0);
 
         for (int i = 0; i < 100; i++) {
@@ -290,7 +340,7 @@ public class DebeziumEngineIT {
         }
         engine.close();
 
-        Assertions.assertThat(offsetStoreSetCalls.get()).isGreaterThanOrEqualTo(1);
-        Assertions.assertThat(exception.get()).isNull();
+        assertThat(offsetStoreSetCalls.get()).isGreaterThanOrEqualTo(1);
+        assertThat(exception.get()).isNull();
     }
 }

@@ -5,8 +5,13 @@
  */
 package io.debezium.data;
 
+import java.util.List;
+
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+
+import io.debezium.schema.SchemaFactory;
+import io.debezium.util.Strings;
 
 /**
  * A semantic type for an enumeration, where the string values are one of the enumeration's values.
@@ -17,6 +22,7 @@ public class Enum {
 
     public static final String LOGICAL_NAME = "io.debezium.data.Enum";
     public static final String VALUES_FIELD = "allowed";
+    public static final int SCHEMA_VERSION = 1;
 
     /**
      * Returns a {@link SchemaBuilder} for an enumeration. You can use the resulting SchemaBuilder
@@ -26,10 +32,21 @@ public class Enum {
      * @return the schema builder
      */
     public static SchemaBuilder builder(String allowedValues) {
-        return SchemaBuilder.string()
-                .name(LOGICAL_NAME)
-                .parameter(VALUES_FIELD, allowedValues)
-                .version(1);
+        return SchemaFactory.get().datatypeEnumSchema(allowedValues);
+    }
+
+    /**
+     * Returns a {@link SchemaBuilder} for an enumeration. You can use the resulting SchemaBuilder
+     * to set additional schema settings such as required/optional, default value, and documentation.
+     *
+     * @param allowedValues the list of allowed values; may not be null
+     * @return the schema builder
+     */
+    public static SchemaBuilder builder(List<String> allowedValues) {
+        if (allowedValues == null) {
+            return builder("");
+        }
+        return builder(Strings.join(",", allowedValues));
     }
 
     /**
@@ -41,5 +58,19 @@ public class Enum {
      */
     public static Schema schema(String allowedValues) {
         return builder(allowedValues).build();
+    }
+
+    /**
+     * Returns a {@link SchemaBuilder} for an enumeration, with all other default Schema settings.
+     *
+     * @param allowedValues the list of allowed values; may not be null
+     * @return the schema
+     * @see #builder(String)
+     */
+    public static Schema schema(List<String> allowedValues) {
+        if (allowedValues == null) {
+            return builder("").build();
+        }
+        return builder(Strings.join(",", allowedValues)).build();
     }
 }

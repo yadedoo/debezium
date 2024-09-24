@@ -9,7 +9,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintWriter;
 import java.math.BigDecimal;
 import java.math.BigInteger;
-import java.text.DecimalFormat;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,15 +50,63 @@ public final class Strings {
      * @param input the input string
      * @param splitter the function that splits the input into multiple items; may not be null
      * @param factory the factory for creating string items into filter matches; may not be null
+     * @param trim specifies whether each input item is trimmed before being added to the returned collection
      * @return the set of objects included in the list; never null
      */
-    public static <T> Set<T> setOf(String input, Function<String, String[]> splitter, Function<String, T> factory) {
+    private static <T> Set<T> setOf(String input, Function<String, String[]> splitter, Function<String, T> factory, boolean trim) {
         if (input == null) {
             return Collections.emptySet();
         }
         Set<T> matches = new HashSet<>();
         for (String item : splitter.apply(input)) {
-            T obj = factory.apply(item);
+            T obj = factory.apply(trim ? item.trim() : item);
+            if (obj != null) {
+                matches.add(obj);
+            }
+        }
+        return matches;
+    }
+
+    /**
+     * Generate the set of values that are included in the list.
+     *
+     * @param input the input string
+     * @param splitter the function that splits the input into multiple items; may not be null
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @return the set of objects included in the list; never null
+     */
+    public static <T> Set<T> setOf(String input, Function<String, String[]> splitter, Function<String, T> factory) {
+        return setOf(input, splitter, factory, false);
+    }
+
+    /**
+     * Generate the set of values that are included in the list, with each element trimmed.
+     *
+     * @param input the input string
+     * @param splitter the function that splits the input into multiple items; may not be null
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @return the set of objects included in the list; never null
+     */
+    public static <T> Set<T> setOfTrimmed(String input, Function<String, String[]> splitter, Function<String, T> factory) {
+        return setOf(input, splitter, factory, true);
+    }
+
+    /**
+     * Generate the list of values that are included in the list.
+     *
+     * @param input the input string
+     * @param splitter the function that splits the input into multiple items; may not be null
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @param trim specifies whether each input item is trimmed before being added to the returned collection
+     * @return the list of objects included in the list; never null
+     */
+    private static <T> List<T> listOf(String input, Function<String, String[]> splitter, Function<String, T> factory, boolean trim) {
+        if (input == null) {
+            return Collections.emptyList();
+        }
+        List<T> matches = new ArrayList<T>();
+        for (String item : splitter.apply(input)) {
+            T obj = factory.apply(trim ? item.trim() : item);
             if (obj != null) {
                 matches.add(obj);
             }
@@ -76,17 +123,19 @@ public final class Strings {
      * @return the list of objects included in the list; never null
      */
     public static <T> List<T> listOf(String input, Function<String, String[]> splitter, Function<String, T> factory) {
-        if (input == null) {
-            return Collections.emptyList();
-        }
-        List<T> matches = new ArrayList<T>();
-        for (String item : splitter.apply(input)) {
-            T obj = factory.apply(item);
-            if (obj != null) {
-                matches.add(obj);
-            }
-        }
-        return matches;
+        return listOf(input, splitter, factory, false);
+    }
+
+    /**
+     * Generate the list of values that are included in the list, with each element trimmed.
+     *
+     * @param input the input string
+     * @param splitter the function that splits the input into multiple items; may not be null
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @return the list of objects included in the list; never null
+     */
+    public static <T> List<T> listOfTrimmed(String input, Function<String, String[]> splitter, Function<String, T> factory) {
+        return listOf(input, splitter, factory, true);
     }
 
     /**
@@ -102,6 +151,18 @@ public final class Strings {
     }
 
     /**
+     * Generate the set of values that are included in the list delimited by the given delimiter, with each element trimmed.
+     *
+     * @param input the input string
+     * @param delimiter the character used to delimit the items in the input
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @return the set of objects included in the list; never null
+     */
+    public static <T> Set<T> setOfTrimmed(String input, char delimiter, Function<String, T> factory) {
+        return setOfTrimmed(input, (str) -> str.split("[" + delimiter + "]"), factory);
+    }
+
+    /**
      * Generate the set of values that are included in the list separated by commas.
      *
      * @param input the input string
@@ -110,6 +171,17 @@ public final class Strings {
      */
     public static <T> Set<T> setOf(String input, Function<String, T> factory) {
         return setOf(input, ',', factory);
+    }
+
+    /**
+     * Generate the set of values that are included in the list separated by commas, with each element trimmed.
+     *
+     * @param input the input string
+     * @param factory the factory for creating string items into filter matches; may not be null
+     * @return the set of objects included in the list; never null
+     */
+    public static <T> Set<T> setOfTrimmed(String input, Function<String, T> factory) {
+        return setOfTrimmed(input, ',', factory);
     }
 
     /**
@@ -155,7 +227,7 @@ public final class Strings {
      * Represents a predicate (boolean-valued function) of one character argument.
      */
     @FunctionalInterface
-    public static interface CharacterPredicate {
+    public interface CharacterPredicate {
         /**
          * Evaluates this predicate on the given character argument.
          *
@@ -395,7 +467,7 @@ public final class Strings {
         return justifyLeft(original, length, padChar, false);
     }
 
-    public static enum Justify {
+    public enum Justify {
         LEFT,
         RIGHT,
         CENTER;
@@ -748,9 +820,9 @@ public final class Strings {
      * <dt>HHH</dt>
      * <dd>is the number of hours written in at least 2 digits (e.g., "03")</dd>
      * <dt>MM</dt>
-     * <dd>is the number of hours written in at least 2 digits (e.g., "05")</dd>
+     * <dd>is the number of minutes written in 2 digits (e.g., "05")</dd>
      * <dt>SS</dt>
-     * <dd>is the number of hours written in at least 2 digits (e.g., "09")</dd>
+     * <dd>is the number of seconds written in 2 digits (e.g., "09")</dd>
      * <dt>mmm</dt>
      * <dd>is the fractional part of seconds, written with 1-3 digits (any trailing zeros are dropped)</dd>
      * </dl>
@@ -759,22 +831,58 @@ public final class Strings {
      * @return the readable duration.
      */
     public static String duration(long durationInMillis) {
-        // Calculate how many seconds, and don't lose any information ...
-        BigDecimal bigSeconds = BigDecimal.valueOf(Math.abs(durationInMillis)).divide(new BigDecimal(1000));
-        // Calculate the minutes, and round to lose the seconds
-        int minutes = bigSeconds.intValue() / 60;
-        // Remove the minutes from the seconds, to just have the remainder of seconds
-        double dMinutes = minutes;
-        double seconds = bigSeconds.doubleValue() - dMinutes * 60;
-        // Now compute the number of full hours, and change 'minutes' to hold the remaining minutes
-        int hours = minutes / 60;
-        minutes = minutes - (hours * 60);
+        long seconds = durationInMillis / 1000;
+        long s = seconds % 60;
+        long m = (seconds / 60) % 60;
+        long h = (seconds / (60 * 60));
+        long q = durationInMillis % 1000;
 
-        // Format the string, and have at least 2 digits for the hours, minutes and whole seconds,
-        // and between 3 and 6 digits for the fractional part of the seconds...
-        String result = new DecimalFormat("######00").format(hours) + ':' + new DecimalFormat("00").format(minutes) + ':'
-                + new DecimalFormat("00.0##").format(seconds);
-        return result;
+        StringBuilder result = new StringBuilder(15);
+
+        if (h < 10) {
+            result.append("0");
+        }
+
+        result.append(h).append(":");
+
+        if (m < 10) {
+            result.append("0");
+        }
+
+        result.append(m).append(":");
+
+        if (s < 10) {
+            result.append("0");
+        }
+
+        result.append(s).append(".");
+
+        if (q == 0) {
+            result.append("0");
+            return result.toString();
+        }
+        else if (q < 10) {
+            result.append("00");
+        }
+        else if (q < 100) {
+            result.append("0");
+        }
+
+        result.append(q);
+
+        int length = result.length();
+
+        if (result.charAt(length - 1) == '0') {
+            if (result.charAt(length - 2) == '0') {
+                return result.substring(0, length - 2);
+            }
+            else {
+                return result.substring(0, length - 1);
+            }
+        }
+        else {
+            return result.toString();
+        }
     }
 
     /**
@@ -952,6 +1060,39 @@ public final class Strings {
     }
 
     /**
+     * Check if the string is blank (i.e. it's blank or only contains whitespace characters) or null.
+     *
+     * @param str the string to check
+     * @return {@code true} if the string is blank or null
+     */
+    public static boolean isNullOrBlank(String str) {
+        return str == null || str.trim().isEmpty();
+    }
+
+    /**
+     * Checks if the value is empty or null, returning the default value if true, otherwise the specified value.
+     *
+     * @param value the string to check
+     * @param defaultValue the default value to return
+     * @return value if not empty or null; default value otherwise
+     */
+    public static String defaultIfEmpty(String value, String defaultValue) {
+        return isNullOrEmpty(value) ? defaultValue : value;
+    }
+
+    /**
+     * Checks if the value is blank (i.e. it's blank or only contains whitespace characters) or null, returning
+     * the default value if true, otherwise returning the specified value.
+     *
+     * @param value the string to check
+     * @param defaultValue the default value to return
+     * @return value if not blank or null; default value otherwise
+     */
+    public static String defaultIfBlank(String value, String defaultValue) {
+        return isNullOrBlank(value) ? defaultValue : value;
+    }
+
+    /**
      * Check if the string contains only digits.
      *
      * @param str the string to check
@@ -1051,6 +1192,20 @@ public final class Strings {
         return null;
     }
 
+    /**
+     * Masks sensitive data in given string
+     *
+     * @param original original string containing possibly sensitive data
+     * @param mask replacement string
+     * @param sensitives sensitive data to be masked
+     * @return original string with sensitive data masked
+     */
+    public static String mask(String original, String mask, String... sensitives) {
+        return Arrays.stream(sensitives)
+                .filter(Objects::nonNull)
+                .reduce(original, (masked, sensitive) -> masked.replace(sensitive, "***"));
+    }
+
     private Strings() {
     }
 
@@ -1059,7 +1214,7 @@ public final class Strings {
      * If a comma is part of expression then it can be prepended with <code>'\'</code> so
      * it will not act as a separator.
      */
-    private static class RegExSplitter implements Tokenizer {
+    public static class RegExSplitter implements Tokenizer {
 
         public static String[] split(String identifier) {
             TokenStream stream = new TokenStream(identifier, new RegExSplitter(), true);

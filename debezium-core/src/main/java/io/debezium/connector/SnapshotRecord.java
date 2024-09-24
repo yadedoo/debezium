@@ -19,13 +19,29 @@ public enum SnapshotRecord {
      */
     TRUE,
     /**
+     * Record is from snapshot is the first record generated in snapshot phase.
+     */
+    FIRST,
+    /**
+     * Record is from snapshot and the first record generated from the table, but not in the entire snapshot.
+     */
+    FIRST_IN_DATA_COLLECTION,
+    /**
+     * Record is from snapshot and the last record generated from the table, but not in the entire snapshot.
+     */
+    LAST_IN_DATA_COLLECTION,
+    /**
      * Record is from snapshot is the last record generated in snapshot phase.
      */
     LAST,
     /**
      * Record is from streaming phase.
      */
-    FALSE;
+    FALSE,
+    /**
+     * Record is from incremental snapshot window.
+     */
+    INCREMENTAL;
 
     public static SnapshotRecord fromSource(Struct source) {
         if (source.schema().field(AbstractSourceInfo.SNAPSHOT_KEY) != null

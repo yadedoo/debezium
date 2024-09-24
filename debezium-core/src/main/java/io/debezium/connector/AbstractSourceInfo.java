@@ -23,11 +23,14 @@ public abstract class AbstractSourceInfo {
     public static final String DEBEZIUM_CONNECTOR_KEY = "connector";
     public static final String SERVER_NAME_KEY = "name";
     public static final String TIMESTAMP_KEY = "ts_ms";
+    public static final String TIMESTAMP_US_KEY = "ts_us";
+    public static final String TIMESTAMP_NS_KEY = "ts_ns";
     public static final String SNAPSHOT_KEY = "snapshot";
     public static final String DATABASE_NAME_KEY = "db";
     public static final String SCHEMA_NAME_KEY = "schema";
     public static final String TABLE_NAME_KEY = "table";
     public static final String COLLECTION_NAME_KEY = "collection";
+    public static final String SEQUENCE_KEY = "sequence";
 
     private final CommonConnectorConfig config;
 
@@ -75,4 +78,18 @@ public abstract class AbstractSourceInfo {
     public Struct struct() {
         return structMaker().struct(this);
     }
+
+    /**
+     * Returns extra sequencing metadata about a change event formatted
+     * as a stringified JSON array. The metadata contained in a sequence must be
+     * ordered sequentially in order to be understood and compared.
+     *
+     * Note: if a source's sequence metadata contains any string values, those
+     * strings must be correctly escaped before being included in the stringified
+     * JSON array.
+     */
+    protected String sequence() {
+        return null;
+    };
+
 }

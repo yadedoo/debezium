@@ -30,46 +30,52 @@ public interface JdbcConfiguration extends Configuration {
     /**
      * A field for the name of the database. This field has no default value.
      */
-    public static final Field DATABASE = Field.create("dbname",
+    Field DATABASE = Field.create("dbname",
             "Name of the database");
     /**
      * A field for the user of the database. This field has no default value.
      */
-    public static final Field USER = Field.create("user",
+    Field USER = Field.create("user",
             "Name of the database user to be used when connecting to the database");
     /**
      * A field for the password of the database. This field has no default value.
      */
-    public static final Field PASSWORD = Field.create("password",
+    Field PASSWORD = Field.create("password",
             "Password to be used when connecting to the database");
     /**
      * A field for the hostname of the database server. This field has no default value.
      */
-    public static final Field HOSTNAME = Field.create("hostname", "IP address of the database");
+    Field HOSTNAME = Field.create("hostname", "IP address of the database");
 
     /**
      * A field for the port of the database server. There is no default value.
      */
-    public static final Field PORT = Field.create("port", "Port of the database");
+    Field PORT = Field.create("port", "Port of the database");
 
     /**
      * A semicolon separated list of SQL statements to be executed when the connection to database is established.
      * Typical use-case is setting of session parameters. There is no default value.
      */
-    public static final Field ON_CONNECT_STATEMENTS = Field.create("initial.statements", "A semicolon separated list of statements to be executed on connection");
+    Field ON_CONNECT_STATEMENTS = Field.create("initial.statements", "A semicolon separated list of statements to be executed on connection");
 
     /**
      * An optional field for datasource factory class that will be used to build the datasource connection pool.
      */
-    public static final Field CONNECTION_FACTORY_CLASS = Field.create("connection.factory.class")
+    Field CONNECTION_FACTORY_CLASS = Field.create("connection.factory.class")
             .withDisplayName("Connection factory class")
             .withDescription(
                     "(Incubating) The factory class for creation of datasource connection pool; the FQN of an implementation of io.debezium.jdbc.JdbcConnection.ConnectionFactory must be given.")
             .withType(Type.CLASS)
             .withValidation(Field::isOptional);
 
-    public static final Field CONNECTION_TIMEOUT_MS = Field.create("connection.timeout.ms")
-            .withDisplayName("The maximum time (ms) to wait for a connection from the pool")
+    Field CONNECTION_TIMEOUT_MS = Field.create("connection.timeout.ms")
+            .withDisplayName("Time to wait for a connection from the pool, given in milliseconds. Defaults to 600 seconds (600,000 ms).")
+            .withType(Type.INT)
+            .withDefault(600000)
+            .withValidation(Field::isOptional);
+
+    Field QUERY_TIMEOUT_MS = Field.create("query.timeout.ms")
+            .withDisplayName("Time to wait for a query to execute, given in milliseconds. Defaults to 600 seconds (600,000 ms); zero means there is no limit.")
             .withType(Type.INT)
             .withDefault(600000)
             .withValidation(Field::isOptional);
@@ -78,8 +84,8 @@ public interface JdbcConfiguration extends Configuration {
      * The set of names of the pre-defined JDBC configuration fields, including {@link #DATABASE}, {@link #USER},
      * {@link #PASSWORD}, {@link #HOSTNAME}, and {@link #PORT}.
      */
-    public static Set<String> ALL_KNOWN_FIELDS = Collect.unmodifiableSet(Field::name, DATABASE, USER, PASSWORD, HOSTNAME, PORT, ON_CONNECT_STATEMENTS,
-            CONNECTION_FACTORY_CLASS, CONNECTION_TIMEOUT_MS);
+    Set<String> ALL_KNOWN_FIELDS = Collect.unmodifiableSet(Field::name, DATABASE, USER, PASSWORD, HOSTNAME, PORT, ON_CONNECT_STATEMENTS,
+            CONNECTION_FACTORY_CLASS, CONNECTION_TIMEOUT_MS, QUERY_TIMEOUT_MS);
 
     /**
      * Obtain a {@link JdbcConfiguration} adapter for the given {@link Configuration}.
@@ -87,7 +93,7 @@ public interface JdbcConfiguration extends Configuration {
      * @param config the configuration; may not be null
      * @return the ClientConfiguration; never null
      */
-    public static JdbcConfiguration adapt(Configuration config) {
+    static JdbcConfiguration adapt(Configuration config) {
         if (config instanceof JdbcConfiguration) {
             return (JdbcConfiguration) config;
         }
@@ -109,13 +115,17 @@ public interface JdbcConfiguration extends Configuration {
         };
     }
 
+    static JdbcConfiguration empty() {
+        return JdbcConfiguration.adapt(Configuration.empty());
+    }
+
     /**
      * The JDBC-specific builder used to construct and/or alter JDBC configuration instances.
      *
      * @see JdbcConfiguration#copy(Configuration)
      * @see JdbcConfiguration#create()
      */
-    public static interface Builder extends Configuration.ConfigBuilder<JdbcConfiguration, Builder> {
+    interface Builder extends Configuration.ConfigBuilder<JdbcConfiguration, Builder> {
         /**
          * Use the given user in the resulting configuration.
          *
@@ -185,6 +195,16 @@ public interface JdbcConfiguration extends Configuration {
         default Builder withConnectionTimeoutMs(int connectionTimeoutMs) {
             return with(CONNECTION_TIMEOUT_MS, connectionTimeoutMs);
         }
+
+        /**
+         * Use the given query timeout in the resulting configuration.
+         *
+         * @param queryTimeoutMs query timeout in ms
+         * @return this builder object so methods can be chained together; never null
+         */
+        default Builder withQueryTimeoutMs(int queryTimeoutMs) {
+            return with(QUERY_TIMEOUT_MS, queryTimeoutMs);
+        }
     }
 
     /**
@@ -193,7 +213,7 @@ public interface JdbcConfiguration extends Configuration {
      * @param config the configuration to copy
      * @return the configuration builder
      */
-    public static Builder copy(Configuration config) {
+    static Builder copy(Configuration config) {
         return new Builder() {
             private Configuration.Builder builder = Configuration.copy(config);
 
@@ -206,6 +226,12 @@ public interface JdbcConfiguration extends Configuration {
             @Override
             public Builder withDefault(String key, String value) {
                 builder.withDefault(key, value);
+                return this;
+            }
+
+            @Override
+            public Builder without(String key) {
+                builder.without(key);
                 return this;
             }
 
@@ -244,7 +270,7 @@ public interface JdbcConfiguration extends Configuration {
      *
      * @return the configuration builder
      */
-    public static Builder create() {
+    static Builder create() {
         return new Builder() {
             private Configuration.Builder builder = Configuration.create();
 
@@ -257,6 +283,12 @@ public interface JdbcConfiguration extends Configuration {
             @Override
             public Builder withDefault(String key, String value) {
                 builder.withDefault(key, value);
+                return this;
+            }
+
+            @Override
+            public Builder without(String key) {
+                builder.without(key);
                 return this;
             }
 
@@ -378,5 +410,14 @@ public interface JdbcConfiguration extends Configuration {
      */
     default Duration getConnectionTimeout() {
         return Duration.ofMillis(getInteger(CONNECTION_TIMEOUT_MS));
+    }
+
+    /**
+     * Get the query timeout from the configuration.
+     *
+     * @return the specified value, or null if there is none.
+     */
+    default Duration getQueryTimeout() {
+        return Duration.ofMillis(getInteger(QUERY_TIMEOUT_MS));
     }
 }

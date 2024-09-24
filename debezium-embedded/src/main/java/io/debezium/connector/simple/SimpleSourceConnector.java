@@ -6,12 +6,14 @@
 package io.debezium.connector.simple;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.Task;
@@ -101,16 +103,16 @@ public class SimpleSourceConnector extends SourceConnector {
 
     @Override
     public ConfigDef config() {
-        return null;
+        return new ConfigDef();
     }
 
     public static class SimpleConnectorTask extends SourceTask {
 
+        private boolean firstStart = true;
         private int recordsPerBatch;
-        private int errorOnRecord;
-        private Queue<SourceRecord> records;
+        private Set<Integer> errorOnRecords;
+        private List<SourceRecord> records;
         private final AtomicBoolean running = new AtomicBoolean();
-        private List<SourceRecord> retryRecords = null;
 
         @Override
         public String version() {
@@ -125,7 +127,15 @@ public class SimpleSourceConnector extends SourceConnector {
                 int batchCount = config.getInteger(BATCH_COUNT, DEFAULT_BATCH_COUNT);
                 String topic = config.getString(TOPIC_NAME, DEFAULT_TOPIC_NAME);
                 boolean includeTimestamp = config.getBoolean(INCLUDE_TIMESTAMP, DEFAULT_INCLUDE_TIMESTAMP);
-                errorOnRecord = config.getInteger(RETRIABLE_ERROR_ON, -1);
+                String errorOnRecordString = config.getString(RETRIABLE_ERROR_ON, "-1");
+                // Embedded engine stops and starts connector upon the failure, initialize the set only for the first
+                // time, otherwise we would run into infinite loop of throwing an error and restarting the connector.
+                if (firstStart) {
+                    errorOnRecords = Arrays.stream(errorOnRecordString.split(","))
+                            .map(s -> Integer.valueOf(s.strip()))
+                            .collect(Collectors.toSet());
+                    firstStart = false;
+                }
 
                 // Create the partition and schemas ...
                 Map<String, ?> partition = Collect.hashMapOf("source", "simple");
@@ -183,24 +193,20 @@ public class SimpleSourceConnector extends SourceConnector {
                 new CountDownLatch(1).await();
             }
             if (running.get()) {
-                if (retryRecords != null) {
-                    final List<SourceRecord> r = retryRecords;
-                    retryRecords = null;
-                    return r;
-                }
                 // Still running, so process whatever is in the queue ...
                 List<SourceRecord> results = new ArrayList<>();
                 int record = 0;
-                while (record < recordsPerBatch && !records.isEmpty()) {
-                    record++;
-                    final SourceRecord fetchedRecord = records.poll();
+                while (record < recordsPerBatch && record < records.size()) {
+                    final SourceRecord fetchedRecord = records.get(record);
                     final Integer id = ((Struct) (fetchedRecord.key())).getInt32("id");
-                    results.add(fetchedRecord);
-                    if (id == errorOnRecord) {
-                        retryRecords = results;
-                        throw new RetriableException("Error on record " + errorOnRecord);
+                    if (errorOnRecords.contains(id)) {
+                        errorOnRecords.remove(id);
+                        throw new RetriableException("Error on record " + id);
                     }
+                    results.add(fetchedRecord);
+                    record++;
                 }
+                records.removeAll(results);
                 return results;
             }
             // No longer running ...

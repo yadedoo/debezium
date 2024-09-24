@@ -5,38 +5,51 @@
  */
 package io.debezium.connector.mongodb.transforms;
 
-import static org.fest.assertions.Assertions.assertThat;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.Collections;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiConsumer;
+import java.util.Iterator;
+import java.util.List;
 
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.bson.Document;
+import org.bson.types.ObjectId;
 import org.junit.After;
 import org.junit.Before;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
-import io.debezium.connector.mongodb.ConnectionContext.MongoPrimary;
+import io.debezium.connector.mongodb.AbstractMongoConnectorIT;
 import io.debezium.connector.mongodb.MongoDbConnector;
 import io.debezium.connector.mongodb.MongoDbConnectorConfig;
 import io.debezium.connector.mongodb.MongoDbTaskContext;
-import io.debezium.connector.mongodb.ReplicaSet;
 import io.debezium.connector.mongodb.TestHelper;
 import io.debezium.data.Envelope;
-import io.debezium.embedded.AbstractConnectorTest;
 
 /**
  * Baseline for all integrations tests regarding MongoDB Update Operations
  *
  * @author Renato Mefi
  */
-public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConnectorTest {
+public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractMongoConnectorIT {
 
     protected static final String DB_NAME = "transform_operations";
     protected static final String SERVER_NAME = "mongo";
-    private MongoDbTaskContext context;
+
+    // for ExtractNewDocumentStateTestIT
+    protected static final String CONFIG_DROP_TOMBSTONES = "drop.tombstones";
+    protected static final String HANDLE_DELETES = "delete.handling.mode";
+    protected static final String HANDLE_TOMBSTONE_DELETES = "delete.tombstone.handling.mode";
+    protected static final String FLATTEN_STRUCT = "flatten.struct";
+    protected static final String DELIMITER = "flatten.struct.delimiter";
+    protected static final String DROP_TOMBSTONE = "drop.tombstones";
+    protected static final String ADD_HEADERS = "add.headers";
+    protected static final String ADD_FIELDS = "add.fields";
+    protected static final String ADD_FIELDS_PREFIX = ADD_FIELDS + ".prefix";
+    protected static final String ADD_HEADERS_PREFIX = ADD_HEADERS + ".prefix";
+    protected static final String ARRAY_ENCODING = "array.encoding";
 
     protected ExtractNewDocumentState<SourceRecord> transformation;
 
@@ -49,20 +62,13 @@ public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConn
     @Before
     public void beforeEach() {
         // Use the DB configuration to define the connector's configuration ...
-        Configuration config = TestHelper.getConfiguration().edit()
-                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
-                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, DB_NAME + "." + this.getCollectionName())
-                .with(MongoDbConnectorConfig.LOGICAL_NAME, SERVER_NAME)
-                .build();
+        Configuration config = getBaseConfigBuilder().build();
 
         beforeEach(config);
     }
 
     public void beforeEach(Configuration config) {
-        Debug.disable();
-        Print.disable();
-        stopConnector();
-        initializeConnectorTestFramework();
+        super.beforeEach();
 
         transformation = new ExtractNewDocumentState<>();
         transformation.configure(Collections.emptyMap());
@@ -71,7 +77,7 @@ public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConn
         context = new MongoDbTaskContext(config);
 
         // Cleanup database
-        TestHelper.cleanDatabase(primary(), DB_NAME);
+        TestHelper.cleanDatabase(mongo, DB_NAME);
 
         // Start the connector ...
         start(MongoDbConnector.class, config);
@@ -79,14 +85,7 @@ public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConn
 
     @After
     public void afterEach() {
-        try {
-            stopConnector();
-        }
-        finally {
-            if (context != null) {
-                context.getConnectionContext().shutdown();
-            }
-        }
+        super.afterEach();
         transformation.close();
     }
 
@@ -95,12 +94,23 @@ public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConn
         afterEach();
 
         // reconfigure and restart
-        Configuration config = TestHelper.getConfiguration().edit()
-                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
-                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, DB_NAME + "." + this.getCollectionName())
-                .with(MongoDbConnectorConfig.LOGICAL_NAME, SERVER_NAME)
+        Configuration config = getBaseConfigBuilder()
                 .with(MongoDbConnectorConfig.TOMBSTONES_ON_DELETE, false)
                 .build();
+
+        beforeEach(config);
+    }
+
+    protected Configuration.Builder getBaseConfigBuilder() {
+        return TestHelper.getConfiguration(mongo).edit()
+                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, DB_NAME + "." + this.getCollectionName())
+                .with(CommonConnectorConfig.TOPIC_PREFIX, SERVER_NAME);
+    }
+
+    protected void restartConnectorWithConfig(Configuration config) {
+        // stop connector
+        afterEach();
 
         beforeEach(config);
     }
@@ -129,19 +139,81 @@ public abstract class AbstractExtractNewDocumentStateTestIT extends AbstractConn
         return getRecordByOperation(Envelope.Operation.UPDATE);
     }
 
-    protected MongoPrimary primary() {
-        ReplicaSet replicaSet = ReplicaSet.parse(context.getConnectionContext().hosts());
-        return context.getConnectionContext().primaryFor(
-                replicaSet, context.filters(), connectionErrorHandler(3));
+    // for ExtractNewDocumentStateTestIT
+    protected SourceRecords createCreateRecordFromJson(String pathOnClasspath) throws Exception {
+        final List<Document> documents = loadTestDocuments(pathOnClasspath);
+        try (var client = connect()) {
+            for (Document document : documents) {
+                client.getDatabase(DB_NAME).getCollection(getCollectionName()).insertOne(document);
+            }
+        }
+
+        final SourceRecords records = consumeRecordsByTopic(documents.size());
+        assertThat(records.recordsForTopic(topicName()).size()).isEqualTo(documents.size());
+        assertNoRecordsToConsume();
+
+        return records;
     }
 
-    private BiConsumer<String, Throwable> connectionErrorHandler(int numErrorsBeforeFailing) {
-        AtomicInteger attempts = new AtomicInteger();
-        return (desc, error) -> {
-            if (attempts.incrementAndGet() > numErrorsBeforeFailing) {
-                fail("Unable to connect to primary after " + numErrorsBeforeFailing + " errors trying to " + desc + ": " + error);
-            }
-            logger.error("Error while attempting to {}: {}", desc, error.getMessage(), error);
-        };
+    protected SourceRecord createCreateRecord() throws Exception {
+        ObjectId objId = new ObjectId();
+        Document obj = new Document()
+                .append("_id", objId)
+                .append("name", "Sally")
+                .append("address", new Document()
+                        .append("struct", "Morris Park Ave")
+                        .append("zipcode", "10462"));
+
+        try (var client = connect()) {
+            client.getDatabase(DB_NAME).getCollection(getCollectionName()).insertOne(obj);
+        }
+
+        final SourceRecords records = consumeRecordsByTopic(1);
+        assertThat(records.recordsForTopic(topicName()).size()).isEqualTo(1);
+        assertNoRecordsToConsume();
+
+        return records.allRecordsInOrder().get(0);
+    }
+
+    protected SourceRecords createDeleteRecordWithTombstone() throws Exception {
+        ObjectId objId = new ObjectId();
+        Document obj = new Document()
+                .append("_id", objId)
+                .append("name", "Sally")
+                .append("address", new Document()
+                        .append("struct", "Morris Park Ave")
+                        .append("zipcode", "10462"));
+
+        try (var client = connect()) {
+            client.getDatabase(DB_NAME).getCollection(getCollectionName()).insertOne(obj);
+        }
+
+        final SourceRecords createRecords = consumeRecordsByTopic(1);
+        assertThat(createRecords.recordsForTopic(topicName()).size()).isEqualTo(1);
+        assertNoRecordsToConsume();
+
+        try (var client = connect()) {
+            Document filter = Document.parse("{\"_id\": {\"$oid\": \"" + objId + "\"}}");
+            client.getDatabase(DB_NAME).getCollection(getCollectionName()).deleteOne(filter);
+        }
+
+        final SourceRecords deleteRecords = consumeRecordsByTopic(2);
+        assertThat(deleteRecords.recordsForTopic(topicName()).size()).isEqualTo(2);
+        assertNoRecordsToConsume();
+
+        return deleteRecords;
+    }
+
+    protected static void waitForStreamingRunning() throws InterruptedException {
+        waitForStreamingRunning("mongodb", SERVER_NAME);
+    }
+
+    protected String getSourceRecordHeaderByKey(SourceRecord record, String headerKey) {
+        Iterator<Header> headers = record.headers().allWithName(headerKey);
+        if (!headers.hasNext()) {
+            return null;
+        }
+        Object value = headers.next().value();
+        return value != null ? value.toString() : null;
     }
 }

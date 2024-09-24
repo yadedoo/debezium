@@ -16,6 +16,7 @@ import org.apache.kafka.common.cache.Cache;
 import org.apache.kafka.common.cache.LRUCache;
 import org.apache.kafka.common.cache.SynchronizedCache;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.connect.components.Versioned;
 import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -25,10 +26,12 @@ import org.apache.kafka.connect.transforms.Transformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.Module;
+import io.debezium.config.CommonConnectorConfig.SchemaNameAdjustmentMode;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.data.Envelope;
-import io.debezium.util.SchemaNameAdjuster;
+import io.debezium.schema.SchemaNameAdjuster;
 import io.debezium.util.Strings;
 
 /**
@@ -52,21 +55,23 @@ import io.debezium.util.Strings;
  * @author David Leibovic
  * @author Mario Mueller
  */
-public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transformation<R> {
+public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transformation<R>, Versioned {
 
     private static final Field TOPIC_REGEX = Field.create("topic.regex")
             .withDisplayName("Topic regex")
             .withType(ConfigDef.Type.STRING)
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
-            .withValidation(Field::isRequired, Field::isRegex)
+            .required()
+            .withValidation(Field::isRegex)
             .withDescription("The regex used for extracting the name of the logical table from the original topic name.");
+
     private static final Field TOPIC_REPLACEMENT = Field.create("topic.replacement")
             .withDisplayName("Topic replacement")
             .withType(ConfigDef.Type.STRING)
             .withWidth(ConfigDef.Width.LONG)
             .withImportance(ConfigDef.Importance.LOW)
-            .withValidation(Field::isRequired)
+            .required()
             .withDescription("The replacement string used in conjunction with " + TOPIC_REGEX.name() +
                     ". This will be used to create the new topic name.");
     private static final Field KEY_ENFORCE_UNIQUENESS = Field.create("key.enforce.uniqueness")
@@ -109,20 +114,38 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
             .withValidation(ByLogicalTableRouter::validateKeyFieldReplacement)
             .withDescription("The replacement string used in conjunction with " + KEY_FIELD_REGEX.name() +
                     ". This will be used to create the physical table identifier in the record's key.");
+    private static final Field SCHEMA_NAME_ADJUSTMENT_MODE = Field.create("schema.name.adjustment.mode")
+            .withDisplayName("Schema Name Adjustment")
+            .withEnum(SchemaNameAdjustmentMode.class, SchemaNameAdjustmentMode.NONE)
+            .withWidth(ConfigDef.Width.MEDIUM)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDescription(
+                    "Specify how the message key schema names derived from the resulting topic name should be adjusted for compatibility with the message converter used by the connector, including:"
+                            + "'avro' replaces the characters that cannot be used in the Avro type name with underscore (default)"
+                            + "'none' does not apply any adjustment");
+    private static final Field LOGICAL_TABLE_CACHE_SIZE = Field.create("logical.table.cache.size")
+            .withDisplayName("Logical table cache size")
+            .withType(ConfigDef.Type.INT)
+            .withWidth(ConfigDef.Width.LONG)
+            .withImportance(ConfigDef.Importance.LOW)
+            .withDefault(16)
+            .withDescription("The size used for holding the max entries in LRUCache. The cache will keep the old/new " +
+                    "schema for logical table key and value, also cache the derived key and topic regex result for improving " +
+                    "the source record transformation.");
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ByLogicalTableRouter.class);
 
-    private final SchemaNameAdjuster schemaNameAdjuster = SchemaNameAdjuster.create(LOGGER);
+    private SchemaNameAdjuster schemaNameAdjuster;
     private Pattern topicRegex;
     private String topicReplacement;
     private Pattern keyFieldRegex;
     private boolean keyEnforceUniqueness;
     private String keyFieldReplacement;
     private String keyFieldName;
-    private final Cache<Schema, Schema> keySchemaUpdateCache = new SynchronizedCache<>(new LRUCache<Schema, Schema>(16));
-    private final Cache<Schema, Schema> envelopeSchemaUpdateCache = new SynchronizedCache<>(new LRUCache<Schema, Schema>(16));
-    private final Cache<String, String> keyRegexReplaceCache = new SynchronizedCache<>(new LRUCache<String, String>(16));
-    private final Cache<String, String> topicRegexReplaceCache = new SynchronizedCache<>(new LRUCache<String, String>(16));
+    private Cache<Schema, Schema> keySchemaUpdateCache;
+    private Cache<Schema, Schema> envelopeSchemaUpdateCache;
+    private Cache<String, String> keyRegexReplaceCache;
+    private Cache<String, String> topicRegexReplaceCache;
     private SmtManager<R> smtManager;
 
     /**
@@ -161,7 +184,9 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
                 TOPIC_REPLACEMENT,
                 KEY_ENFORCE_UNIQUENESS,
                 KEY_FIELD_REGEX,
-                KEY_FIELD_REPLACEMENT);
+                KEY_FIELD_REPLACEMENT,
+                SCHEMA_NAME_ADJUSTMENT_MODE,
+                LOGICAL_TABLE_CACHE_SIZE);
 
         if (!config.validateAndRecord(configFields, LOGGER::error)) {
             throw new ConnectException("Unable to validate config.");
@@ -180,8 +205,16 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
         }
         keyFieldName = config.getString(KEY_FIELD_NAME);
         keyEnforceUniqueness = config.getBoolean(KEY_ENFORCE_UNIQUENESS);
+        int cacheSize = config.getInteger(LOGICAL_TABLE_CACHE_SIZE);
+        keySchemaUpdateCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
+        envelopeSchemaUpdateCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
+        keyRegexReplaceCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
+        topicRegexReplaceCache = new SynchronizedCache<>(new LRUCache<>(cacheSize));
 
         smtManager = new SmtManager<>(config);
+
+        schemaNameAdjuster = SchemaNameAdjustmentMode.parse(config.getString(SCHEMA_NAME_ADJUSTMENT_MODE))
+                .createAdjuster();
     }
 
     @Override
@@ -252,8 +285,14 @@ public class ByLogicalTableRouter<R extends ConnectRecord<R>> implements Transfo
                 TOPIC_REPLACEMENT,
                 KEY_ENFORCE_UNIQUENESS,
                 KEY_FIELD_REGEX,
-                KEY_FIELD_REPLACEMENT);
+                KEY_FIELD_REPLACEMENT,
+                LOGICAL_TABLE_CACHE_SIZE);
         return config;
+    }
+
+    @Override
+    public String version() {
+        return Module.version();
     }
 
     /**

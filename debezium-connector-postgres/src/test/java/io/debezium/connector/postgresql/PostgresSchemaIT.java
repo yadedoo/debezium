@@ -7,16 +7,21 @@
 package io.debezium.connector.postgresql;
 
 import static io.debezium.junit.EqualityCheck.LESS_THAN;
-import static io.debezium.relational.RelationalDatabaseConnectorConfig.SCHEMA_BLACKLIST;
 import static io.debezium.relational.RelationalDatabaseConnectorConfig.SCHEMA_EXCLUDE_LIST;
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.math.BigDecimal;
 import java.sql.SQLException;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.Arrays;
-import java.util.stream.IntStream;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Field;
@@ -27,6 +32,7 @@ import org.junit.Rule;
 import org.junit.Test;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
+import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
 import io.debezium.connector.postgresql.data.Ltree;
 import io.debezium.data.Bits;
 import io.debezium.data.Json;
@@ -40,16 +46,17 @@ import io.debezium.data.geometry.Point;
 import io.debezium.doc.FixFor;
 import io.debezium.junit.SkipTestRule;
 import io.debezium.junit.SkipWhenDatabaseVersion;
+import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
+import io.debezium.schema.SchemaNameAdjuster;
 import io.debezium.time.Date;
 import io.debezium.time.MicroDuration;
 import io.debezium.time.MicroTime;
 import io.debezium.time.MicroTimestamp;
 import io.debezium.time.ZonedTime;
 import io.debezium.time.ZonedTimestamp;
-import io.debezium.util.SchemaNameAdjuster;
 import io.debezium.util.Strings;
 
 /**
@@ -87,11 +94,11 @@ public class PostgresSchemaIT {
         try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(TEST_TABLES);
-            Arrays.stream(TEST_TABLES).forEach(tableId -> assertKeySchema(tableId, "pk", Schema.INT32_SCHEMA));
+            Arrays.stream(TEST_TABLES).forEach(tableId -> assertKeySchema(tableId, "pk", SchemaBuilder.int32().defaultValue(0).build()));
             assertTableSchema("public.numeric_table", "si, i, bi, r, db, ss, bs, b",
                     Schema.OPTIONAL_INT16_SCHEMA, Schema.OPTIONAL_INT32_SCHEMA, Schema.OPTIONAL_INT64_SCHEMA, Schema.OPTIONAL_FLOAT32_SCHEMA,
-                    Schema.OPTIONAL_FLOAT64_SCHEMA, Schema.INT16_SCHEMA,
-                    Schema.INT64_SCHEMA, Schema.OPTIONAL_BOOLEAN_SCHEMA);
+                    Schema.OPTIONAL_FLOAT64_SCHEMA, SchemaBuilder.int16().defaultValue((short) 0).build(),
+                    SchemaBuilder.int64().defaultValue(0L).build(), Schema.OPTIONAL_BOOLEAN_SCHEMA);
             assertTableSchema("public.numeric_decimal_table", "d, dzs, dvs, n, nzs, nvs",
                     Decimal.builder(2).parameter(TestHelper.PRECISION_PARAMETER_KEY, "3").optional().build(),
                     Decimal.builder(0).parameter(TestHelper.PRECISION_PARAMETER_KEY, "4").optional().build(),
@@ -148,7 +155,7 @@ public class PostgresSchemaIT {
         try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
             assertTablesIncluded(tableId);
-            assertKeySchema(tableId, "pk", Schema.INT32_SCHEMA);
+            assertKeySchema(tableId, "pk", SchemaBuilder.int32().defaultValue(0).build());
             assertTableSchema(tableId, "m", Schema.OPTIONAL_STRING_SCHEMA);
         }
     }
@@ -165,7 +172,7 @@ public class PostgresSchemaIT {
             schema.refresh(connection, false);
             assertTablesIncluded(TEST_TABLES);
             assertTableSchema("public.custom_table", "lt", Ltree.builder().optional().build());
-            assertTableSchema("public.custom_table", "i", Schema.BYTES_SCHEMA);
+            assertTableSchema("public.custom_table", "i", Schema.STRING_SCHEMA);
         }
     }
 
@@ -180,7 +187,7 @@ public class PostgresSchemaIT {
             schema.refresh(connection, false);
             final String[] testTables = new String[]{ "public.postgis_table" };
             assertTablesIncluded(testTables);
-            Arrays.stream(testTables).forEach(tableId -> assertKeySchema(tableId, "pk", Schema.INT32_SCHEMA));
+            Arrays.stream(testTables).forEach(tableId -> assertKeySchema(tableId, "pk", SchemaBuilder.int32().defaultValue(0).build()));
 
             assertTableSchema("public.postgis_table", "p, ml",
                     Geometry.builder().optional().build(), Geography.builder().optional().build());
@@ -209,22 +216,7 @@ public class PostgresSchemaIT {
             assertTablesExcluded("s1.a", "s1.b");
         }
 
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_BLACKLIST, "s1").build());
-        schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
-            schema.refresh(connection, false);
-            assertTablesIncluded("s2.a", "s2.b");
-            assertTablesExcluded("s1.a", "s1.b");
-        }
-
         config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_EXCLUDE_LIST, "s.*").build());
-        schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.create()) {
-            schema.refresh(connection, false);
-            assertTablesExcluded("s1.a", "s2.a", "s1.b", "s2.b");
-        }
-
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(SCHEMA_BLACKLIST, "s.*").build());
         schema = TestHelper.getSchema(config, typeRegistry);
         try (PostgresConnection connection = TestHelper.create()) {
             schema.refresh(connection, false);
@@ -239,7 +231,7 @@ public class PostgresSchemaIT {
             assertTablesExcluded("s1.a", "s2.a");
         }
 
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_BLACKLIST, "s1.A,s2.A").build());
+        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.TABLE_EXCLUDE_LIST, "s1.A,s2.A").build());
         schema = TestHelper.getSchema(config, typeRegistry);
         try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
             schema.refresh(connection, false);
@@ -258,17 +250,6 @@ public class PostgresSchemaIT {
             assertTablesExcluded("s1.a", "s2.a", "s2.b");
         }
 
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig()
-                .with(SCHEMA_BLACKLIST, "s2")
-                .with(PostgresConnectorConfig.TABLE_BLACKLIST, "s1.A")
-                .build());
-        schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
-            schema.refresh(connection, false);
-            assertTablesIncluded("s1.b");
-            assertTablesExcluded("s1.a", "s2.a", "s2.b");
-        }
-
         config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_EXCLUDE_LIST, ".*aa")
                 .build());
         schema = TestHelper.getSchema(config, typeRegistry);
@@ -277,23 +258,7 @@ public class PostgresSchemaIT {
             assertColumnsExcluded("s1.a.aa", "s2.a.aa");
         }
 
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_BLACKLIST, ".*aa")
-                .build());
-        schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
-            schema.refresh(connection, false);
-            assertColumnsExcluded("s1.a.aa", "s2.a.aa");
-        }
-
         config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_INCLUDE_LIST, ".*bb")
-                .build());
-        schema = TestHelper.getSchema(config, typeRegistry);
-        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
-            schema.refresh(connection, false);
-            assertColumnsExcluded("s1.a.aa", "s2.a.aa");
-        }
-
-        config = new PostgresConnectorConfig(TestHelper.defaultConfig().with(PostgresConnectorConfig.COLUMN_WHITELIST, ".*bb")
                 .build());
         schema = TestHelper.getSchema(config, typeRegistry);
         try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
@@ -370,25 +335,221 @@ public class PostgresSchemaIT {
         }
     }
 
-    protected void assertKeySchema(String fullyQualifiedTableName, String fields, Schema... types) {
+    @Test
+    public void shouldProperlyGetDefaultColumnValues() throws Exception {
+        String ddl = "DROP TABLE IF EXISTS default_column_test; CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"; CREATE TABLE default_column_test (" +
+                "pk SERIAL, " +
+                "ss SMALLSERIAL, " +
+                "bs BIGSERIAL, " +
+                "bigint BIGINT default 9223372036854775807, " +
+                "bit_as_boolean BIT(1) default B'1', " +
+                "bit BIT(2) default B'11', " +
+                "varbit VARBIT(5) default B'110', " +
+                "boolean BOOLEAN not null default TRUE, " +
+                // box
+                // bytea
+                "char CHAR(10) default 'abcd', " +
+                "varchar VARCHAR(100) default 'abcde', " +
+                // cidr
+                "date DATE default '2021-03-19'::date, " +
+                "date_func DATE default NOW()::date, " +
+                "double float8 default 123456789.1234567890123, " +
+                // inet
+                "integer INT default 2147483647, " +
+                "integer_func1 INT default ABS(-1), " +
+                "integer_func2 INT default DIV(2, 1), " +
+                "integer_opt INT, " +
+                "interval INTERVAL default INTERVAL '1 hour', " +
+                "interval_func1 INTERVAL default make_interval(hours := 1), " +
+                "json JSON default '{}', " +
+                "json_opt JSON, " +
+                "jsonb JSONB default '{}', " +
+                // line
+                // lseg
+                // macaddr
+                // macaddr8
+                // money
+                "numeric NUMERIC(10, 5) default 12345.67891, " +
+                "numeric_var NUMERIC default 0, " +
+                // path
+                // pg_lsn
+                // point
+                // polygon
+                "real FLOAT4 default 1234567890.5, " +
+                "smallint INT2 default 32767, " +
+                "text TEXT default 'asdf', " +
+                "text_parens TEXT default 'text(parens)'," +
+                "text_func3 TEXT default concat('foo', 'bar', 'baz'), " +
+                "time_hm TIME default '12:34'::time, " +
+                "time_hms TIME default '12:34:56'::time, " +
+                "time_func TIME default NOW()::time, " +
+                // time with time zone
+                "timestamp TIMESTAMP default '2021-03-20 13:44:28'::timestamp, " +
+                "timestamp_func TIMESTAMP default NOW()::timestamp, " +
+                "timestamp_opt TIMESTAMP, " +
+                "timestamptz TIMESTAMPTZ default '2021-03-20 14:44:28 +1'::timestamptz, " +
+                "timestamptz_func TIMESTAMPTZ default NOW()::timestamptz, " +
+                "timestamptz_opt TIMESTAMPTZ, " +
+                // tsquery
+                // tsvector
+                // txid_snapshot
+                "uuid UUID default '76019d1a-ad2e-4b22-96e9-1a6d6543c818'::uuid, " +
+                "uuid_func UUID default uuid_generate_v4(), " +
+                "uuid_opt UUID, " +
+                "xml XML default '<foo>bar</foo>'" +
+                ");";
+
+        PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
+        schema = TestHelper.getSchema(config);
+
+        final PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder = (typeRegistry) -> PostgresValueConverter.of(
+                config,
+                TestHelper.getDatabaseCharset(),
+                typeRegistry);
+
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+
+            PostgresDefaultValueConverter defaultValueConverter = connection.getDefaultValueConverter();
+
+            connection.execute(ddl);
+            schema.refresh(connection, false);
+
+            List<Column> columns = tableFor("public.default_column_test").columns();
+            assertColumnDefault("pk", 0, columns, defaultValueConverter);
+            assertColumnDefault("ss", (short) 0, columns, defaultValueConverter);
+            assertColumnDefault("bs", 0L, columns, defaultValueConverter);
+            assertColumnDefault("bigint", 9223372036854775807L, columns, defaultValueConverter);
+            assertColumnDefault("bit_as_boolean", true, columns, defaultValueConverter);
+            assertColumnDefault("bit", new byte[]{ 3 }, columns, defaultValueConverter);
+            assertColumnDefault("varbit", new byte[]{ 6 }, columns, defaultValueConverter);
+            assertColumnDefault("boolean", true, columns, defaultValueConverter);
+            assertColumnDefault("char", "abcd", columns, defaultValueConverter);
+            assertColumnDefault("varchar", "abcde", columns, defaultValueConverter);
+
+            assertColumnDefault("date", (int) LocalDate.of(2021, 3, 19).toEpochDay(), columns, defaultValueConverter);
+            assertColumnDefault("date_func", 0, columns, defaultValueConverter);
+
+            assertColumnDefault("double", 123456789.1234567890123, columns, defaultValueConverter);
+            assertColumnDefault("integer", 2147483647, columns, defaultValueConverter);
+            assertColumnDefault("integer_func1", 0, columns, defaultValueConverter);
+            assertColumnDefault("integer_func2", 0, columns, defaultValueConverter);
+            assertColumnDefault("integer_opt", null, columns, defaultValueConverter);
+
+            assertColumnDefault("interval", TimeUnit.HOURS.toMicros(1), columns, defaultValueConverter);
+            assertColumnDefault("interval_func1", 0L, columns, defaultValueConverter);
+
+            assertColumnDefault("json", "{}", columns, defaultValueConverter);
+            assertColumnDefault("json_opt", null, columns, defaultValueConverter);
+            assertColumnDefault("jsonb", "{}", columns, defaultValueConverter);
+
+            assertColumnDefault("numeric", new BigDecimal("12345.67891"), columns, defaultValueConverter);
+            // KAFKA-12694: default value for Struct currently exported as null
+            assertColumnDefault("numeric_var", null, columns, defaultValueConverter);
+            assertColumnDefault("real", 1234567890.5f, columns, defaultValueConverter);
+            assertColumnDefault("smallint", (short) 32767, columns, defaultValueConverter);
+
+            assertColumnDefault("text", "asdf", columns, defaultValueConverter);
+            assertColumnDefault("text_parens", "text(parens)", columns, defaultValueConverter);
+            assertColumnDefault("text_func3", "", columns, defaultValueConverter);
+
+            assertColumnDefault("time_hm", TimeUnit.SECONDS.toMicros(LocalTime.of(12, 34).toSecondOfDay()), columns, defaultValueConverter);
+            assertColumnDefault("time_hms", TimeUnit.SECONDS.toMicros(LocalTime.of(12, 34, 56).toSecondOfDay()), columns, defaultValueConverter);
+            assertColumnDefault("time_func", 0L, columns, defaultValueConverter);
+            assertColumnDefault("timestamp", TimeUnit.SECONDS.toMicros(1616247868), columns, defaultValueConverter);
+            assertColumnDefault("timestamp_func", 0L, columns, defaultValueConverter);
+            assertColumnDefault("timestamp_opt", null, columns, defaultValueConverter);
+            assertColumnDefault("timestamptz", "2021-03-20T13:44:28.000000Z", columns, defaultValueConverter);
+            assertColumnDefault("timestamptz_func", "1970-01-01T00:00:00.000000Z", columns, defaultValueConverter);
+            assertColumnDefault("timestamptz_opt", null, columns, defaultValueConverter);
+
+            assertColumnDefault("uuid", "76019d1a-ad2e-4b22-96e9-1a6d6543c818", columns, defaultValueConverter);
+            assertColumnDefault("uuid_func", "00000000-0000-0000-0000-000000000000", columns, defaultValueConverter);
+            assertColumnDefault("uuid_opt", null, columns, defaultValueConverter);
+            assertColumnDefault("xml", "<foo>bar</foo>", columns, defaultValueConverter);
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-5398")
+    public void shouldLoadSchemaForUniqueIndexIncludingFunction() throws Exception {
+        String statements = "CREATE SCHEMA IF NOT EXISTS public;"
+                + "DROP TABLE IF EXISTS counter;"
+                + "CREATE TABLE counter(\n"
+                + "  campaign_id   text not null,\n"
+                + "  group_id      text,\n"
+                + "  sent_cnt      integer   default 0,\n"
+                + "  time_sent_cnt integer   default 0,\n"
+                + "  last_sent_dt  timestamp default LOCALTIMESTAMP,\n"
+                + "  emd_ins_dt    timestamp default LOCALTIMESTAMP not null,\n"
+                + "  emd_upd_dt    timestamp\n"
+                + ");\n"
+                + "create unique index uk_including_function on counter(campaign_id, COALESCE(group_id, ''::text));";
+
+        TestHelper.execute(statements);
+        PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig().build());
+        schema = TestHelper.getSchema(config);
+        TableId tableId = TableId.parse("public.counter", false);
+
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            Table table = schema.tableFor(tableId);
+            assertThat(table).isNotNull();
+            assertThat(table.primaryKeyColumnNames().size()).isEqualTo(0);
+        }
+
+        statements = "drop index uk_including_function;"
+                + "create unique index uk_including_expression on counter((campaign_id),(sent_cnt/ 2));";
+        TestHelper.execute(statements);
+        try (PostgresConnection connection = TestHelper.createWithTypeRegistry()) {
+            schema.refresh(connection, false);
+            Table table = schema.tableFor(tableId);
+            assertThat(table).isNotNull();
+            assertThat(table.primaryKeyColumnNames().size()).isEqualTo(0);
+        }
+    }
+
+    private void assertColumnDefault(String columnName, Object expectedDefault, List<Column> columns, PostgresDefaultValueConverter defaultValueConverter) {
+        Column column = columns.stream().filter(c -> c.name().equals(columnName)).findFirst().get();
+
+        Object defaultValue = defaultValueConverter
+                .parseDefaultValue(column, column.defaultValueExpression().orElse(null))
+                .orElse(null);
+
+        if (expectedDefault instanceof byte[]) {
+            byte[] expectedBytes = (byte[]) expectedDefault;
+            byte[] defaultBytes = (byte[]) defaultValue;
+            assertArrayEquals(expectedBytes, defaultBytes);
+        }
+        else {
+            if (Objects.isNull(defaultValue)) {
+                assertTrue(Objects.isNull(expectedDefault));
+            }
+            else {
+                assertTrue(defaultValue.equals(expectedDefault));
+            }
+        }
+    }
+
+    protected void assertKeySchema(String fullyQualifiedTableName, String fields, Schema... expectedSchemas) {
         TableSchema tableSchema = schemaFor(fullyQualifiedTableName);
         Schema keySchema = tableSchema.keySchema();
-        assertSchemaContent(fields.split(","), types, keySchema);
+        assertSchemaContent(keySchema, fields.split(","), expectedSchemas);
     }
 
-    protected void assertTableSchema(String fullyQualifiedTableName, String fields, Schema... types) {
+    protected void assertTableSchema(String fullyQualifiedTableName, String fields, Schema... expectedSchemas) {
         TableSchema tableSchema = schemaFor(fullyQualifiedTableName);
-        Schema keySchema = tableSchema.valueSchema();
-        assertSchemaContent(fields.split(","), types, keySchema);
+        Schema valueSchema = tableSchema.valueSchema();
+        assertSchemaContent(valueSchema, fields.split(","), expectedSchemas);
     }
 
-    private void assertSchemaContent(String[] fields, Schema[] types, Schema keySchema) {
-        IntStream.range(0, fields.length).forEach(i -> {
+    private void assertSchemaContent(Schema actualSchema, String[] fields, Schema[] expectedSchemas) {
+        for (int i = 0; i < fields.length; i++) {
             String fieldName = fields[i].trim();
-            Field field = keySchema.field(Strings.unquoteIdentifierPart(fieldName));
+
+            Field field = actualSchema.field(Strings.unquoteIdentifierPart(fieldName));
             assertNotNull(fieldName + " not found in schema", field);
-            VerifyRecord.assertConnectSchemasAreEqual(fieldName, types[i], field.schema());
-        });
+            VerifyRecord.assertConnectSchemasAreEqual(fieldName, field.schema(), expectedSchemas[i]);
+        }
     }
 
     protected void assertTablesIncluded(String... fullyQualifiedTableNames) {

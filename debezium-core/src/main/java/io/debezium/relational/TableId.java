@@ -5,9 +5,12 @@
  */
 package io.debezium.relational;
 
+import java.util.List;
+
 import io.debezium.annotation.Immutable;
 import io.debezium.relational.Selectors.TableIdToStringMapper;
-import io.debezium.schema.DataCollectionId;
+import io.debezium.spi.schema.DataCollectionId;
+import io.debezium.util.Collect;
 
 /**
  * Unique identifier for a database table.
@@ -31,16 +34,61 @@ public final class TableId implements DataCollectionId, Comparable<TableId> {
      * Parse the supplied string, extracting up to the first 3 parts into a TableID.
      *
      * @param str the string representation of the table identifier; may not be null
+     * @param predicates the {@link TableIdPredicates} which determines DB specific reserved characters
+     * @return the table ID, or null if it could not be parsed
+     */
+    public static TableId parse(String str, TableIdPredicates predicates) {
+        return parse(str, true, predicates);
+    }
+
+    /**
+     * Parse the supplied string, extracting up to the first 3 parts into a TableID.
+     *
+     * @param str the string representation of the table identifier; may not be null
      * @param useCatalogBeforeSchema {@code true} if the parsed string contains only 2 items and the first should be used as
      *            the catalog and the second as the table name, or {@code false} if the first should be used as the schema and the
      *            second as the table name
      * @return the table ID, or null if it could not be parsed
      */
     public static TableId parse(String str, boolean useCatalogBeforeSchema) {
-        String[] parts = TableIdParser.parse(str).stream()
-                .toArray(String[]::new);
-
+        final String[] parts = parseParts(str);
         return TableId.parse(parts, parts.length, useCatalogBeforeSchema);
+    }
+
+    /**
+     * Parse the supplied string, extracting up to the first 3 parts into a TableID.
+     *
+     * @param str the string representation of the table identifier; may not be null
+     * @param useCatalogBeforeSchema {@code true} if the parsed string contains only 2 items and the first should be used as
+     *            the catalog and the second as the table name, or {@code false} if the first should be used as the schema and the
+     *            second as the table name
+     * @param predicates the {@link TableIdPredicates} which determines DB specific reserved characters
+     * @return the table ID, or null if it could not be parsed
+     */
+    public static TableId parse(String str, boolean useCatalogBeforeSchema, TableIdPredicates predicates) {
+        final String[] parts = parseParts(str, predicates);
+        return TableId.parse(parts, parts.length, useCatalogBeforeSchema);
+    }
+
+    /**
+     * Parse the supplied string into its tokenized parts.
+     *
+     * @param str the string representation of the table identifier; may not be null
+     * @return the parts of the parsed string.
+     */
+    public static String[] parseParts(String str) {
+        return TableIdParser.parse(str).toArray(new String[0]);
+    }
+
+    /**
+     * Parse the supplied string into its tokenized parts.
+     *
+     * @param str the string representation of the table identifier; may not be null
+     * @param predicates the {@link TableIdPredicates} which determines DB specific reserved characters
+     * @return the parts of the parsed string.
+     */
+    public static String[] parseParts(String str, TableIdPredicates predicates) {
+        return TableIdParser.parse(str, predicates).toArray(new String[0]);
     }
 
     /**
@@ -138,6 +186,21 @@ public final class TableId implements DataCollectionId, Comparable<TableId> {
     }
 
     @Override
+    public List<String> parts() {
+        return Collect.arrayListOf(catalogName, schemaName, tableName);
+    }
+
+    @Override
+    public List<String> databaseParts() {
+        return Collect.arrayListOf(catalogName, tableName);
+    }
+
+    @Override
+    public List<String> schemaParts() {
+        return Collect.arrayListOf(schemaName, tableName);
+    }
+
+    @Override
     public int compareTo(TableId that) {
         if (this == that) {
             return 0;
@@ -179,6 +242,32 @@ public final class TableId implements DataCollectionId, Comparable<TableId> {
     }
 
     /**
+     * Returns a new {@link TableId} with all parts of the identifier using {@code "} character.
+     */
+    public TableId toDoubleQuoted() {
+        return toQuoted('"');
+    }
+
+    /**
+     * Returns a new {@link TableId} that has all parts of the identifier quoted.
+     *
+     * @param quotingChar the character to be used to quote the identifier parts.
+     */
+    public TableId toQuoted(char quotingChar) {
+        String catalogName = null;
+        if (this.catalogName != null && !this.catalogName.isEmpty()) {
+            catalogName = quote(this.catalogName, quotingChar);
+        }
+
+        String schemaName = null;
+        if (this.schemaName != null && !this.schemaName.isEmpty()) {
+            schemaName = quote(this.schemaName, quotingChar);
+        }
+
+        return new TableId(catalogName, schemaName, quote(this.tableName, quotingChar));
+    }
+
+    /**
      * Returns a dot-separated String representation of this identifier, quoting all
      * name parts with the given quoting char.
      */
@@ -199,13 +288,13 @@ public final class TableId implements DataCollectionId, Comparable<TableId> {
     }
 
     private static String tableId(String catalog, String schema, String table) {
-        if (catalog == null || catalog.length() == 0) {
-            if (schema == null || schema.length() == 0) {
+        if (catalog == null || catalog.isEmpty()) {
+            if (schema == null || schema.isEmpty()) {
                 return table;
             }
             return schema + "." + table;
         }
-        if (schema == null || schema.length() == 0) {
+        if (schema == null || schema.isEmpty()) {
             return catalog + "." + table;
         }
         return catalog + "." + schema + "." + table;
@@ -220,7 +309,7 @@ public final class TableId implements DataCollectionId, Comparable<TableId> {
         }
 
         if (identifierPart.isEmpty()) {
-            return new StringBuilder().append(quotingChar).append(quotingChar).toString();
+            return repeat(quotingChar);
         }
 
         if (identifierPart.charAt(0) != quotingChar && identifierPart.charAt(identifierPart.length() - 1) != quotingChar) {

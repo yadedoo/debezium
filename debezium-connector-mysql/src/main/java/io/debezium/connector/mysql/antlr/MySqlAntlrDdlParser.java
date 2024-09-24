@@ -9,23 +9,31 @@ package io.debezium.connector.mysql.antlr;
 import java.sql.Types;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
 import org.antlr.v4.runtime.CharStream;
 import org.antlr.v4.runtime.CommonTokenStream;
+import org.antlr.v4.runtime.misc.Interval;
 import org.antlr.v4.runtime.tree.ParseTree;
 
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.antlr.AntlrDdlParser;
 import io.debezium.antlr.AntlrDdlParserListener;
 import io.debezium.antlr.DataTypeResolver;
 import io.debezium.antlr.DataTypeResolver.DataTypeEntry;
-import io.debezium.connector.mysql.MySqlSystemVariables;
-import io.debezium.connector.mysql.MySqlValueConverters;
+import io.debezium.connector.binlog.charset.BinlogCharsetRegistry;
+import io.debezium.connector.binlog.jdbc.BinlogSystemVariables;
 import io.debezium.connector.mysql.antlr.listener.MySqlAntlrDdlParserListener;
+import io.debezium.connector.mysql.jdbc.MySqlValueConverters;
 import io.debezium.ddl.parser.mysql.generated.MySqlLexer;
 import io.debezium.ddl.parser.mysql.generated.MySqlParser;
+import io.debezium.ddl.parser.mysql.generated.MySqlParser.CharsetNameContext;
+import io.debezium.ddl.parser.mysql.generated.MySqlParser.CollationNameContext;
+import io.debezium.ddl.parser.mysql.generated.MySqlParser.RenameTableClauseContext;
+import io.debezium.ddl.parser.mysql.generated.MySqlParser.RenameTableContext;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.SystemVariables;
@@ -43,24 +51,30 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
     private final ConcurrentMap<String, String> charsetNameForDatabase = new ConcurrentHashMap<>();
     private final MySqlValueConverters converters;
     private final TableFilter tableFilter;
+    private final BinlogCharsetRegistry charsetRegistry;
 
+    @VisibleForTesting
     public MySqlAntlrDdlParser() {
         this(null, TableFilter.includeAll());
     }
 
+    @VisibleForTesting
     public MySqlAntlrDdlParser(MySqlValueConverters converters) {
         this(converters, TableFilter.includeAll());
     }
 
+    @VisibleForTesting
     public MySqlAntlrDdlParser(MySqlValueConverters converters, TableFilter tableFilter) {
-        this(true, false, converters, tableFilter);
+        this(true, false, false, converters, tableFilter, null);
     }
 
-    protected MySqlAntlrDdlParser(boolean throwErrorsFromTreeWalk, boolean includeViews, MySqlValueConverters converters, TableFilter tableFilter) {
-        super(throwErrorsFromTreeWalk, includeViews);
-        systemVariables = new MySqlSystemVariables();
+    public MySqlAntlrDdlParser(boolean throwErrorsFromTreeWalk, boolean includeViews, boolean includeComments,
+                               MySqlValueConverters converters, TableFilter tableFilter, BinlogCharsetRegistry charsetRegistry) {
+        super(throwErrorsFromTreeWalk, includeViews, includeComments);
+        systemVariables = new BinlogSystemVariables();
         this.converters = converters;
         this.tableFilter = tableFilter;
+        this.charsetRegistry = charsetRegistry;
     }
 
     @Override
@@ -85,7 +99,7 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
 
     @Override
     protected SystemVariables createNewSystemVariablesInstance() {
-        return new MySqlSystemVariables();
+        return new BinlogSystemVariables();
     }
 
     @Override
@@ -99,25 +113,30 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
 
         dataTypeResolverBuilder.registerDataTypes(MySqlParser.StringDataTypeContext.class.getCanonicalName(), Arrays.asList(
                 new DataTypeEntry(Types.CHAR, MySqlParser.CHAR),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.CHAR, MySqlParser.VARYING),
                 new DataTypeEntry(Types.VARCHAR, MySqlParser.VARCHAR),
                 new DataTypeEntry(Types.VARCHAR, MySqlParser.TINYTEXT),
                 new DataTypeEntry(Types.VARCHAR, MySqlParser.TEXT),
                 new DataTypeEntry(Types.VARCHAR, MySqlParser.MEDIUMTEXT),
                 new DataTypeEntry(Types.VARCHAR, MySqlParser.LONGTEXT),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.LONG),
                 new DataTypeEntry(Types.NCHAR, MySqlParser.NCHAR),
+                new DataTypeEntry(Types.NVARCHAR, MySqlParser.NCHAR, MySqlParser.VARYING),
                 new DataTypeEntry(Types.NVARCHAR, MySqlParser.NVARCHAR),
-                new DataTypeEntry(Types.BINARY, MySqlParser.CHAR, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.VARCHAR, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.TINYTEXT, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.TEXT, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.MEDIUMTEXT, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.LONGTEXT, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.NCHAR, MySqlParser.BINARY),
-                new DataTypeEntry(Types.BINARY, MySqlParser.NVARCHAR, MySqlParser.BINARY),
-                new DataTypeEntry(Types.CHAR, MySqlParser.CHARACTER)));
+                new DataTypeEntry(Types.CHAR, MySqlParser.CHAR, MySqlParser.BINARY),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.VARCHAR, MySqlParser.BINARY),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.TINYTEXT, MySqlParser.BINARY),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.TEXT, MySqlParser.BINARY),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.MEDIUMTEXT, MySqlParser.BINARY),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.LONGTEXT, MySqlParser.BINARY),
+                new DataTypeEntry(Types.NCHAR, MySqlParser.NCHAR, MySqlParser.BINARY),
+                new DataTypeEntry(Types.NVARCHAR, MySqlParser.NVARCHAR, MySqlParser.BINARY),
+                new DataTypeEntry(Types.CHAR, MySqlParser.CHARACTER),
+                new DataTypeEntry(Types.VARCHAR, MySqlParser.CHARACTER, MySqlParser.VARYING)));
         dataTypeResolverBuilder.registerDataTypes(MySqlParser.NationalStringDataTypeContext.class.getCanonicalName(), Arrays.asList(
                 new DataTypeEntry(Types.NVARCHAR, MySqlParser.NATIONAL, MySqlParser.VARCHAR).setSuffixTokens(MySqlParser.BINARY),
                 new DataTypeEntry(Types.NCHAR, MySqlParser.NATIONAL, MySqlParser.CHARACTER).setSuffixTokens(MySqlParser.BINARY),
+                new DataTypeEntry(Types.NCHAR, MySqlParser.NATIONAL, MySqlParser.CHAR).setSuffixTokens(MySqlParser.BINARY),
                 new DataTypeEntry(Types.NVARCHAR, MySqlParser.NCHAR, MySqlParser.VARCHAR).setSuffixTokens(MySqlParser.BINARY)));
         dataTypeResolverBuilder.registerDataTypes(MySqlParser.NationalVaryingStringDataTypeContext.class.getCanonicalName(), Arrays.asList(
                 new DataTypeEntry(Types.NVARCHAR, MySqlParser.NATIONAL, MySqlParser.CHAR, MySqlParser.VARYING),
@@ -169,17 +188,20 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
                 new DataTypeEntry(Types.NUMERIC, MySqlParser.NUMERIC)
                         .setSuffixTokens(MySqlParser.SIGNED, MySqlParser.UNSIGNED, MySqlParser.ZEROFILL)
                         .setDefaultLengthScaleDimension(10, 0),
-                new DataTypeEntry(Types.BIT, MySqlParser.BIT),
+                new DataTypeEntry(Types.BIT, MySqlParser.BIT)
+                        .setDefaultLengthDimension(1),
+                new DataTypeEntry(Types.OTHER, MySqlParser.VECTOR)
+                        .setDefaultLengthDimension(2048),
                 new DataTypeEntry(Types.TIME, MySqlParser.TIME),
                 new DataTypeEntry(Types.TIMESTAMP_WITH_TIMEZONE, MySqlParser.TIMESTAMP),
                 new DataTypeEntry(Types.TIMESTAMP, MySqlParser.DATETIME),
                 new DataTypeEntry(Types.BINARY, MySqlParser.BINARY),
                 new DataTypeEntry(Types.VARBINARY, MySqlParser.VARBINARY),
+                new DataTypeEntry(Types.BLOB, MySqlParser.BLOB),
                 new DataTypeEntry(Types.INTEGER, MySqlParser.YEAR)));
         dataTypeResolverBuilder.registerDataTypes(MySqlParser.SimpleDataTypeContext.class.getCanonicalName(), Arrays.asList(
                 new DataTypeEntry(Types.DATE, MySqlParser.DATE),
                 new DataTypeEntry(Types.BLOB, MySqlParser.TINYBLOB),
-                new DataTypeEntry(Types.BLOB, MySqlParser.BLOB),
                 new DataTypeEntry(Types.BLOB, MySqlParser.MEDIUMBLOB),
                 new DataTypeEntry(Types.BLOB, MySqlParser.LONGBLOB),
                 new DataTypeEntry(Types.BOOLEAN, MySqlParser.BOOL),
@@ -280,7 +302,7 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
     }
 
     /**
-     * Parse column names for primary index from {@link MySqlParser.IndexColumnNamesContext}. This method will updates
+     * Parse column names for primary index from {@link MySqlParser.IndexColumnNamesContext}. This method will update
      * column to be not optional and set primary key column names to table.
      *
      * @param indexColumnNamesContext primary key index column names context.
@@ -294,22 +316,71 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
                     if (indexColumnNameContext.uid() != null) {
                         columnName = parseName(indexColumnNameContext.uid());
                     }
-                    else {
+                    else if (indexColumnNameContext.STRING_LITERAL() != null) {
                         columnName = withoutQuotes(indexColumnNameContext.STRING_LITERAL().getText());
+                    }
+                    else {
+                        columnName = indexColumnNameContext.expression().getText();
                     }
                     Column column = tableEditor.columnWithName(columnName);
                     if (column != null && column.isOptional()) {
                         final ColumnEditor ce = column.edit().optional(false);
-                        if (ce.hasDefaultValue() && ce.defaultValue() == null) {
-                            ce.unsetDefaultValue();
+                        if (ce.hasDefaultValue() && !ce.defaultValueExpression().isPresent()) {
+                            ce.unsetDefaultValueExpression();
                         }
                         tableEditor.addColumn(ce.create());
                     }
-                    return columnName;
+                    return column != null ? column.name() : columnName;
                 })
                 .collect(Collectors.toList());
 
         tableEditor.setPrimaryKeyNames(pkColumnNames);
+    }
+
+    /**
+     * Parse column names for unique index from {@link MySqlParser.IndexColumnNamesContext}. This method will set
+     * unique key column names to table if there are no optional.
+     *
+     * @param indexColumnNamesContext unique key index column names context.
+     * @param tableEditor editor for table where primary key index is parsed.
+     */
+    public void parseUniqueIndexColumnNames(MySqlParser.IndexColumnNamesContext indexColumnNamesContext, TableEditor tableEditor) {
+        List<Column> indexColumns = getIndexColumns(indexColumnNamesContext, tableEditor);
+        if (indexColumns.stream().filter(col -> Objects.isNull(col) || col.isOptional()).count() > 0) {
+            logger.warn("Skip to set unique index columns {} to primary key which including optional columns", indexColumns);
+        }
+        else {
+            tableEditor.setPrimaryKeyNames(indexColumns.stream().map(Column::name).collect(Collectors.toList()));
+        }
+    }
+
+    /**
+     * Determine if a table's unique index should be included when parsing relative unique index statement.
+     *
+     * @param indexColumnNamesContext unique index column names context.
+     * @param tableEditor editor for table where unique index is parsed.
+     * @return true if the index is to be included; false otherwise.
+     */
+    public boolean isTableUniqueIndexIncluded(MySqlParser.IndexColumnNamesContext indexColumnNamesContext, TableEditor tableEditor) {
+        return getIndexColumns(indexColumnNamesContext, tableEditor).stream().filter(Objects::isNull).count() == 0;
+    }
+
+    private List<Column> getIndexColumns(MySqlParser.IndexColumnNamesContext indexColumnNamesContext, TableEditor tableEditor) {
+        return indexColumnNamesContext.indexColumnName().stream()
+                .map(indexColumnNameContext -> {
+                    String columnName;
+                    if (indexColumnNameContext.uid() != null) {
+                        columnName = parseName(indexColumnNameContext.uid());
+                    }
+                    else if (indexColumnNameContext.STRING_LITERAL() != null) {
+                        columnName = withoutQuotes(indexColumnNameContext.STRING_LITERAL().getText());
+                    }
+                    else {
+                        columnName = indexColumnNameContext.expression().getText();
+                    }
+                    return tableEditor.columnWithName(columnName);
+                })
+                .collect(Collectors.toList());
     }
 
     /**
@@ -318,11 +389,21 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
      * @return the name of the character set for the current database, or null if not known ...
      */
     public String currentDatabaseCharset() {
-        String charsetName = systemVariables.getVariable(MySqlSystemVariables.CHARSET_NAME_DATABASE);
+        String charsetName = systemVariables.getVariable(BinlogSystemVariables.CHARSET_NAME_DATABASE);
         if (charsetName == null || "DEFAULT".equalsIgnoreCase(charsetName)) {
-            charsetName = systemVariables.getVariable(MySqlSystemVariables.CHARSET_NAME_SERVER);
+            charsetName = systemVariables.getVariable(BinlogSystemVariables.CHARSET_NAME_SERVER);
         }
         return charsetName;
+    }
+
+    /**
+     * Get the name of the character set for the give table name.
+     *
+     * @return the name of the character set for the given table, or null if not known ...
+     */
+    public String charsetForTable(TableId tableId) {
+        final String defaultDatabaseCharset = tableId.catalog() != null ? charsetNameForDatabase().get(tableId.catalog()) : null;
+        return defaultDatabaseCharset != null ? defaultDatabaseCharset : currentDatabaseCharset();
     }
 
     /**
@@ -357,7 +438,7 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
         // Replace comma to backslash followed by comma (this escape sequence implies comma is part of the option)
         // Replace backlash+single-quote to a single-quote.
         // Replace double single-quote to a single-quote.
-        return option.replaceAll(",", "\\\\,").replaceAll("\\\\'", "'").replaceAll("''", "'");
+        return option.replaceAll(",", "\\\\,").replaceAll("\\\\'", "'").replace("''", "'");
     }
 
     public MySqlValueConverters getConverters() {
@@ -366,5 +447,44 @@ public class MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser>
 
     public TableFilter getTableFilter() {
         return tableFilter;
+    }
+
+    /**
+     * Obtains the charset name either form charset if present or from collation.
+     *
+     * @param charsetNode
+     * @param collationNode
+     * @return character set
+     */
+    public String extractCharset(CharsetNameContext charsetNode, CollationNameContext collationNode) {
+        String charsetName = null;
+        if (charsetNode != null && charsetNode.getText() != null) {
+            charsetName = withoutQuotes(charsetNode.getText());
+        }
+        else if (collationNode != null && collationNode.getText() != null) {
+            final String collationName = withoutQuotes(collationNode.getText()).toLowerCase();
+            for (int index = 0; index < charsetRegistry.getCharsetMapSize(); index++) {
+                if (collationName.equals(charsetRegistry.getCollationNameForCollationIndex(index))) {
+                    charsetName = charsetRegistry.getCharsetNameForCollationIndex(index);
+                    break;
+                }
+            }
+        }
+        return charsetName;
+    }
+
+    /**
+     * Signal an alter table event to ddl changes listener.
+     *
+     * @param id         the table identifier; may not be null
+     * @param previousId the previous name of the view if it was renamed, or null if it was not renamed
+     * @param ctx        the start of the statement; may not be null
+     */
+    public void signalAlterTable(TableId id, TableId previousId, RenameTableClauseContext ctx) {
+        final RenameTableContext parent = (RenameTableContext) ctx.getParent();
+        Interval interval = new Interval(ctx.getParent().start.getStartIndex(),
+                parent.renameTableClause().get(0).start.getStartIndex() - 1);
+        String prefix = ctx.getParent().start.getInputStream().getText(interval);
+        signalAlterTable(id, previousId, prefix + getText(ctx));
     }
 }

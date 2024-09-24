@@ -7,38 +7,44 @@ package io.debezium.connector.sqlserver;
 
 import static io.debezium.connector.sqlserver.SqlServerConnectorConfig.SNAPSHOT_ISOLATION_MODE;
 import static io.debezium.relational.RelationalDatabaseConnectorConfig.TABLE_INCLUDE_LIST;
-import static org.fest.assertions.Assertions.assertThat;
+import static junit.framework.TestCase.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertNull;
 
 import java.math.BigDecimal;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.fest.assertions.Assertions;
-import org.fest.assertions.MapAssert;
+import org.awaitility.Awaitility;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import io.debezium.config.CommonConnectorConfig.Version;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotIsolationMode;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
 import io.debezium.connector.sqlserver.util.TestHelper;
 import io.debezium.converters.CloudEventsConverterTest;
+import io.debezium.converters.spi.CloudEventsMaker;
 import io.debezium.data.SchemaAndValueField;
 import io.debezium.data.SourceRecordAssert;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.junit.logging.LogInterceptor;
+import io.debezium.pipeline.ErrorHandler;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.time.Timestamp;
 import io.debezium.util.Testing;
@@ -71,7 +77,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         TestHelper.enableTableCdc(connection, "table1");
 
         initializeConnectorTestFramework();
-        Testing.Files.delete(TestHelper.DB_HISTORY_PATH);
+        Testing.Files.delete(TestHelper.SCHEMA_HISTORY_PATH);
     }
 
     @After
@@ -117,7 +123,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
+        final List<SourceRecord> table1 = records.recordsForTopic("server1.testDB1.dbo.table1");
 
         assertThat(table1).hasSize(INITIAL_RECORDS_PER_TABLE);
 
@@ -135,9 +141,10 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).includes(
-                    MapAssert.entry("snapshot", true),
-                    MapAssert.entry("snapshot_completed", i == INITIAL_RECORDS_PER_TABLE - 1));
+            assertThat(record1.sourceOffset())
+                    .extracting("snapshot").containsExactly(true);
+            assertThat(record1.sourceOffset())
+                    .extracting("snapshot_completed").containsExactly(i == INITIAL_RECORDS_PER_TABLE - 1);
             assertNull(value1.get("before"));
         }
     }
@@ -151,8 +158,9 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         // Ignore initial records
         final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
-        table1.subList(0, INITIAL_RECORDS_PER_TABLE - 1).forEach(record -> {
+        final List<SourceRecord> table1 = records.recordsForTopic("server1.testDB1.dbo.table1");
+        assertThat(((Struct) table1.get(0).value()).getStruct("source").getString("snapshot")).isEqualTo("first");
+        table1.subList(1, INITIAL_RECORDS_PER_TABLE - 1).forEach(record -> {
             assertThat(((Struct) record.value()).getStruct("source").getString("snapshot")).isEqualTo("true");
         });
         assertThat(((Struct) table1.get(INITIAL_RECORDS_PER_TABLE - 1).value()).getStruct("source").getString("snapshot")).isEqualTo("last");
@@ -162,7 +170,8 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-1280")
     public void testDeadlockDetection() throws Exception {
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptorErrorHandler = new LogInterceptor(ErrorHandler.class);
+        final LogInterceptor logInterceptorTask = new LogInterceptor(BaseSourceTask.class);
         final Configuration config = TestHelper.defaultConfig()
                 .with(RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS, 1_000)
                 .build();
@@ -173,27 +182,11 @@ public class SnapshotIT extends AbstractConnectorTest {
         connection.setAutoCommit(false).executeWithoutCommitting(
                 "SELECT TOP(0) * FROM dbo.table1 WITH (TABLOCKX)");
         consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        assertConnectorNotRunning();
-        assertThat(logInterceptor.containsStacktraceElement("Lock request time out period exceeded.")).as("Log contains error related to lock timeout").isTrue();
+        Awaitility.await().atMost(TestHelper.waitTimeForLogEntries(), TimeUnit.SECONDS).until(
+                () -> logInterceptorTask.containsWarnMessage("Going to restart connector after "));
+        assertThat(logInterceptorErrorHandler.containsStacktraceElement("Lock request time out period exceeded.")).as("Log contains error related to lock timeout")
+                .isTrue();
         connection.rollback();
-    }
-
-    @Test
-    public void takeSnapshotWithOldStructAndStartStreaming() throws Exception {
-        final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SOURCE_STRUCT_MAKER_VERSION, Version.V1)
-                .build();
-
-        start(SqlServerConnector.class, config);
-        assertConnectorIsRunning();
-
-        // Ignore initial records
-        final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
-        table1.forEach(record -> {
-            assertThat(((Struct) record.value()).getStruct("source").getBoolean("snapshot")).isTrue();
-        });
-        testStreaming();
     }
 
     private void testStreaming() throws SQLException, InterruptedException {
@@ -208,7 +201,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         TestHelper.waitForCdcRecord(connection, "table1", rs -> rs.getInt("id") == lastId);
 
         final SourceRecords records = consumeRecordsByTopic(STREAMING_RECORDS_PER_TABLE);
-        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
+        final List<SourceRecord> table1 = records.recordsForTopic("server1.testDB1.dbo.table1");
 
         assertThat(table1).hasSize(INITIAL_RECORDS_PER_TABLE);
 
@@ -227,7 +220,7 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).hasSize(4);
+            assertThat(record1.sourceOffset()).hasSize(3);
 
             Assert.assertTrue(record1.sourceOffset().containsKey("change_lsn"));
             Assert.assertTrue(record1.sourceOffset().containsKey("commit_lsn"));
@@ -239,7 +232,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndStartStreaming() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -262,7 +255,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         TestHelper.enableTableCdc(connection, "User");
         initializeConnectorTestFramework();
-        Testing.Files.delete(TestHelper.DB_HISTORY_PATH);
+        Testing.Files.delete(TestHelper.SCHEMA_HISTORY_PATH);
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(TABLE_INCLUDE_LIST, "dbo.User")
@@ -271,7 +264,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        final List<SourceRecord> user = records.recordsForTopic("server1.dbo.User");
+        final List<SourceRecord> user = records.recordsForTopic("server1.testDB1.dbo.User");
 
         assertThat(user).hasSize(INITIAL_RECORDS_PER_TABLE);
 
@@ -287,9 +280,10 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).includes(
-                    MapAssert.entry("snapshot", true),
-                    MapAssert.entry("snapshot_completed", i == INITIAL_RECORDS_PER_TABLE - 1));
+            assertThat(record1.sourceOffset())
+                    .extracting("snapshot").containsExactly(true);
+            assertThat(record1.sourceOffset())
+                    .extracting("snapshot_completed").containsExactly(i == INITIAL_RECORDS_PER_TABLE - 1);
             assertNull(value1.get("before"));
         }
     }
@@ -297,7 +291,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndSendHeartbeat() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(Heartbeat.HEARTBEAT_INTERVAL, 300_000)
                 .build();
 
@@ -306,65 +300,47 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         TestHelper.waitForSnapshotToBeCompleted();
         final SourceRecord record = consumeRecord();
-        Assertions.assertThat(record).isNotNull();
-        Assertions.assertThat(record.topic()).startsWith("__debezium-heartbeat");
+        assertThat(record).isNotNull();
+        assertThat(record.topic()).startsWith("__debezium-heartbeat");
     }
 
     @Test
-    @FixFor("DBZ-1067")
-    public void testBlacklistColumn() throws Exception {
+    @FixFor("DBZ-2456")
+    public void shouldSelectivelySnapshotTables() throws SQLException, InterruptedException {
         connection.execute(
-                "CREATE TABLE blacklist_column_table_a (id int, name varchar(30), amount integer primary key(id))",
-                "CREATE TABLE blacklist_column_table_b (id int, name varchar(30), amount integer primary key(id))");
-        connection.execute("INSERT INTO blacklist_column_table_a VALUES(10, 'some_name', 120)");
-        connection.execute("INSERT INTO blacklist_column_table_b VALUES(11, 'some_name', 447)");
-        TestHelper.enableTableCdc(connection, "blacklist_column_table_a");
-        TestHelper.enableTableCdc(connection, "blacklist_column_table_b");
+                "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_b (id int, name varchar(30), amount integer primary key(id))");
+        connection.execute("INSERT INTO table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO table_b VALUES(11, 'some_name', 447)");
+        TestHelper.enableTableCdc(connection, "table_a");
+        TestHelper.enableTableCdc(connection, "table_b");
 
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
-                .with(SqlServerConnectorConfig.COLUMN_BLACKLIST, "dbo.blacklist_column_table_a.amount")
-                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.blacklist_column_table_a,dbo.blacklist_column_table_b")
+                .with(SqlServerConnectorConfig.COLUMN_EXCLUDE_LIST, "dbo.table_a.amount")
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.table_a,dbo.table_b")
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, "[A-z].*dbo.table_a")
                 .build();
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
 
-        final SourceRecords records = consumeRecordsByTopic(2);
-        final List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.blacklist_column_table_a");
-        final List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.blacklist_column_table_b");
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.table_b");
 
-        Schema expectedSchemaA = SchemaBuilder.struct()
-                .optional()
-                .name("server1.dbo.blacklist_column_table_a.Value")
-                .field("id", Schema.INT32_SCHEMA)
-                .field("name", Schema.OPTIONAL_STRING_SCHEMA)
-                .build();
-        Struct expectedValueA = new Struct(expectedSchemaA)
-                .put("id", 10)
-                .put("name", "some_name");
+        assertThat(tableA).hasSize(1);
+        assertThat(tableB).isNull();
+        TestHelper.waitForSnapshotToBeCompleted();
+        connection.execute("INSERT INTO table_a VALUES(22, 'some_name', 556)");
+        connection.execute("INSERT INTO table_b VALUES(24, 'some_name', 558)");
 
-        Schema expectedSchemaB = SchemaBuilder.struct()
-                .optional()
-                .name("server1.dbo.blacklist_column_table_b.Value")
-                .field("id", Schema.INT32_SCHEMA)
-                .field("name", Schema.OPTIONAL_STRING_SCHEMA)
-                .field("amount", Schema.OPTIONAL_INT32_SCHEMA)
-                .build();
-        Struct expectedValueB = new Struct(expectedSchemaB)
-                .put("id", 11)
-                .put("name", "some_name")
-                .put("amount", 447);
+        records = consumeRecordsByTopic(2);
+        tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        tableB = records.recordsForTopic("server1.testDB1.dbo.table_b");
 
-        Assertions.assertThat(tableA).hasSize(1);
-        SourceRecordAssert.assertThat(tableA.get(0))
-                .valueAfterFieldIsEqualTo(expectedValueA)
-                .valueAfterFieldSchemaIsEqualTo(expectedSchemaA);
-
-        Assertions.assertThat(tableB).hasSize(1);
-        SourceRecordAssert.assertThat(tableB.get(0))
-                .valueAfterFieldIsEqualTo(expectedValueB)
-                .valueAfterFieldSchemaIsEqualTo(expectedSchemaB);
+        assertThat(tableA).hasSize(1);
+        assertThat(tableB).hasSize(1);
 
         stopConnector();
     }
@@ -390,12 +366,12 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         final SourceRecords records = consumeRecordsByTopic(2);
-        final List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.blacklist_column_table_a");
-        final List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.blacklist_column_table_b");
+        final List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.blacklist_column_table_a");
+        final List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.blacklist_column_table_b");
 
         Schema expectedSchemaA = SchemaBuilder.struct()
                 .optional()
-                .name("server1.dbo.blacklist_column_table_a.Value")
+                .name("server1.testDB1.dbo.blacklist_column_table_a.Value")
                 .field("id", Schema.INT32_SCHEMA)
                 .field("name", Schema.OPTIONAL_STRING_SCHEMA)
                 .build();
@@ -405,7 +381,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         Schema expectedSchemaB = SchemaBuilder.struct()
                 .optional()
-                .name("server1.dbo.blacklist_column_table_b.Value")
+                .name("server1.testDB1.dbo.blacklist_column_table_b.Value")
                 .field("id", Schema.INT32_SCHEMA)
                 .field("name", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("amount", Schema.OPTIONAL_INT32_SCHEMA)
@@ -415,12 +391,12 @@ public class SnapshotIT extends AbstractConnectorTest {
                 .put("name", "some_name")
                 .put("amount", 447);
 
-        Assertions.assertThat(tableA).hasSize(1);
+        assertThat(tableA).hasSize(1);
         SourceRecordAssert.assertThat(tableA.get(0))
                 .valueAfterFieldIsEqualTo(expectedValueA)
                 .valueAfterFieldSchemaIsEqualTo(expectedSchemaA);
 
-        Assertions.assertThat(tableB).hasSize(1);
+        assertThat(tableB).hasSize(1);
         SourceRecordAssert.assertThat(tableB.get(0))
                 .valueAfterFieldIsEqualTo(expectedValueB)
                 .valueAfterFieldSchemaIsEqualTo(expectedSchemaB);
@@ -447,15 +423,15 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         SourceRecords records = consumeRecordsByTopic(1);
-        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
-        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_b");
+        List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.table_b");
 
-        Assertions.assertThat(tableB).hasSize(1);
-        Assertions.assertThat(tableA).isNull();
+        assertThat(tableB).hasSize(1);
+        assertThat(tableA).isNull();
 
         records = consumeRecordsByTopic(1);
-        tableA = records.recordsForTopic("server1.dbo.table_a");
-        Assertions.assertThat(tableA).hasSize(1);
+        tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        assertThat(tableA).hasSize(1);
 
         stopConnector();
     }
@@ -482,22 +458,22 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         SourceRecords records = consumeRecordsByTopic(1);
-        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
-        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_ab");
-        List<SourceRecord> tableC = records.recordsForTopic("server1.dbo.table_ac");
+        List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.table_ab");
+        List<SourceRecord> tableC = records.recordsForTopic("server1.testDB1.dbo.table_ac");
 
-        Assertions.assertThat(tableB).hasSize(1);
-        Assertions.assertThat(tableA).isNull();
-        Assertions.assertThat(tableC).isNull();
-
-        records = consumeRecordsByTopic(1);
-        tableA = records.recordsForTopic("server1.dbo.table_a");
-        Assertions.assertThat(tableA).hasSize(1);
-        Assertions.assertThat(tableC).isNull();
+        assertThat(tableB).hasSize(1);
+        assertThat(tableA).isNull();
+        assertThat(tableC).isNull();
 
         records = consumeRecordsByTopic(1);
-        tableC = records.recordsForTopic("server1.dbo.table_ac");
-        Assertions.assertThat(tableC).hasSize(1);
+        tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        assertThat(tableA).hasSize(1);
+        assertThat(tableC).isNull();
+
+        records = consumeRecordsByTopic(1);
+        tableC = records.recordsForTopic("server1.testDB1.dbo.table_ac");
+        assertThat(tableC).hasSize(1);
 
         stopConnector();
     }
@@ -525,28 +501,28 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         SourceRecords records = consumeRecordsByTopic(1);
-        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
-        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_ab");
-        List<SourceRecord> tableC = records.recordsForTopic("server1.dbo.table_ac");
+        List<SourceRecord> tableA = records.recordsForTopic("server1.testDB1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.testDB1.dbo.table_ab");
+        List<SourceRecord> tableC = records.recordsForTopic("server1.testDB1.dbo.table_ac");
 
-        Assertions.assertThat(tableA).hasSize(1);
-        Assertions.assertThat(tableB).isNull();
-        Assertions.assertThat(tableC).isNull();
-
-        records = consumeRecordsByTopic(1);
-        tableB = records.recordsForTopic("server1.dbo.table_ab");
-        Assertions.assertThat(tableB).hasSize(1);
-        Assertions.assertThat(tableC).isNull();
+        assertThat(tableA).hasSize(1);
+        assertThat(tableB).isNull();
+        assertThat(tableC).isNull();
 
         records = consumeRecordsByTopic(1);
-        tableC = records.recordsForTopic("server1.dbo.table_ac");
-        Assertions.assertThat(tableC).hasSize(1);
+        tableB = records.recordsForTopic("server1.testDB1.dbo.table_ab");
+        assertThat(tableB).hasSize(1);
+        assertThat(tableC).isNull();
+
+        records = consumeRecordsByTopic(1);
+        tableC = records.recordsForTopic("server1.testDB1.dbo.table_ac");
+        assertThat(tableC).hasSize(1);
 
         stopConnector();
     }
 
     @Test
-    @FixFor("DBZ-1292")
+    @FixFor({ "DBZ-1292", "DBZ-3157" })
     public void shouldOutputRecordsInCloudEventsFormat() throws Exception {
         final Configuration config = TestHelper.defaultConfig().build();
 
@@ -554,7 +530,7 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         final SourceRecords snapshotRecords = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
-        final List<SourceRecord> snapshotTable1 = snapshotRecords.recordsForTopic("server1.dbo.table1");
+        final List<SourceRecord> snapshotTable1 = snapshotRecords.recordsForTopic("server1.testDB1.dbo.table1");
 
         assertThat(snapshotTable1).hasSize(INITIAL_RECORDS_PER_TABLE);
 
@@ -572,19 +548,86 @@ public class SnapshotIT extends AbstractConnectorTest {
         }
 
         final SourceRecords streamingRecords = consumeRecordsByTopic(STREAMING_RECORDS_PER_TABLE);
-        final List<SourceRecord> streamingTable1 = streamingRecords.recordsForTopic("server1.dbo.table1");
+        final List<SourceRecord> streamingTable1 = streamingRecords.recordsForTopic("server1.testDB1.dbo.table1");
 
         assertThat(streamingTable1).hasSize(INITIAL_RECORDS_PER_TABLE);
 
         // test streaming
         for (SourceRecord sourceRecord : streamingTable1) {
-            CloudEventsConverterTest.shouldConvertToCloudEventsInJson(sourceRecord, false);
+            CloudEventsConverterTest.shouldConvertToCloudEventsInJson(sourceRecord, false,
+                    jsonNode -> {
+                        assertThat(jsonNode.get(CloudEventsMaker.FieldName.ID).asText()).contains("event_serial_no:1");
+                    });
             CloudEventsConverterTest.shouldConvertToCloudEventsInJsonWithDataAsAvro(sourceRecord, false);
             CloudEventsConverterTest.shouldConvertToCloudEventsInAvro(sourceRecord, "sqlserver", "server1", false);
         }
     }
 
+    @Test
+    @FixFor({ "DBZ-5198", "DBZ-7828" })
+    public void shouldHandleBracketsInSnapshotSelect() throws InterruptedException, SQLException {
+        connection.execute(
+                "CREATE TABLE [user detail] (id int PRIMARY KEY, name varchar(30))",
+                "INSERT INTO [user detail] VALUES(1, 'k')",
+                "INSERT INTO [user detail] VALUES(2, 'k')");
+        TestHelper.enableTableCdc(connection, "user detail");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(SqlServerConnectorConfig.TABLE_INCLUDE_LIST, "dbo.user detail")
+                .with(SqlServerConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, "[dbo].[user detail]")
+                .with(SqlServerConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE + ".[dbo].[user detail]", "SELECT * FROM [dbo].[user detail] WHERE id = 2")
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> recordsForTopic = records.recordsForTopic("server1.testDB1.dbo.user_detail");
+        assertThat(recordsForTopic.get(0).key()).isNotNull();
+        Struct value = (Struct) ((Struct) recordsForTopic.get(0).value()).get("after");
+        System.out.println("DATA: " + value);
+        assertThat(value.get("id")).isEqualTo(2);
+        assertThat(value.get("name")).isEqualTo("k");
+
+        stopConnector();
+    }
+
+    @Test
+    @FixFor("DBZ-6811")
+    public void shouldSendHeartbeatsWhenNoRecordsAreSent() throws Exception {
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
+                .with(Heartbeat.HEARTBEAT_INTERVAL, 100)
+                .build();
+
+        start(SqlServerConnector.class, config);
+        TestHelper.waitForSnapshotToBeCompleted();
+
+        final AtomicInteger heartbeatCount = new AtomicInteger();
+        Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> {
+            final SourceRecord record = consumeRecord();
+            if (record != null) {
+                if (record.topic().startsWith("__debezium-heartbeat")) {
+                    assertHeartBeatRecord(record);
+                    heartbeatCount.incrementAndGet();
+                }
+            }
+            return heartbeatCount.get() > 10;
+        });
+    }
+
     private void assertRecord(Struct record, List<SchemaAndValueField> expected) {
         expected.forEach(schemaAndValueField -> schemaAndValueField.assertFor(record));
+    }
+
+    private void assertHeartBeatRecord(SourceRecord heartbeat) {
+        assertEquals("__debezium-heartbeat." + TestHelper.TEST_SERVER_NAME, heartbeat.topic());
+
+        Struct key = (Struct) heartbeat.key();
+        assertThat(key.get("serverName")).isEqualTo(TestHelper.TEST_SERVER_NAME);
+
+        Struct value = (Struct) heartbeat.value();
+        assertThat(value.getInt64("ts_ms")).isLessThanOrEqualTo(Instant.now().toEpochMilli());
     }
 }

@@ -7,17 +7,25 @@
 package io.debezium.connector.postgresql;
 
 import static io.debezium.connector.postgresql.TestHelper.PK_FIELD;
+import static io.debezium.connector.postgresql.TestHelper.getDefaultReplicationSlot;
 import static io.debezium.connector.postgresql.TestHelper.topicName;
 import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static junit.framework.TestCase.assertEquals;
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -27,19 +35,24 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
+import javax.management.InstanceNotFoundException;
+
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.awaitility.Awaitility;
 import org.awaitility.core.ConditionTimeoutException;
-import org.fest.assertions.Assertions;
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
@@ -48,26 +61,35 @@ import org.junit.Test;
 import org.junit.rules.TestRule;
 import org.postgresql.util.PSQLState;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
-import io.debezium.config.CommonConnectorConfig.Version;
+import io.debezium.config.CommonConnectorConfig.SnapshotQueryMode;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.LogicalDecoder;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
+import io.debezium.connector.postgresql.connection.AbstractMessageDecoder;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
+import io.debezium.connector.postgresql.connection.PostgresReplicationConnection;
+import io.debezium.connector.postgresql.connection.ReplicaIdentityInfo;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.connector.postgresql.connection.pgoutput.PgOutputMessageDecoder;
+import io.debezium.connector.postgresql.junit.PostgresDatabaseVersionResolver;
 import io.debezium.connector.postgresql.junit.SkipTestDependingOnDecoderPluginNameRule;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIs;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIsNot;
+import io.debezium.connector.postgresql.spi.SlotState;
 import io.debezium.converters.CloudEventsConverterTest;
 import io.debezium.data.Envelope;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
-import io.debezium.embedded.EmbeddedEngine;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.engine.DebeziumEngine;
 import io.debezium.heartbeat.Heartbeat;
+import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.EqualityCheck;
 import io.debezium.junit.SkipWhenDatabaseVersion;
@@ -75,16 +97,18 @@ import io.debezium.junit.SkipWhenKafkaVersion;
 import io.debezium.junit.SkipWhenKafkaVersion.KafkaVersion;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.RelationalDatabaseSchema;
+import io.debezium.relational.RelationalSnapshotChangeEventSource;
+import io.debezium.relational.TableId;
 import io.debezium.schema.DatabaseSchema;
 import io.debezium.util.Strings;
-import io.debezium.util.Testing;
 
 /**
- * Integration test for {@link PostgresConnector} using an {@link io.debezium.embedded.EmbeddedEngine}
+ * Integration test for {@link PostgresConnector} using an {@link io.debezium.engine.DebeziumEngine}
  *
  * @author Horia Chiorean (hchiorea@redhat.com)
  */
-public class PostgresConnectorIT extends AbstractConnectorTest {
+public class PostgresConnectorIT extends AbstractAsyncEngineConnectorTest {
 
     /*
      * Specific tests that need to extend the initial DDL set should do it in a form of
@@ -152,6 +176,41 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
+    public void shouldNotStartWithInvalidSlotConfigAndUserRoles() throws Exception {
+        // Start with a clean slate and create database objects
+        TestHelper.dropAllSchemas();
+        TestHelper.dropPublication();
+        TestHelper.dropDefaultReplicationSlot();
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute("CREATE USER badboy WITH PASSWORD 'failing';", "GRANT ALL PRIVILEGES ON DATABASE postgres TO badboy;");
+
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
+                .with(PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME)
+                .build();
+
+        start(PostgresConnector.class, config);
+        waitForStreamingRunning();
+
+        Configuration failingConfig = TestHelper.defaultConfig()
+                .with("name", "failingPGConnector")
+                .with(PostgresConnectorConfig.DATABASE_CONFIG_PREFIX + JdbcConfiguration.USER, "badboy")
+                .with(PostgresConnectorConfig.DATABASE_CONFIG_PREFIX + JdbcConfiguration.PASSWORD, "failing")
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
+                .with(PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME)
+                .build();
+        List<ConfigValue> validatedConfig = new PostgresConnector().validate(failingConfig.asMap()).configValues();
+
+        final List<String> invalidProperties = Collections.singletonList("database.user");
+        validatedConfig.forEach(
+                configValue -> {
+                    if (!invalidProperties.contains(configValue.name())) {
+                        assertTrue("Unexpected error for \"" + configValue.name() + "\": " + configValue.errorMessages(), configValue.errorMessages().isEmpty());
+                    }
+                });
+    }
+
+    @Test
     public void shouldValidateConfiguration() throws Exception {
         // use an empty configuration which should be invalid because of the lack of DB connection details
         Configuration config = Configuration.create().build();
@@ -161,42 +220,38 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertConfigurationErrors(validatedConfig, PostgresConnectorConfig.HOSTNAME, 1);
         assertConfigurationErrors(validatedConfig, PostgresConnectorConfig.USER, 1);
         assertConfigurationErrors(validatedConfig, PostgresConnectorConfig.DATABASE_NAME, 1);
-        assertConfigurationErrors(validatedConfig, PostgresConnectorConfig.SERVER_NAME, 1);
+        assertConfigurationErrors(validatedConfig, CommonConnectorConfig.TOPIC_PREFIX, 1);
 
         // validate the non required fields
-        validateField(validatedConfig, PostgresConnectorConfig.PLUGIN_NAME, LogicalDecoder.DECODERBUFS.getValue());
-        validateField(validatedConfig, PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME);
-        validateField(validatedConfig, PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
-        validateField(validatedConfig, PostgresConnectorConfig.PORT, PostgresConnectorConfig.DEFAULT_PORT);
-        validateField(validatedConfig, PostgresConnectorConfig.MAX_QUEUE_SIZE, PostgresConnectorConfig.DEFAULT_MAX_QUEUE_SIZE);
-        validateField(validatedConfig, PostgresConnectorConfig.MAX_BATCH_SIZE, PostgresConnectorConfig.DEFAULT_MAX_BATCH_SIZE);
-        validateField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_FETCH_SIZE, null);
-        validateField(validatedConfig, PostgresConnectorConfig.POLL_INTERVAL_MS, PostgresConnectorConfig.DEFAULT_POLL_INTERVAL_MILLIS);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_MODE, PostgresConnectorConfig.SecureConnectionMode.DISABLED);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_CERT, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_KEY, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_KEY_PASSWORD, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_ROOT_CERT, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SCHEMA_WHITELIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SCHEMA_BLACKLIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SCHEMA_EXCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TABLE_WHITELIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TABLE_INCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TABLE_BLACKLIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TABLE_EXCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.COLUMN_BLACKLIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.COLUMN_EXCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.COLUMN_WHITELIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.COLUMN_INCLUDE_LIST, null);
-        validateField(validatedConfig, PostgresConnectorConfig.MSG_KEY_COLUMNS, null);
-        validateField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL);
-        validateField(validatedConfig, RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS,
+        validateConfigField(validatedConfig, PostgresConnectorConfig.PLUGIN_NAME, LogicalDecoder.DECODERBUFS.getValue());
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.PORT, PostgresConnectorConfig.DEFAULT_PORT);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.MAX_QUEUE_SIZE, PostgresConnectorConfig.DEFAULT_MAX_QUEUE_SIZE);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.MAX_BATCH_SIZE, PostgresConnectorConfig.DEFAULT_MAX_BATCH_SIZE);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_FETCH_SIZE, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.POLL_INTERVAL_MS, PostgresConnectorConfig.DEFAULT_POLL_INTERVAL_MILLIS);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_MODE, PostgresConnectorConfig.SecureConnectionMode.PREFER);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_CERT, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_KEY, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_CLIENT_KEY_PASSWORD, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_ROOT_CERT, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SCHEMA_EXCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.TABLE_INCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.TABLE_EXCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.COLUMN_EXCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.COLUMN_INCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.MSG_KEY_COLUMNS, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL);
+        validateConfigField(validatedConfig, RelationalDatabaseConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS,
                 RelationalDatabaseConnectorConfig.DEFAULT_SNAPSHOT_LOCK_TIMEOUT_MILLIS);
-        validateField(validatedConfig, PostgresConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ADAPTIVE);
-        validateField(validatedConfig, PostgresConnectorConfig.DECIMAL_HANDLING_MODE, PostgresConnectorConfig.DecimalHandlingMode.PRECISE);
-        validateField(validatedConfig, PostgresConnectorConfig.SSL_SOCKET_FACTORY, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TCP_KEEPALIVE, true);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ADAPTIVE);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.DECIMAL_HANDLING_MODE, PostgresConnectorConfig.DecimalHandlingMode.PRECISE);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.SSL_SOCKET_FACTORY, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.TCP_KEEPALIVE, true);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.LOGICAL_DECODING_MESSAGE_PREFIX_EXCLUDE_LIST, null);
+        validateConfigField(validatedConfig, PostgresConnectorConfig.LOGICAL_DECODING_MESSAGE_PREFIX_INCLUDE_LIST, null);
     }
 
     @Test
@@ -220,7 +275,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
             if (TestHelper.shouldSSLConnectionFail()) {
                 // we expect the task to fail at startup when we're printing the server info
                 assertThat(success).isFalse();
-                assertThat(error).isInstanceOf(ConnectException.class);
+                assertThat(error).isInstanceOf(DebeziumException.class);
                 Throwable cause = error.getCause();
                 assertThat(cause).isInstanceOf(SQLException.class);
                 assertThat(PSQLState.CONNECTION_REJECTED.getState().equals(((SQLException) cause).getSQLState()));
@@ -268,36 +323,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
-    @FixFor("DBZ-1174")
-    public void shouldUseMicrosecondsForTransactionCommitTime() throws InterruptedException {
-        TestHelper.execute(SETUP_TABLES_STMT);
-        start(PostgresConnector.class, TestHelper.defaultConfig()
-                .with(CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION, Version.V1)
-                .build());
-        assertConnectorIsRunning();
-
-        // check records from snapshot
-        Instant inst = Instant.now();
-        // Microseconds since epoch, may overflow
-        final long microsSnapshot = TimeUnit.SECONDS.toMicros(inst.getEpochSecond()) + TimeUnit.NANOSECONDS.toMicros(inst.getNano());
-        SourceRecords actualRecords = consumeRecordsByTopic(2);
-        actualRecords.forEach(sourceRecord -> assertSourceInfoMicrosecondTransactionTimestamp(sourceRecord, microsSnapshot, TimeUnit.MINUTES.toMicros(1L)));
-
-        // insert 2 new records
-        TestHelper.execute(INSERT_STMT);
-        // check records from streaming
-        inst = Instant.now();
-        // Microseconds since epoch, may overflow
-        final long microsStream = TimeUnit.SECONDS.toMicros(inst.getEpochSecond()) + TimeUnit.NANOSECONDS.toMicros(inst.getNano());
-        actualRecords = consumeRecordsByTopic(2);
-        actualRecords.forEach(sourceRecord -> assertSourceInfoMicrosecondTransactionTimestamp(sourceRecord, microsStream, TimeUnit.MINUTES.toMicros(1L)));
-
-        // now stop the connector
-        stopConnector();
-        assertNoRecordsToConsume();
-    }
-
-    @Test
     @FixFor("DBZ-1235")
     public void shouldUseMillisecondsForTransactionCommitTime() throws InterruptedException {
         TestHelper.execute(SETUP_TABLES_STMT);
@@ -319,10 +344,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         final long millisStream = TimeUnit.SECONDS.toMillis(inst.getEpochSecond()) + TimeUnit.NANOSECONDS.toMillis(inst.getNano());
         actualRecords = consumeRecordsByTopic(2);
         actualRecords.forEach(sourceRecord -> assertSourceInfoMillisecondTransactionTimestamp(sourceRecord, millisStream, TimeUnit.MINUTES.toMillis(1L)));
-
-        // now stop the connector
-        stopConnector();
-        assertNoRecordsToConsume();
     }
 
     @Test
@@ -344,9 +365,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
         waitForSnapshotToBeCompleted();
         SourceRecords records = consumeRecordsByTopic(recordCount);
-        Assertions.assertThat(records.recordsForTopic("test_server.s1.a")).hasSize(recordCount);
-
-        stopConnector();
+        assertThat(records.recordsForTopic("test_server.s1.a")).hasSize(recordCount);
     }
 
     @Test
@@ -361,21 +380,19 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.MAX_QUEUE_SIZE, recordCount / 2)
                 .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 10)
-                .with(PostgresConnectorConfig.SCHEMA_WHITELIST, "s1");
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "s1");
         start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
 
         waitForSnapshotToBeCompleted();
         SourceRecords records = consumeRecordsByTopic(recordCount);
-        Assertions.assertThat(records.recordsForTopic("test_server.s1.a")).hasSize(recordCount);
-
-        stopConnector();
+        assertThat(records.recordsForTopic("test_server.s1.a")).hasSize(recordCount);
     }
 
     @Test
     @FixFor("DBZ-997")
     public void shouldReceiveChangesForChangePKColumnDefinition() throws Exception {
-        Testing.Print.enable();
+        // Testing.Print.enable();
         final String slotName = "pkcolumndef" + new Random().nextInt(100);
         TestHelper.create().dropReplicationSlot(slotName);
         try {
@@ -472,6 +489,281 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
+    public void shouldReceiveChangesForChangeColumnDefault() throws Exception {
+        // Testing.Print.enable();
+        final String slotName = "default_change" + new Random().nextInt(100);
+        TestHelper.create().dropReplicationSlot(slotName);
+        try {
+            final PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig()
+                    .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, Boolean.FALSE)
+                    .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "default_change")
+                    .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                    .with(PostgresConnectorConfig.SLOT_NAME, slotName)
+                    .build());
+
+            final String topicName = topicName("default_change.test_table");
+
+            TestHelper.execute(
+                    "CREATE SCHEMA IF NOT EXISTS default_change;",
+                    "DROP TABLE IF EXISTS default_change.test_table;",
+                    "CREATE TABLE default_change.test_table (pk SERIAL, i INT DEFAULT 1, text TEXT DEFAULT 'foo', PRIMARY KEY(pk));",
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);");
+
+            start(PostgresConnector.class, config.getConfig());
+
+            assertConnectorIsRunning();
+            waitForSnapshotToBeCompleted();
+
+            // check the records from the snapshot
+            final SourceRecords snapshotRecords = consumeRecordsByTopic(1);
+
+            final Integer pkExpectedDefault = 0;
+            final Integer snapshotIntDefault = 1;
+            final String snapshotTextDefault = "foo";
+            snapshotRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 1);
+                assertValueField(snapshotRecord, "after/i", snapshotIntDefault);
+                assertValueField(snapshotRecord, "after/text", snapshotTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(snapshotIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(snapshotTextDefault);
+            });
+
+            waitForStreamingRunning();
+
+            TestHelper.execute(
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);",
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN i SET DEFAULT 2;",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN text SET DEFAULT 'bar';",
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN i SET DEFAULT 3;",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN text SET DEFAULT 'baz';",
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);");
+
+            final Integer secondIntDefault = 2;
+            final String secondTextDefault = "bar";
+            final Integer thirdIntDefault = 3;
+            final String thirdTextDefault = "baz";
+
+            final Integer schemaIntDefaultAfterAlter = DecoderDifferences.areDefaultValuesRefreshedEagerly() ? thirdIntDefault : snapshotIntDefault;
+            final String schemaTextDefaultAfterAlter = DecoderDifferences.areDefaultValuesRefreshedEagerly() ? thirdTextDefault : snapshotTextDefault;
+
+            // check records inserted with i=1, text='foo' default
+            final SourceRecords firstBatchRecords = consumeRecordsByTopic(2);
+
+            firstBatchRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/i", snapshotIntDefault);
+                assertValueField(snapshotRecord, "after/text", snapshotTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(schemaIntDefaultAfterAlter);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(schemaTextDefaultAfterAlter);
+            });
+
+            // check records inserted with i=2, text='bar' default
+            final SourceRecords secondBatchRecords = consumeRecordsByTopic(1);
+
+            secondBatchRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/i", secondIntDefault);
+                assertValueField(snapshotRecord, "after/text", secondTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(schemaIntDefaultAfterAlter);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(schemaTextDefaultAfterAlter);
+            });
+
+            // check records inserted with i=3, text='baz' default
+            final SourceRecords thirdBatchRecords = consumeRecordsByTopic(1);
+
+            thirdBatchRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/i", thirdIntDefault);
+                assertValueField(snapshotRecord, "after/text", thirdTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(schemaIntDefaultAfterAlter);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(schemaTextDefaultAfterAlter);
+            });
+
+            // restart the connector, starting with a new record which should have refreshed schema
+            stopConnector();
+
+            TestHelper.execute("INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);");
+
+            start(PostgresConnector.class, config.getConfig());
+
+            assertConnectorIsRunning();
+
+            // check that the schema defaults will be in-sync after restart refreshes schema
+            final SourceRecords afterRestartRecords = consumeRecordsByTopic(1);
+
+            afterRestartRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 6);
+                assertValueField(snapshotRecord, "after/i", thirdIntDefault);
+                assertValueField(snapshotRecord, "after/text", thirdTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(thirdIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(thirdTextDefault);
+            });
+
+            TestHelper.execute(
+                    "ALTER TABLE default_change.test_table ALTER COLUMN i SET DEFAULT 4;",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN text SET DEFAULT 'boo';",
+                    "ALTER TABLE default_change.test_table ADD COLUMN tstz TIMESTAMPTZ DEFAULT '2021-03-20 14:44:28 +1'::TIMESTAMPTZ;",
+                    "INSERT INTO default_change.test_table(i, text, tstz) VALUES (DEFAULT, DEFAULT, DEFAULT);");
+
+            // check that the schema defaults will be in-sync after column changes refreshes schema
+            final Integer refreshedIntDefault = 4;
+            final String refreshedTextDefault = "boo";
+            final String refreshedTstzDefault = "2021-03-20T13:44:28.000000Z";
+            final SourceRecords afterRefreshRecords = consumeRecordsByTopic(1);
+
+            afterRefreshRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 7);
+                assertValueField(snapshotRecord, "after/i", refreshedIntDefault);
+                assertValueField(snapshotRecord, "after/text", refreshedTextDefault);
+                assertValueField(snapshotRecord, "after/tstz", refreshedTstzDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(refreshedIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(refreshedTextDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "tstz")).isEqualTo(refreshedTstzDefault);
+            });
+
+            stopConnector();
+            TestHelper.create().dropReplicationSlot(slotName);
+
+            TestHelper.execute("DROP SCHEMA IF EXISTS default_change CASCADE;");
+        }
+        catch (Throwable t) {
+            stopConnector(null);
+            TestHelper.create().dropReplicationSlot(slotName);
+            throw t;
+        }
+    }
+
+    @Test
+    public void showThatSchemaColumnDefaultMayApplyRetroactively() throws Exception {
+        // Testing.Print.enable();
+        final String slotName = "default_change" + new Random().nextInt(100);
+        try (PostgresConnection conn = TestHelper.create()) {
+            conn.dropReplicationSlot(slotName);
+        }
+        try {
+            final PostgresConnectorConfig config = new PostgresConnectorConfig(TestHelper.defaultConfig()
+                    .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, Boolean.FALSE)
+                    .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "default_change")
+                    .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                    .with(PostgresConnectorConfig.SLOT_NAME, slotName)
+                    .build());
+
+            final String topicName = topicName("default_change.test_table");
+
+            TestHelper.execute(
+                    "CREATE SCHEMA IF NOT EXISTS default_change;",
+                    "DROP TABLE IF EXISTS default_change.test_table;",
+                    "CREATE TABLE default_change.test_table (pk SERIAL, i INT DEFAULT 1, text TEXT DEFAULT 'foo', PRIMARY KEY(pk));",
+                    "INSERT INTO default_change.test_table(i, text) VALUES (DEFAULT, DEFAULT);");
+
+            start(PostgresConnector.class, config.getConfig());
+
+            assertConnectorIsRunning();
+            waitForSnapshotToBeCompleted();
+
+            // check the records from the snapshot
+            final SourceRecords snapshotRecords = consumeRecordsByTopic(1);
+
+            final Integer pkExpectedDefault = 0;
+            final Integer initialIntDefault = 1;
+            final String initialTextDefault = "foo";
+            snapshotRecords.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 1);
+                assertValueField(snapshotRecord, "after/i", initialIntDefault);
+                assertValueField(snapshotRecord, "after/text", initialTextDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(initialIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(initialTextDefault);
+            });
+
+            stopConnector();
+
+            // default changes interwoven with updates while connector stopped
+            TestHelper.execute("ALTER TABLE default_change.test_table ADD COLUMN bi BIGINT DEFAULT 1;",
+                    "INSERT INTO default_change.test_table(i, text, bi) VALUES (DEFAULT, DEFAULT, DEFAULT);",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN i SET DEFAULT 2;",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN text SET DEFAULT 'bar';",
+                    "ALTER TABLE default_change.test_table ALTER COLUMN bi SET DEFAULT 2;",
+                    "ALTER TABLE default_change.test_table ADD COLUMN tstz TIMESTAMPTZ DEFAULT '2021-03-20 14:44:28 +1'::TIMESTAMPTZ;",
+                    "INSERT INTO default_change.test_table(i, text, bi, tstz) VALUES (DEFAULT, DEFAULT, DEFAULT, DEFAULT);");
+
+            start(PostgresConnector.class, config.getConfig());
+
+            assertConnectorIsRunning();
+
+            // check that the schema defaults will be in-sync after restart refreshes schema
+            final Integer refreshedIntDefault = 2;
+            final String refreshedTextDefault = "bar";
+            final Long initialBigIntDefault = 1L;
+            final Long refreshedBigIntDefault = 2L;
+            final String refreshedTstzDefault = "2021-03-20T13:44:28.000000Z";
+            final SourceRecords oldOfflineRecord = consumeRecordsByTopic(1);
+
+            // record fields will have the default value that was applied on insert, but schema will show the current default value
+            oldOfflineRecord.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 2);
+                assertValueField(snapshotRecord, "after/i", initialIntDefault);
+                assertValueField(snapshotRecord, "after/text", initialTextDefault);
+                assertValueField(snapshotRecord, "after/bi", initialBigIntDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(refreshedIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(refreshedTextDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "bi")).isEqualTo(refreshedBigIntDefault);
+                assertThat(getRecordFieldFromAfter(snapshotRecord, "tstz")).isNull();
+            });
+
+            final SourceRecords latestOfflineRecord = consumeRecordsByTopic(1);
+
+            latestOfflineRecord.recordsForTopic(topicName).forEach(snapshotRecord -> {
+                assertValueField(snapshotRecord, "after/pk", 3);
+                assertValueField(snapshotRecord, "after/i", refreshedIntDefault);
+                assertValueField(snapshotRecord, "after/text", refreshedTextDefault);
+                assertValueField(snapshotRecord, "after/bi", refreshedBigIntDefault);
+                assertValueField(snapshotRecord, "after/tstz", refreshedTstzDefault);
+
+                assertThat(readRecordFieldDefault(snapshotRecord, "pk")).isEqualTo(pkExpectedDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "i")).isEqualTo(refreshedIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "text")).isEqualTo(refreshedTextDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "bi")).isEqualTo(refreshedBigIntDefault);
+                assertThat(readRecordFieldDefault(snapshotRecord, "tstz")).isEqualTo(refreshedTstzDefault);
+            });
+
+            stopConnector();
+            try (PostgresConnection conn = TestHelper.create()) {
+                conn.dropReplicationSlot(slotName);
+            }
+
+            TestHelper.execute("DROP SCHEMA IF EXISTS default_change CASCADE;");
+        }
+        catch (Throwable t) {
+            stopConnector(null);
+            TestHelper.create().dropReplicationSlot(slotName);
+            throw t;
+        }
+    }
+
+    private static Object readRecordFieldDefault(SourceRecord record, String field) {
+        return getRecordFieldFromAfter(record, field).schema().defaultValue();
+    }
+
+    private static org.apache.kafka.connect.data.Field getRecordFieldFromAfter(SourceRecord record, String field) {
+        return ((Struct) record.value()).getStruct("after").schema().field(field);
+    }
+
+    @Test
     @FixFor("DBZ-1021")
     @SkipWhenDecoderPluginNameIs(value = SkipWhenDecoderPluginNameIs.DecoderPluginName.PGOUTPUT, reason = "Pgoutput will generate insert statements even for dropped tables, column optionality will default to true however")
     public void shouldIgnoreEventsForDeletedTable() throws Exception {
@@ -506,9 +798,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         SourceRecords actualRecords = consumeRecordsByTopic(1);
         assertThat(actualRecords.topics()).hasSize(1);
         assertThat(actualRecords.recordsForTopic(topicName("s2.a"))).hasSize(1);
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
@@ -547,9 +836,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertThat(actualRecords.topics()).hasSize(2);
         assertThat(actualRecords.recordsForTopic(topicName("s1.a"))).hasSize(1);
         assertThat(actualRecords.recordsForTopic(topicName("s2.a"))).hasSize(1);
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
@@ -586,9 +872,46 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         waitForStreamingRunning();
 
         assertRecordsAfterInsert(2, 3, 3);
+    }
 
+    @Test
+    public void shouldLimitDecoderLog() throws Exception {
+        LogInterceptor interceptor = new LogInterceptor(AbstractMessageDecoder.class);
+        TestHelper.execute(
+                SETUP_TABLES_STMT +
+                        "CREATE VIEW s1.myview AS SELECT * from s1.a;");
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        // check the records from the snapshot
+        assertRecordsFromSnapshot(2, 1, 1);
+        waitForStreamingRunning();
+
+        // insert 2 new records
+        TestHelper.execute(INSERT_STMT);
+        assertRecordsAfterInsert(2, 2, 2);
+
+        // now stop the connector
         stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
+        assertNoRecordsToConsume();
+
+        // insert some more records
+        TestHelper.execute(INSERT_STMT);
+
+        // start the connector back up and check that a new snapshot has not been performed (we're running initial only mode)
+        // but the 2 records that we were inserted while we were down will be retrieved
+        start(PostgresConnector.class, configBuilder.with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE).build());
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+
+        assertRecordsAfterInsert(2, 3, 3);
+
+        assertEquals("There should be at most one log message every 10 seconds",
+                1, interceptor.countOccurrences("identified as already processed"));
     }
 
     @Test
@@ -601,6 +924,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
         start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
+        waitForStreamingRunning();
 
         SourceRecords actualRecords = consumeRecordsByTopic(6);
         assertKey(actualRecords.allRecordsInOrder().get(0), "pk", 1);
@@ -610,18 +934,15 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // so the given statements will be executed multiple times, resulting in multiple
         // records; here we're interested just in the first insert for s2.a
         assertValueField(actualRecords.allRecordsInOrder().get(5), "after/bb", "hello; world");
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
     public void shouldProduceEventsWhenSnapshotsAreNeverAllowed() throws InterruptedException {
-        Testing.Print.enable();
+        // Testing.Print.enable();
         TestHelper.dropDefaultReplicationSlot();
         TestHelper.execute(SETUP_TABLES_STMT);
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
                 .build();
         start(PostgresConnector.class, config);
@@ -639,7 +960,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
     @Test
     public void shouldNotProduceEventsWithInitialOnlySnapshot() throws InterruptedException {
-        Testing.Print.enable();
+        // Testing.Print.enable();
         TestHelper.execute(SETUP_TABLES_STMT);
         Configuration config = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL_ONLY.getValue())
@@ -684,9 +1005,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         waitForSnapshotToBeCompleted();
 
         assertRecordsFromSnapshot(4, 1, 2, 1, 2);
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
@@ -698,7 +1016,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         Configuration.Builder configBuilder = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
-        EmbeddedEngine.CompletionCallback completionCallback = (success, message, error) -> {
+        DebeziumEngine.CompletionCallback completionCallback = (success, message, error) -> {
             if (error != null) {
                 latch.countDown();
             }
@@ -731,9 +1049,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // insert and verify 2 new records
         TestHelper.execute(INSERT_STMT);
         assertRecordsAfterInsert(2, 3, 3);
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
@@ -754,13 +1069,233 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
         assertRecordsFromSnapshot(2, 1, 1);
 
-        // kill all opened connections to the database
-        TestHelper.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender'");
+        // DBZ-5408 make sure regular streaming is fully running
         TestHelper.execute(INSERT_STMT);
         assertRecordsAfterInsert(2, 2, 2);
 
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
+        // kill all opened connections to the database
+        TestHelper.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender'");
+        TestHelper.execute(INSERT_STMT);
+        assertRecordsAfterInsert(2, 3, 3);
+    }
+
+    @Test
+    public void shouldUpdateReplicaIdentity() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        String setupStmt = SETUP_TABLES_STMT;
+        TestHelper.execute(setupStmt);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s1.a:FULL,s2.a:DEFAULT")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            TableId tableIds1 = new TableId("", "s1", "a");
+            TableId tableIds2 = new TableId("", "s2", "a");
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL, connection.readReplicaIdentityInfo(tableIds1).getReplicaIdentity());
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.DEFAULT, connection.readReplicaIdentityInfo(tableIds2).getReplicaIdentity());
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity set to FULL for table '%s'", tableIds1))).isTrue();
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity for table '%s' is already DEFAULT", tableIds2))).isTrue();
+        }
+    }
+
+    @Test
+    public void shouldUpdateReplicaIdentityWithRegExp() throws Exception {
+
+        TestHelper.executeDDL("postgres_create_multiple_tables.ddl");
+
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "(.*).a:FULL,s2.*:NOTHING")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            TableId tableIds1a = new TableId("", "s1", "a");
+            TableId tableIds2b = new TableId("", "s2", "b");
+            TableId tableIds2c = new TableId("", "s2", "c");
+            TableId tableIds3a = new TableId("", "s3", "a");
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL, connection.readReplicaIdentityInfo(tableIds1a).getReplicaIdentity());
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL, connection.readReplicaIdentityInfo(tableIds3a).getReplicaIdentity());
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.NOTHING, connection.readReplicaIdentityInfo(tableIds2b).getReplicaIdentity());
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.NOTHING, connection.readReplicaIdentityInfo(tableIds2c).getReplicaIdentity());
+        }
+    }
+
+    @Test
+    public void shouldNotUpdateReplicaIdentityWithRegExpDuplicated() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        TestHelper.executeDDL("postgres_create_multiple_tables.ddl");
+
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s.*:FULL,s2.*:NOTHING")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(10, TimeUnit.SECONDS);
+
+        assertThat(logInterceptor.containsErrorMessage("Unable to update Replica Identity for table s2.c")).isTrue();
+        assertThat(logInterceptor.containsStacktraceElement("More than one Regular expressions matched table s2.c")).isTrue();
+        assertThat(logInterceptor.containsErrorMessage("Unable to update Replica Identity for table s2.b")).isTrue();
+        assertThat(logInterceptor.containsStacktraceElement("More than one Regular expressions matched table s2.b")).isTrue();
+    }
+
+    @Test
+    public void shouldUpdateReplicaIdentityWithOneTable() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        String setupStmt = SETUP_TABLES_STMT;
+        TestHelper.execute(setupStmt);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s1.a:FULL")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            TableId tableIds1 = new TableId("", "s1", "a");
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL.toString(), connection.readReplicaIdentityInfo(tableIds1).toString());
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity set to FULL for table '%s'", tableIds1))).isTrue();
+        }
+    }
+
+    @Test
+    public void shouldUpdateReplicaIdentityUsingIndex() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        String setupStmt = SETUP_TABLES_STMT;
+        TestHelper.execute(setupStmt);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s1.a:FULL,s2.a:INDEX a_pkey")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            TableId tableIds1 = new TableId("", "s1", "a");
+            TableId tableIds2 = new TableId("", "s2", "a");
+            String index_name = connection.readIndexOfReplicaIdentity(tableIds2);
+            ReplicaIdentityInfo replicaIdentityTable2 = connection.readReplicaIdentityInfo(tableIds2);
+            replicaIdentityTable2.setIndexName(index_name);
+
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL.toString(), connection.readReplicaIdentityInfo(tableIds1).toString());
+            ReplicaIdentityInfo replicaIdentityIndex = new ReplicaIdentityInfo(ReplicaIdentityInfo.ReplicaIdentity.INDEX, "a_pkey");
+            assertEquals(replicaIdentityIndex.toString(), replicaIdentityTable2.toString());
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity set to FULL for table '%s'", tableIds1))).isTrue();
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity set to USING INDEX %s for table '%s'", index_name, tableIds2))).isTrue();
+        }
+    }
+
+    @Test
+    public void shouldLogOwnershipErrorForReplicaIdentityUpdate() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresConnection.class);
+
+        TestHelper.executeDDL("postgres_create_role_specific_tables.ddl");
+
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s1.a:FULL,s2.a:DEFAULT")
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.DISABLED.getValue())
+                .with("database.user", "role_2")
+                .with("database.password", "role_2_pass")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        assertThat(logInterceptor.containsMessage(String.format("Replica identity could not be updated because of lack of privileges"))).isTrue();
+    }
+
+    @Test
+    public void shouldCheckTablesToUpdateReplicaIdentityAreCaptured() throws Exception {
+
+        // This captures all logged messages, allowing us to verify log message was written.
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        String setupStmt = SETUP_TABLES_STMT;
+        TestHelper.execute(setupStmt);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.REPLICA_IDENTITY_AUTOSET_VALUES, "s1.a:FULL,s2.b:DEFAULT")
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForStreamingRunning();
+
+        // Waiting for Replica Identity is updated
+        waitForAvailableRecords(5, TimeUnit.SECONDS);
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            TableId tableIds1 = new TableId("", "s1", "a");
+            assertEquals(ReplicaIdentityInfo.ReplicaIdentity.FULL.toString(), connection.readReplicaIdentityInfo(tableIds1).toString());
+            assertThat(logInterceptor.containsMessage(String.format("Replica identity set to FULL for table '%s'", tableIds1))).isTrue();
+
+            assertThat(logInterceptor
+                    .containsMessage(
+                            "Replica identity for table 's2.a' will not be updated because Replica Identity is not defined on REPLICA_IDENTITY_AUTOSET_VALUES property"))
+                    .isTrue();
+        }
     }
 
     @Test
@@ -816,9 +1351,9 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         Configuration.Builder configBuilder = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
-                .with(PostgresConnectorConfig.SCHEMA_BLACKLIST, "s2")
-                .with(PostgresConnectorConfig.TABLE_BLACKLIST, ".+b")
-                .with(PostgresConnectorConfig.COLUMN_BLACKLIST, ".+bb");
+                .with(PostgresConnectorConfig.SCHEMA_EXCLUDE_LIST, "s2")
+                .with(PostgresConnectorConfig.TABLE_EXCLUDE_LIST, ".+b")
+                .with(PostgresConnectorConfig.COLUMN_EXCLUDE_LIST, ".+bb");
 
         start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
@@ -845,7 +1380,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-1962")
-    public void shouldTakeColumnWhitelistFilterIntoAccount() throws Exception {
+    public void shouldTakeColumnIncludeListFilterIntoAccount() throws Exception {
         String setupStmt = SETUP_TABLES_STMT +
                 "ALTER TABLE s1.a ADD COLUMN bb integer;" +
                 "ALTER TABLE s1.a ADD COLUMN cc char(12);" +
@@ -913,8 +1448,8 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         Configuration.Builder configBuilder = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
-                .with(PostgresConnectorConfig.SCHEMA_WHITELIST, "s1")
-                .with(PostgresConnectorConfig.TABLE_WHITELIST, tableWhitelistWithWhitespace);
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "s1")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, tableWhitelistWithWhitespace);
 
         start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
@@ -956,12 +1491,10 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
         SourceRecord record = records.get(0);
         VerifyRecord.isValidInsert(record, PK_FIELD, 1);
-        final String isbn = new String(((Struct) record.value()).getStruct("after").getBytes("aa"));
-        Assertions.assertThat(isbn).isEqualTo("0-393-04002-X");
+        final String isbn = new String(((Struct) record.value()).getStruct("after").getString("aa"));
+        assertThat(isbn).isEqualTo("0-393-04002-X");
 
         TestHelper.assertNoOpenTransactions();
-        stopConnector();
-        assertConnectorNotRunning();
     }
 
     @Test
@@ -1000,13 +1533,14 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 "CREATE SCHEMA s1; " +
                 "CREATE TABLE s1.a (pk SERIAL, aa integer, PRIMARY KEY(pk));";
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
                 .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.a")
                 .with(Heartbeat.HEARTBEAT_INTERVAL, 10)
                 .build();
         start(PostgresConnector.class, config);
         assertConnectorIsRunning();
+        waitForStreamingRunning();
         // Generate empty logical decoding message
         TestHelper.execute(statement);
         waitForAvailableRecords(1000, TimeUnit.MILLISECONDS);
@@ -1021,7 +1555,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         final int recordCount = 10;
         TestHelper.execute(SETUP_TABLES_STMT);
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
                 .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.a")
                 .build();
@@ -1032,7 +1566,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertNoRecordsToConsume();
 
         final Set<String> flushLsn = new HashSet<>();
-        try (final PostgresConnection connection = TestHelper.create()) {
+        try (PostgresConnection connection = TestHelper.create()) {
             flushLsn.add(getConfirmedFlushLsn(connection));
             for (int i = 2; i <= recordCount + 2; i++) {
                 TestHelper.execute(INSERT_STMT);
@@ -1052,22 +1586,19 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         }
         // Theoretically the LSN should change for each record but in reality there can be
         // unfortunate timings so let's suppose the change will happen in 75 % of cases
-        Assertions.assertThat(flushLsn.size()).isGreaterThanOrEqualTo((recordCount * 3) / 4);
+        assertThat(flushLsn.size()).isGreaterThanOrEqualTo((recordCount * 3) / 4);
     }
 
     @Test
-    @FixFor("DBZ-892")
-    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.WAL2JSON, reason = "Only wal2json decoder emits empty events and passes them to streaming source")
-    public void shouldFlushLsnOnEmptyMessage() throws InterruptedException, SQLException {
-        final String DDL_STATEMENT = "CREATE TEMPORARY TABLE xx(id INT);";
-
+    @FixFor("DBZ-2660")
+    public void shouldRegularlyFlushLsnWithTxMonitoring() throws InterruptedException, SQLException {
         final int recordCount = 10;
         TestHelper.execute(SETUP_TABLES_STMT);
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
-                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.a")
-                .with(Heartbeat.HEARTBEAT_INTERVAL, 1_000)
+                .with(PostgresConnectorConfig.PROVIDE_TRANSACTION_METADATA, true)
                 .build();
         start(PostgresConnector.class, config);
         assertConnectorIsRunning();
@@ -1075,23 +1606,35 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // there shouldn't be any snapshot records
         assertNoRecordsToConsume();
 
-        final Set<String> flushLsn = new HashSet<>();
+        final String txTopic = topicName("transaction");
         TestHelper.execute(INSERT_STMT);
+        final SourceRecords firstRecords = consumeDmlRecordsByTopic(1);
+        assertThat(firstRecords.topics().size()).isEqualTo(2);
+        assertThat(firstRecords.recordsForTopic(txTopic).size()).isGreaterThanOrEqualTo(2);
+        assertThat(firstRecords.recordsForTopic(txTopic).get(1).sourceOffset().containsKey("lsn_commit")).isTrue();
+        stopConnector();
+        assertConnectorNotRunning();
 
-        Awaitility.await().atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
-            final SourceRecords actualRecords = consumeRecordsByTopic(1);
-            final List<SourceRecord> topicRecords = actualRecords.recordsForTopic(topicName("s1.a"));
-            return topicRecords != null && topicRecords.size() == 1;
-        });
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+        waitForStreamingRunning("postgres", TestHelper.TEST_SERVER);
+        // there shouldn't be any snapshot records, only potentially transaction messages
+        assertOnlyTransactionRecordsToConsume();
 
-        try (final PostgresConnection connection = TestHelper.create()) {
+        final Set<String> flushLsn = new HashSet<>();
+        try (PostgresConnection connection = TestHelper.create()) {
             flushLsn.add(getConfirmedFlushLsn(connection));
-            for (int i = 0; i < recordCount; i++) {
-                TestHelper.execute(DDL_STATEMENT);
+            for (int i = 2; i <= recordCount + 2; i++) {
+                TestHelper.execute(INSERT_STMT);
 
+                final SourceRecords actualRecords = consumeDmlRecordsByTopic(1);
+                assertThat(actualRecords.topics().size()).isEqualTo(2);
+                assertThat(actualRecords.recordsForTopic(txTopic).size()).isGreaterThanOrEqualTo(2);
+                assertThat(actualRecords.recordsForTopic(topicName("s1.a")).size()).isEqualTo(1);
+
+                // Wait max 2 seconds for LSN change
                 try {
-                    // Wait max 5 seconds for LSN change caused by DDL_STATEMENT
-                    Awaitility.await().atMost(5, TimeUnit.SECONDS).ignoreExceptions().until(() -> flushLsn.add(getConfirmedFlushLsn(connection)));
+                    Awaitility.await().atMost(2, TimeUnit.SECONDS).ignoreExceptions().until(() -> flushLsn.add(getConfirmedFlushLsn(connection)));
                 }
                 catch (ConditionTimeoutException e) {
                     // We do not require all flushes to succeed in time
@@ -1100,59 +1643,57 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         }
         // Theoretically the LSN should change for each record but in reality there can be
         // unfortunate timings so let's suppose the change will happen in 75 % of cases
-        Assertions.assertThat(flushLsn.size()).isGreaterThanOrEqualTo((recordCount * 3) / 4);
+        assertThat(flushLsn.size()).isGreaterThanOrEqualTo((recordCount * 3) / 4);
     }
 
     @Test
-    @FixFor("DBZ-1082")
-    public void shouldAllowForCustomSnapshot() throws InterruptedException {
+    @FixFor("DBZ-2456")
+    public void shouldAllowForSelectiveSnapshot() throws InterruptedException {
         TestHelper.execute(SETUP_TABLES_STMT);
-        Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CLASS, CustomTestSnapshot.class.getName())
-                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
-                .build();
-        start(PostgresConnector.class, config);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.ALWAYS.name())
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, "s1.a")
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+
+        start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
 
+        /* Snapshot must be taken only for the listed tables */
         SourceRecords actualRecords = consumeRecordsByTopic(1);
-
         List<SourceRecord> s1recs = actualRecords.recordsForTopic(topicName("s1.a"));
         List<SourceRecord> s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
+
         assertThat(s1recs.size()).isEqualTo(1);
         assertThat(s2recs).isNull();
+        VerifyRecord.isValidRead(s1recs.get(0), PK_FIELD, 1);
 
-        SourceRecord record = s1recs.get(0);
-        VerifyRecord.isValidRead(record, PK_FIELD, 1);
-
+        /* streaming should work normally */
         TestHelper.execute(INSERT_STMT);
         actualRecords = consumeRecordsByTopic(2);
 
         s1recs = actualRecords.recordsForTopic(topicName("s1.a"));
         s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
+
         assertThat(s1recs.size()).isEqualTo(1);
         assertThat(s2recs.size()).isEqualTo(1);
-        record = s1recs.get(0);
-        VerifyRecord.isValidInsert(record, PK_FIELD, 2);
-        record = s2recs.get(0);
-        VerifyRecord.isValidInsert(record, PK_FIELD, 2);
+        VerifyRecord.isValidInsert(s1recs.get(0), PK_FIELD, 2);
+        VerifyRecord.isValidInsert(s2recs.get(0), PK_FIELD, 2);
+
         stopConnector();
 
-        config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CLASS, CustomTestSnapshot.class.getName())
+        /* start the connector back up and make sure snapshot is being taken */
+        start(PostgresConnector.class, configBuilder
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
-                .build();
-        start(PostgresConnector.class, config);
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_TABLES, "s2.a")
+                .build());
         assertConnectorIsRunning();
-        actualRecords = consumeRecordsByTopic(4);
 
+        actualRecords = consumeRecordsByTopic(2);
         s1recs = actualRecords.recordsForTopic(topicName("s1.a"));
         s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
-        assertThat(s1recs.size()).isEqualTo(2);
+
         assertThat(s2recs.size()).isEqualTo(2);
-        VerifyRecord.isValidRead(s1recs.get(0), PK_FIELD, 1);
-        VerifyRecord.isValidRead(s1recs.get(1), PK_FIELD, 2);
+        assertThat(s1recs).isNull();
         VerifyRecord.isValidRead(s2recs.get(0), PK_FIELD, 1);
         VerifyRecord.isValidRead(s2recs.get(1), PK_FIELD, 2);
     }
@@ -1167,7 +1708,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // the replication slot was created.
         TestHelper.execute(SETUP_TABLES_STMT);
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.EXPORTED.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .build();
         start(PostgresConnector.class, config);
@@ -1201,7 +1742,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         stopConnector();
 
         config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.EXPORTED.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
                 .build();
         start(PostgresConnector.class, config);
@@ -1231,7 +1772,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         TestHelper.execute(INSERT_STMT);
 
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.EXPORTED.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .with(PostgresConnectorConfig.MAX_QUEUE_SIZE, 2)
                 .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 1)
@@ -1251,7 +1792,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 }
                 inserted.set(true);
             }
-        });
+        }, true);
         assertConnectorIsRunning();
 
         // Consume records from the snapshot
@@ -1265,9 +1806,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
         assertThat(s1recs.size()).isEqualTo(2);
         assertThat(s2recs.size()).isEqualTo(2);
-
-        stopConnector();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
@@ -1283,7 +1821,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         TestHelper.execute(INSERT_STMT);
 
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.EXPORTED.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .with(PostgresConnectorConfig.MAX_QUEUE_SIZE, 2)
                 .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 1)
@@ -1303,7 +1841,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 }
                 inserted.set(true);
             }
-        });
+        }, true);
         assertConnectorIsRunning();
 
         // Consume records from the snapshot
@@ -1317,17 +1855,13 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
         assertThat(s1recs.size()).isEqualTo(2);
         assertThat(s2recs.size()).isEqualTo(2);
-
-        stopConnector();
-        TestHelper.dropPublication();
-        TestHelper.dropDefaultReplicationSlot();
     }
 
     @Test
     @FixFor("DBZ-1437")
-    public void shouldPeformSnapshotOnceForInitialOnlySnapshotMode() throws Exception {
+    public void shouldPerformSnapshotOnceForInitialOnlySnapshotMode() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresSnapshotChangeEventSource.class);
 
         TestHelper.dropDefaultReplicationSlot();
 
@@ -1370,8 +1904,11 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         start(PostgresConnector.class, config);
         assertConnectorIsRunning();
 
+        waitForConnectorShutdown("postgres", TestHelper.TEST_SERVER);
+
         // Stop the connector, verify that no snapshot was performed
-        stopConnector(value -> assertThat(logInterceptor.containsMessage("Previous initial snapshot completed, no snapshot will be performed")).isTrue());
+        assertThat(logInterceptor.containsMessage("A previous offset indicating a completed snapshot has been found."))
+                .isTrue();
     }
 
     @Test
@@ -1381,7 +1918,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // Perform an regular snapshot
         Configuration config = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CLASS, CustomStartFromStreamingTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomStartFromStreamingTestSnapshot.class.getName())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .build();
         start(PostgresConnector.class, config);
@@ -1404,7 +1941,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // Perform catch up streaming and resnapshot everything
         config = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CLASS, CustomStartFromStreamingTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomStartFromStreamingTestSnapshot.class.getName())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .build();
         start(PostgresConnector.class, config);
@@ -1436,7 +1973,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-2094")
     public void customSnapshotterSkipsTablesOnRestart() throws Exception {
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(RelationalSnapshotChangeEventSource.class);
 
         TestHelper.execute(SETUP_TABLES_STMT);
         // Perform an regular snapshot using the always snapshotter
@@ -1464,7 +2001,9 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         // Perform a custom partial snapshot
         config = TestHelper.defaultConfig()
                 .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CLASS, CustomPartialTableTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomPartialTableTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.SNAPSHOT_QUERY_MODE, SnapshotQueryMode.CUSTOM)
+                .with(PostgresConnectorConfig.SNAPSHOT_QUERY_MODE_CUSTOM_NAME, CustomPartialTableTestSnapshot.class.getName())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .build();
         start(PostgresConnector.class, config);
@@ -1490,13 +2029,121 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         VerifyRecord.isValidRead(s1recs.get(1), PK_FIELD, 1);
         VerifyRecord.isValidRead(s1recs.get(2), PK_FIELD, 2);
 
+        assertNoRecordsToConsume();
+
         TestHelper.assertNoOpenTransactions();
 
         stopConnector(value -> assertThat(logInterceptor.containsMessage("For table 's2.a' the select statement was not provided, skipping table")).isTrue());
     }
 
+    @Test
+    @FixFor("DBZ-2094")
+    public void customSnapshotterSkipsTablesOnRestartWithConcurrentTx() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(RelationalSnapshotChangeEventSource.class);
+
+        // Testing.Print.enable();
+        TestHelper.execute(SETUP_TABLES_STMT);
+        // Perform an regular snapshot using the always snapshotter
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.ALWAYS.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .build();
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+
+        SourceRecords actualRecords = consumeRecordsByTopic(2);
+        List<SourceRecord> s1recs = actualRecords.recordsForTopic(topicName("s1.a"));
+        List<SourceRecord> s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
+        assertThat(s1recs.size()).isEqualTo(1);
+        assertThat(s2recs.size()).isEqualTo(1);
+        VerifyRecord.isValidRead(s1recs.get(0), PK_FIELD, 1);
+        VerifyRecord.isValidRead(s2recs.get(0), PK_FIELD, 1);
+
+        stopConnector();
+
+        // Insert records while connector is stopped
+        TestHelper.execute(INSERT_STMT);
+
+        // Perform a custom partial snapshot
+        config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomPartialTableTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.SNAPSHOT_QUERY_MODE, SnapshotQueryMode.CUSTOM)
+                .with(PostgresConnectorConfig.SNAPSHOT_QUERY_MODE_CUSTOM_NAME, CustomPartialTableTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .build();
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        Awaitility.await()
+                .alias("Streaming was not started on time")
+                .pollInterval(1000, TimeUnit.MILLISECONDS)
+                .atMost(waitTimeForRecords() * 30, TimeUnit.SECONDS)
+                .ignoreException(InstanceNotFoundException.class)
+                .until(() -> {
+                    // Required due to DBZ-3158, creates empty transaction
+                    TestHelper.create().execute("vacuum full").close();
+                    return (boolean) ManagementFactory.getPlatformMBeanServer()
+                            .getAttribute(getSnapshotMetricsObjectName("postgres", TestHelper.TEST_SERVER), "SnapshotCompleted");
+                });
+
+        // wait for the second streaming phase
+        waitForStreamingRunning();
+
+        actualRecords = consumeRecordsByTopic(4);
+
+        s1recs = actualRecords.recordsForTopic(topicName("s1.a"));
+        s2recs = actualRecords.recordsForTopic(topicName("s2.a"));
+        assertThat(s1recs.size()).isEqualTo(3);
+        assertThat(s2recs.size()).isEqualTo(1);
+
+        // streaming records
+        VerifyRecord.isValidInsert(s1recs.get(0), PK_FIELD, 2);
+        VerifyRecord.isValidInsert(s2recs.get(0), PK_FIELD, 2);
+
+        // snapshot records
+        VerifyRecord.isValidRead(s1recs.get(1), PK_FIELD, 1);
+        VerifyRecord.isValidRead(s1recs.get(2), PK_FIELD, 2);
+
+        assertNoRecordsToConsume();
+
+        TestHelper.assertNoOpenTransactions();
+
+        stopConnector(value -> assertThat(logInterceptor.containsMessage("For table 's2.a' the select statement was not provided, skipping table")).isTrue());
+    }
+
+    @Test
+    @FixFor("DBZ-2608")
+    public void testCustomSnapshotterSnapshotCompleteLifecycleHook() throws Exception {
+        TestHelper.execute("DROP SCHEMA IF EXISTS s1 CASCADE;" +
+                "CREATE SCHEMA s1; " +
+                "CREATE TABLE s1.lifecycle_state (hook text, state text, PRIMARY KEY(hook));");
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomLifecycleHookTestSnapshot.class.getName())
+                .build();
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        waitForSnapshotToBeCompleted();
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            List<String> snapshotCompleteState = connection.queryAndMap(
+                    "SELECT state FROM s1.lifecycle_state WHERE hook like 'snapshotComplete'",
+                    rs -> {
+                        final List<String> ret = new ArrayList<>();
+                        while (rs.next()) {
+                            ret.add(rs.getString(1));
+                        }
+                        return ret;
+                    });
+            assertEquals(Collections.singletonList("complete"), snapshotCompleteState);
+        }
+    }
+
     private String getConfirmedFlushLsn(PostgresConnection connection) throws SQLException {
-        return connection.prepareQueryAndMap(
+        final String lsn = connection.prepareQueryAndMap(
                 "select * from pg_replication_slots where slot_name = ? and database = ? and plugin = ?", statement -> {
                     statement.setString(1, ReplicationConnection.Builder.DEFAULT_SLOT_NAME);
                     statement.setString(2, "postgres");
@@ -1511,6 +2158,8 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                     }
                     return null;
                 });
+        connection.rollback();
+        return lsn;
     }
 
     private void assertFieldAbsent(SourceRecord record, String fieldName) {
@@ -1530,7 +2179,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
         Configuration.Builder configBuilder = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE);
         start(PostgresConnector.class, configBuilder.build());
         assertConnectorIsRunning();
@@ -1583,10 +2232,43 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
+    public void shouldProcessPurgedLogsWhenDownAndSnapshotNeeded() throws InterruptedException {
+
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE);
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        // check the records from the snapshot
+        assertRecordsFromSnapshot(2, 1, 1);
+        // insert and verify 2 new records
+        TestHelper.execute(INSERT_STMT);
+        assertRecordsAfterInsert(2, 2, 2);
+
+        // now stop the connector
+        stopConnector();
+        assertNoRecordsToConsume();
+
+        // start the connector back up and check that a new snapshot has been performed
+        start(PostgresConnector.class, configBuilder
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.WHEN_NEEDED.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE).build());
+
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        assertRecordsFromSnapshot(4, 1, 2, 1, 2);
+    }
+
+    @Test
     @FixFor("DBZ-1242")
     public void testEmptySchemaWarningAfterApplyingFilters() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(RelationalDatabaseSchema.class);
 
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
@@ -1606,7 +2288,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @FixFor("DBZ-1242")
     public void testNoEmptySchemaWarningAfterApplyingFilters() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(RelationalDatabaseSchema.class);
 
         TestHelper.dropAllSchemas();
         TestHelper.executeDDL("postgres_create_tables.ddl");
@@ -1626,7 +2308,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
     public void testCustomPublicationNameUsed() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
 
         TestHelper.dropAllSchemas();
         TestHelper.dropPublication("cdc");
@@ -1658,14 +2340,14 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         SourceRecords records = consumeRecordsByTopic(2);
         records.recordsForTopic("test_server.s1.a").forEach(record -> {
             Struct key = (Struct) record.key();
-            Assertions.assertThat(key.get(PK_FIELD)).isNotNull();
-            Assertions.assertThat(key.get("aa")).isNotNull();
+            assertThat(key.get(PK_FIELD)).isNotNull();
+            assertThat(key.get("aa")).isNotNull();
         });
         records.recordsForTopic("test_server.s2.a").forEach(record -> {
             Struct key = (Struct) record.key();
-            Assertions.assertThat(key.get(PK_FIELD)).isNotNull();
-            Assertions.assertThat(key.get("pk")).isNotNull();
-            Assertions.assertThat(key.schema().field("aa")).isNull();
+            assertThat(key.get(PK_FIELD)).isNotNull();
+            assertThat(key.get("pk")).isNotNull();
+            assertThat(key.schema().field("aa")).isNull();
         });
 
         stopConnector();
@@ -1675,25 +2357,44 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-1519")
     public void shouldNotIssueWarningForNoMonitoredTablesAfterApplyingFilters() throws Exception {
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(RelationalDatabaseSchema.class);
 
         TestHelper.execute(SETUP_TABLES_STMT);
         TestHelper.execute(INSERT_STMT);
-        Configuration config = TestHelper.defaultConfig().with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "s2").build();
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "s2")
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .build();
 
-        // Start connector, verify that it does not log no monitored tables warning
+        // Start connector, verify that it does not log no captured tables warning
         start(PostgresConnector.class, config);
         waitForSnapshotToBeCompleted();
         SourceRecords records = consumeRecordsByTopic(1);
         assertThat(logInterceptor.containsMessage(DatabaseSchema.NO_CAPTURED_DATA_COLLECTIONS_WARNING)).isFalse();
         stopConnector();
 
-        // Restart connector, verify it does not log no monitored tables warning
+        // Restart connector, verify it does not log no captured tables warning
         start(PostgresConnector.class, config);
         waitForStreamingRunning();
         assertThat(logInterceptor.containsMessage(DatabaseSchema.NO_CAPTURED_DATA_COLLECTIONS_WARNING)).isFalse();
+    }
 
-        stopConnector();
+    @Test
+    @FixFor("DBZ-2865")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.DECODERBUFS, reason = "Expected warning message is emitted by protobuf decoder")
+    public void shouldClearDatabaseWarnings() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        TestHelper.execute(SETUP_TABLES_STMT);
+        TestHelper.execute(INSERT_STMT);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.POLL_INTERVAL_MS, "10")
+                .build();
+
+        start(PostgresConnector.class, config);
+        waitForSnapshotToBeCompleted();
+        Awaitility.await().atMost(Duration.ofSeconds(TestHelper.waitTimeForRecords() * 6))
+                .until(() -> logInterceptor.containsMessage("Server-side message: 'Exiting startup callback'"));
     }
 
     @Test
@@ -1707,7 +2408,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         TestHelper.executeDDL("postgres_create_tables.ddl");
 
         Configuration config = TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER)
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, false)
                 .build();
 
@@ -1717,19 +2418,21 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         waitForStreamingRunning();
 
         // Check that publication was created
-        assertTrue(TestHelper.publicationExists());
+        Awaitility.await("Wait until publication is created").atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS)
+                .until(TestHelper::publicationExists);
 
         // Stop connector, drop publication
         stopConnector();
         TestHelper.dropPublication();
 
         // Create log interceptor and restart the connector, should observe publication gets re-created
-        final LogInterceptor interceptor = new LogInterceptor();
+        final LogInterceptor interceptor = new LogInterceptor(PostgresReplicationConnection.class);
         start(PostgresConnector.class, config);
         waitForStreamingRunning();
 
         // Check that publication was created
-        assertTrue(TestHelper.publicationExists());
+        Awaitility.await("Wait until publication is created").atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS)
+                .until(TestHelper::publicationExists);
 
         // Stop Connector and check log messages
         stopConnector(value -> {
@@ -1796,8 +2499,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         if (value.getStruct("after") != null) {
             assertThat(value.getStruct("after").getString("bb")).isEqualTo("*****");
         }
-
-        stopConnector();
     }
 
     @Test
@@ -1877,8 +2578,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         if (value.getStruct("after") != null) {
             assertThat(value.getStruct("after").getString("bb")).isEqualTo("b4d39ab0d198fb4cac8b2f023da74f670bcaf192dcc79b5d6361b7ae6b2fafdf");
         }
-
-        stopConnector();
     }
 
     @Test
@@ -1935,8 +2634,85 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         if (value.getStruct("after") != null) {
             assertThat(value.getStruct("after").getString("bb")).isEqualTo("hel");
         }
+    }
+
+    @Test
+    @FixFor("DBZ-5811")
+    public void shouldAckLsnOnSourceByDefault() throws Exception {
+        TestHelper.dropDefaultReplicationSlot();
+        TestHelper.createDefaultReplicationSlot();
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        final Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME)
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, "false");
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        SourceRecords actualRecords = consumeRecordsByTopic(2);
+        assertThat(actualRecords.allRecordsInOrder().size()).isEqualTo(2);
 
         stopConnector();
+        final SlotState slotAfterSnapshot = getDefaultReplicationSlot();
+
+        TestHelper.execute("INSERT INTO s2.a (aa,bb) VALUES (1, 'test');");
+        TestHelper.execute("UPDATE s2.a SET aa=2, bb='hello' WHERE pk=2;");
+
+        start(PostgresConnector.class, configBuilder.build());
+
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+
+        actualRecords = consumeRecordsByTopic(2);
+        assertThat(actualRecords.allRecordsInOrder().size()).isEqualTo(2);
+        stopConnector();
+
+        final SlotState slotAfterIncremental = getDefaultReplicationSlot();
+        Assert.assertEquals(1, slotAfterIncremental.slotLastFlushedLsn().compareTo(slotAfterSnapshot.slotLastFlushedLsn()));
+    }
+
+    @Test
+    @FixFor("DBZ-5811")
+    public void shouldNotAckLsnOnSource() throws Exception {
+        TestHelper.dropDefaultReplicationSlot();
+        TestHelper.createDefaultReplicationSlot();
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        final SlotState slotAtTheBeginning = getDefaultReplicationSlot();
+
+        final Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SHOULD_FLUSH_LSN_IN_SOURCE_DB, "false")
+                .with(PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME)
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, "false");
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        SourceRecords actualRecords = consumeRecordsByTopic(2);
+        assertThat(actualRecords.allRecordsInOrder().size()).isEqualTo(2);
+
+        stopConnector();
+
+        final SlotState slotAfterSnapshot = getDefaultReplicationSlot();
+        Assert.assertEquals(slotAtTheBeginning.slotLastFlushedLsn(), slotAfterSnapshot.slotLastFlushedLsn());
+
+        TestHelper.execute("INSERT INTO s2.a (aa,bb) VALUES (1, 'test');");
+        TestHelper.execute("UPDATE s2.a SET aa=2, bb='hello' WHERE pk=2;");
+
+        start(PostgresConnector.class, configBuilder.build());
+
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+
+        actualRecords = consumeRecordsByTopic(2);
+        assertThat(actualRecords.allRecordsInOrder().size()).isEqualTo(2);
+        stopConnector();
+
+        final SlotState slotAfterIncremental = getDefaultReplicationSlot();
+        Assert.assertEquals(slotAfterSnapshot.slotLastFlushedLsn(), slotAfterIncremental.slotLastFlushedLsn());
     }
 
     @Test
@@ -1966,7 +2742,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         waitForStreamingRunning();
         TestHelper.execute(INSERT_STMT);
 
-        Testing.Print.enable();
+        // Testing.Print.enable();
 
         final List<SourceRecord> streaming = new ArrayList<SourceRecord>();
         Awaitility.await().atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
@@ -1989,8 +2765,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
             CloudEventsConverterTest.shouldConvertToCloudEventsInJsonWithDataAsAvro(record, true);
             CloudEventsConverterTest.shouldConvertToCloudEventsInAvro(record, "postgresql", "test_server", true);
         }
-
-        stopConnector();
     }
 
     @Test
@@ -1998,7 +2772,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
     public void shouldConfigureSubscriptionsForAllTablesByDefault() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
 
         TestHelper.dropAllSchemas();
         TestHelper.dropPublication("cdc");
@@ -2022,7 +2796,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
     @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
     public void shouldConfigureSubscriptionsFromTableFilters() throws Exception {
         // This captures all logged messages, allowing us to verify log message was written.
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
 
         TestHelper.dropAllSchemas();
         TestHelper.dropPublication("cdc");
@@ -2109,8 +2883,173 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertThat(s2recs).hasSize(1);
 
         VerifyRecord.isValidInsert(s2recs.get(0), PK_FIELD, 2);
+    }
+
+    @Test
+    @FixFor("DBZ-2885")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
+    public void shouldThrowWhenTableFiltersIsEmpty() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresConnectorIT.class);
+
+        TestHelper.dropAllSchemas();
+        TestHelper.dropPublication("cdc");
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PUBLICATION_NAME, "cdc")
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.FILTERED.getValue())
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "nonexistent.table");
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorNotRunning();
+        assertTrue(logInterceptor.containsStacktraceElement("No table filters found for filtered publication cdc"));
+    }
+
+    @Test
+    @FixFor("DBZ-3921")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
+    public void shouldUpdatePublicationForConfiguredTables() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.dropPublication("cdc");
+        TestHelper.executeDDL("postgres_create_tables.ddl");
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        Configuration.Builder initalConfigBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PUBLICATION_NAME, "cdc")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s2.a")
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.FILTERED.getValue());
+
+        start(PostgresConnector.class, initalConfigBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        // snapshot record s2.a
+        consumeRecordsByTopic(1);
+
+        TestHelper.execute(INSERT_STMT);
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+        assertThat(actualRecords.topics()).hasSize(1);
+
+        // there should be no record for s1.a
+        List<SourceRecord> initalS1recs = actualRecords.recordsForTopic(topicName("s1.a"));
+        List<SourceRecord> initalS2recs = actualRecords.recordsForTopic(topicName("s2.a"));
+        assertThat(initalS1recs).isNull();
+        assertThat(initalS2recs).hasSize(1);
+
+        VerifyRecord.isValidInsert(initalS2recs.get(0), PK_FIELD, 2);
 
         stopConnector();
+
+        logger.info("Connector stopped");
+
+        // update configured tables use s1.a and no longer s2.a
+        Configuration.Builder updatedConfigBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PUBLICATION_NAME, "cdc")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.a")
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.FILTERED.getValue());
+
+        start(PostgresConnector.class, updatedConfigBuilder.build());
+        assertConnectorIsRunning();
+
+        // snapshot record s1.a
+        consumeRecordsByTopic(1);
+
+        TestHelper.execute(INSERT_STMT);
+        SourceRecords actualRecordsAfterUpdate = consumeRecordsByTopic(1);
+        assertThat(actualRecordsAfterUpdate.topics()).hasSize(1);
+
+        // there should be no record for s2.a
+        List<SourceRecord> afterUpdateS1recs = actualRecordsAfterUpdate.recordsForTopic(topicName("s1.a"));
+        List<SourceRecord> afterUpdateS2recs = actualRecordsAfterUpdate.recordsForTopic(topicName("s2.a"));
+        assertThat(afterUpdateS1recs).hasSize(1);
+        assertThat(afterUpdateS2recs).isNull();
+    }
+
+    @Test
+    @FixFor("DBZ-5949")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 13, reason = "Publication with 'publish_via_partition_root' parameter is supported only on Postgres 13+")
+    public void shouldUpdateExistingPublicationForConfiguredPartitionedTables() throws Exception {
+        String setupStmt = "DROP SCHEMA IF EXISTS s1 CASCADE;" +
+                "CREATE SCHEMA s1;" +
+                "CREATE TABLE s1.part (pk SERIAL, aa integer, PRIMARY KEY(pk, aa)) PARTITION BY RANGE (aa);" +
+                "CREATE TABLE s1.part1 PARTITION OF s1.part FOR VALUES FROM (0) TO (500);" +
+                "CREATE TABLE s1.part2 PARTITION OF s1.part FOR VALUES FROM (500) TO (1000);" +
+                "INSERT INTO s1.part (pk, aa) VALUES (0, 0);";
+        TestHelper.execute(setupStmt);
+
+        TestHelper.dropPublication("cdc");
+        TestHelper.execute("CREATE PUBLICATION cdc FOR TABLE s1.part WITH (publish_via_partition_root = true);");
+
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PUBLICATION_NAME, "cdc")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.part")
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.FILTERED.getValue());
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        // snapshot record s1.part
+        consumeRecordsByTopic(1);
+
+        String insertStmt = "INSERT INTO s1.part (pk, aa) VALUES (1, 1);" +
+                "INSERT INTO s1.part (pk, aa) VALUES (501, 501);";
+        TestHelper.execute(insertStmt);
+        SourceRecords actualRecords = consumeRecordsByTopic(2);
+        assertThat(actualRecords.topics()).hasSize(1);
+
+        // there should be no records for s1.part1 and s1.part2
+        List<SourceRecord> recs = actualRecords.recordsForTopic(topicName("s1.part"));
+        List<SourceRecord> part1recs = actualRecords.recordsForTopic(topicName("s1.part1"));
+        List<SourceRecord> part2recs = actualRecords.recordsForTopic(topicName("s1.part2"));
+        assertThat(recs).hasSize(2);
+        assertThat(part1recs).isNull();
+        assertThat(part2recs).isNull();
+
+        VerifyRecord.isValidInsert(recs.get(0), PK_FIELD, 1);
+        VerifyRecord.isValidInsert(recs.get(1), PK_FIELD, 501);
+    }
+
+    @Test
+    public void shouldEmitNoEventsForSkippedCreateOperations() throws Exception {
+        // Testing.Print.enable();
+        TestHelper.dropDefaultReplicationSlot();
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                .with(PostgresConnectorConfig.SKIPPED_OPERATIONS, Envelope.Operation.UPDATE.code())
+                .build();
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+        waitForStreamingRunning("postgres", TestHelper.TEST_SERVER);
+        assertNoRecordsToConsume();
+
+        // insert record and update it
+        TestHelper.execute("INSERT into s1.a VALUES(201, 1);");
+        TestHelper.execute("UPDATE s1.a SET aa=201 WHERE pk=201");
+        TestHelper.execute("INSERT into s1.a VALUES(202, 2)");
+        TestHelper.execute("UPDATE s1.a SET aa=202 WHERE pk=202");
+        TestHelper.execute("INSERT into s1.a VALUES(203, 3)");
+        TestHelper.execute("UPDATE s1.a SET aa=203 WHERE pk=203");
+
+        SourceRecords records = consumeRecordsByTopic(3);
+        List<SourceRecord> recordsForTopic = records.recordsForTopic(topicName("s1.a"));
+
+        assertThat(recordsForTopic.size()).isEqualTo(3);
+        assertInsert(recordsForTopic.get(0), PK_FIELD, 201);
+        assertInsert(recordsForTopic.get(1), PK_FIELD, 202);
+        assertInsert(recordsForTopic.get(2), PK_FIELD, 203);
+
+        recordsForTopic.forEach(record -> {
+            Struct value = (Struct) record.value();
+            String op = value.getString("op");
+            assertNotEquals(op, Envelope.Operation.UPDATE.code());
+        });
+
     }
 
     private CompletableFuture<Void> batchInsertRecords(long recordsCount, int batchSize) {
@@ -2132,6 +3071,504 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
             stmtBuilder.delete(0, stmtBuilder.length());
         }).exceptionally(throwable -> {
             throw new RuntimeException(throwable);
+        });
+    }
+
+    private List<Long> getSequence(SourceRecord record) {
+        assertTrue(record.value() instanceof Struct);
+        Struct source = ((Struct) record.value()).getStruct("source");
+        String stringSequence = source.getString("sequence");
+        ObjectMapper mapper = new ObjectMapper();
+        try {
+            // Sequence values are Strings, but they are all Longs for
+            // Postgres sources.
+            return Arrays.asList(mapper.readValue(stringSequence, Long[].class));
+        }
+        catch (IOException e) {
+            throw new IllegalArgumentException(e);
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-2911")
+    public void shouldHaveLastCommitLsn() throws InterruptedException {
+        TestHelper.execute(SETUP_TABLES_STMT);
+        start(PostgresConnector.class, TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PROVIDE_TRANSACTION_METADATA, true)
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
+                .build());
+        assertConnectorIsRunning();
+
+        waitForAvailableRecords(100, TimeUnit.MILLISECONDS);
+        assertNoRecordsToConsume();
+
+        final int n_inserts = 3;
+        for (int i = 0; i < n_inserts; ++i) {
+            TestHelper.execute(INSERT_STMT);
+        }
+
+        List<SourceRecord> records = new ArrayList<>();
+        Awaitility.await("Skip empty transactions and find the data").atMost(Duration.ofSeconds(TestHelper.waitTimeForRecords() * 3)).until(() -> {
+            int n_transactions = 0;
+            while (n_transactions < n_inserts) {
+                final List<SourceRecord> candidate = consumeRecordsByTopic(2).allRecordsInOrder();
+                if (candidate.get(1).topic().contains("transaction")) {
+                    // empty transaction, should be skipped
+                    continue;
+                }
+                records.addAll(candidate);
+                records.addAll(consumeRecordsByTopic(2).allRecordsInOrder());
+                ++n_transactions;
+            }
+            return true;
+        });
+
+        assertEquals(4 * n_inserts, records.size());
+        List<Long> second_transaction_sequence = getSequence(records.get(5));
+        assertEquals(second_transaction_sequence.size(), 2);
+        assertEquals(second_transaction_sequence.get(0), getSequence(records.get(6)).get(0));
+
+        List<Long> third_transaction_sequence = getSequence(records.get(9));
+        assertEquals(third_transaction_sequence.size(), 2);
+        assertEquals(third_transaction_sequence.get(0), getSequence(records.get(10)).get(0));
+
+        // Assert the lsn of the second transaction is less than the third.
+        assertTrue(second_transaction_sequence.get(1) < third_transaction_sequence.get(1));
+
+        // Assert that the sequences of different records in the same transaction differ
+        // (Fix for DBZ-3801)
+        assertNotEquals(getSequence(records.get(5)), getSequence(records.get(6)));
+    }
+
+    @Test
+    @FixFor("DBZ-1042")
+    public void testCreateNumericReplicationSlotName() throws Exception {
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SLOT_NAME, "12345");
+        start(PostgresConnector.class, configBuilder.build());
+        waitForStreamingRunning();
+        assertConnectorIsRunning();
+    }
+
+    @Test
+    @FixFor("DBZ-1042")
+    public void testStreamingWithNumericReplicationSlotName() throws Exception {
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SLOT_NAME, "12345");
+        start(PostgresConnector.class, configBuilder.build());
+        waitForStreamingRunning();
+        assertConnectorIsRunning();
+
+        // insert records
+        TestHelper.execute("INSERT into s1.a VALUES(201, 1)");
+        TestHelper.execute("INSERT into s1.a VALUES(202, 2)");
+        TestHelper.execute("INSERT into s1.a VALUES(203, 3)");
+
+        SourceRecords records = consumeRecordsByTopic(5);
+        List<SourceRecord> recordsForTopic = records.recordsForTopic(topicName("s1.a"));
+
+        assertThat(recordsForTopic.size()).isEqualTo(4);
+        assertInsert(recordsForTopic.get(1), PK_FIELD, 201);
+        assertInsert(recordsForTopic.get(2), PK_FIELD, 202);
+        assertInsert(recordsForTopic.get(3), PK_FIELD, 203);
+    }
+
+    @Test
+    @FixFor("DBZ-5204")
+    public void testShouldNotCloseConnectionFetchingMetadataWithNewDataTypes() throws Exception {
+        TestHelper.execute(CREATE_TABLES_STMT);
+        Configuration config = TestHelper.defaultConfig().build();
+        start(PostgresConnector.class, config);
+        waitForStreamingRunning();
+        assertConnectorIsRunning();
+
+        waitForAvailableRecords(waitTimeForRecords(), TimeUnit.SECONDS);
+
+        TestHelper.execute("CREATE TYPE enum5204 as enum ('V1','V2')");
+        TestHelper.execute("CREATE TABLE s1.c (pk SERIAL, data enum5204, primary key (pk))");
+        TestHelper.execute("INSERT INTO s1.c (pk,data) values (1, 'V1'::enum5204)");
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> recordsForTopic = records.recordsForTopic(topicName("s1.c"));
+
+        assertThat(recordsForTopic).hasSize(1);
+        assertInsert(recordsForTopic.get(0), PK_FIELD, 1);
+        System.out.println(recordsForTopic.get(0));
+    }
+
+    @Test
+    @FixFor("DBZ-5295")
+    public void shouldReselectToastColumnsOnPrimaryKeyChange() throws Exception {
+        TestHelper.execute(CREATE_TABLES_STMT);
+
+        final String toastValue1 = RandomStringUtils.randomAlphanumeric(10000);
+        final String toastValue2 = RandomStringUtils.randomAlphanumeric(10000);
+
+        TestHelper.execute("CREATE TABLE s1.dbz5295 (pk serial, data text, data2 text, primary key(pk));");
+        TestHelper.execute("ALTER TABLE s1.dbz5295 REPLICA IDENTITY FULL;");
+        TestHelper.execute("INSERT INTO s1.dbz5295 (pk,data,data2) values (1,'" + toastValue1 + "','" + toastValue2 + "');");
+
+        Configuration config = TestHelper.defaultConfig().build();
+        start(PostgresConnector.class, config);
+        waitForStreamingRunning();
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> recordsForTopic = records.recordsForTopic(topicName("s1.dbz5295"));
+        assertThat(recordsForTopic).hasSize(1);
+
+        SourceRecord record = recordsForTopic.get(0);
+        Struct after = ((Struct) record.value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.get("pk")).isEqualTo(1);
+        assertThat(after.get("data")).isEqualTo(toastValue1);
+        assertThat(after.get("data2")).isEqualTo(toastValue2);
+
+        TestHelper.execute("UPDATE s1.dbz5295 SET pk = 2 WHERE pk = 1;");
+
+        // The update of the primary key causes a DELETE and a CREATE, mingled with a TOMBSTONE
+        records = consumeRecordsByTopic(3);
+        recordsForTopic = records.recordsForTopic(topicName("s1.dbz5295"));
+        assertThat(recordsForTopic).hasSize(3);
+
+        // First event: DELETE
+        record = recordsForTopic.get(0);
+        VerifyRecord.isValidDelete(record, "pk", 1);
+        after = ((Struct) record.value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after).isNull();
+
+        // Second event: TOMBSTONE
+        record = recordsForTopic.get(1);
+        VerifyRecord.isValidTombstone(record);
+
+        // Third event: CREATE
+        record = recordsForTopic.get(2);
+        VerifyRecord.isValidInsert(record, "pk", 2);
+        after = ((Struct) record.value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.get("pk")).isEqualTo(2);
+        assertThat(after.get("data")).isEqualTo(toastValue1);
+        assertThat(after.get("data2")).isEqualTo(toastValue2);
+    }
+
+    @Test
+    @FixFor("DBZ-5783")
+    public void shouldSuppressLoggingOptionalOfExcludedColumns() throws Exception {
+        TestHelper.execute(CREATE_TABLES_STMT);
+        TestHelper.execute("CREATE TABLE s1.dbz5783 (id SERIAL not null, data text, PRIMARY KEY(id));");
+
+        final LogInterceptor logInterceptor = new LogInterceptor(PgOutputMessageDecoder.class);
+
+        Configuration config = TestHelper.defaultConfig()
+                .with("column.exclude.list", "s1.dbz5783.data")
+                .build();
+        start(PostgresConnector.class, config);
+
+        waitForStreamingRunning("postgres", TestHelper.TEST_SERVER);
+
+        TestHelper.execute("INSERT INTO s1.dbz5783 (data) values ('test');");
+
+        final SourceRecords records = consumeRecordsByTopic(1);
+        final List<SourceRecord> recordsForTopic = records.recordsForTopic(topicName("s1.dbz5783"));
+
+        assertThat(recordsForTopic).hasSize(1);
+        assertThat(recordsForTopic.get(0).valueSchema().field("after").schema().field("data")).isNull();
+        assertThat(logInterceptor.containsMessage("Column 'data' optionality could not be determined, defaulting to true")).isFalse();
+    }
+
+    @Test
+    @FixFor("DBZ-5739")
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 11, reason = "This needs pg_replication_slot_advance which is supported only on Postgres 11+")
+    public void shouldStopConnectorOnSlotRecreation() throws InterruptedException {
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresConnectorIT.class);
+
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL_ONLY.name())
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, "s1.a")
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE);
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+
+        consumeRecordsByTopic(1);
+
+        stopConnector();
+        assertConnectorNotRunning();
+
+        TestHelper.execute(INSERT_STMT);
+
+        configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.name())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                .with(PostgresConnectorConfig.SLOT_SEEK_TO_KNOWN_OFFSET, Boolean.TRUE);
+
+        start(PostgresConnector.class, configBuilder.build());
+        Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 5, TimeUnit.SECONDS)
+                .until(() -> logInterceptor.containsStacktraceElement("Cannot seek to the last known offset "));
+        assertConnectorNotRunning();
+    }
+
+    @Test
+    @FixFor("DBZ-5739")
+    @SkipWhenDatabaseVersion(check = EqualityCheck.GREATER_THAN_OR_EQUAL, major = 11, reason = "This pg_replication_slot_advance is not present Postgres 10")
+    public void shouldSeekToCorrectOffset() throws InterruptedException {
+        final LogInterceptor logInterceptor = new LogInterceptor(PostgresReplicationConnection.class);
+
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.name())
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, "s1.a")
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+
+        consumeRecordsByTopic(1);
+
+        stopConnector();
+        assertConnectorNotRunning();
+
+        TestHelper.execute(INSERT_STMT);
+
+        configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.name())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                .with(PostgresConnectorConfig.SLOT_SEEK_TO_KNOWN_OFFSET, Boolean.TRUE);
+
+        start(PostgresConnector.class, configBuilder.build());
+        consumeRecordsByTopic(1);
+        assertConnectorIsRunning();
+
+        Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 5, TimeUnit.SECONDS)
+                .until(() -> logInterceptor
+                        .containsMessage("Postgres server doesn't support the command pg_replication_slot_advance(). Not seeking to last known offset."));
+    }
+
+    @Test
+    @FixFor("DBZ-5852")
+    public void shouldInvokeSnapshotterAbortedMethod() throws Exception {
+        CountDownLatch latch = new CountDownLatch(1);
+        // insert another set of rows so we can stop at certain point
+        String setupStmt = SETUP_TABLES_STMT + INSERT_STMT + INSERT_STMT + INSERT_STMT;
+        TestHelper.execute(setupStmt);
+
+        TestHelper.execute(
+                "CREATE TABLE s1.lifecycle_state (hook text, state text, PRIMARY KEY(hook));");
+
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 1)
+                .with(PostgresConnectorConfig.MAX_QUEUE_SIZE, 2)
+                .with(PostgresConnectorConfig.MAX_RETRIES, 1)
+                .with(PostgresConnectorConfig.POLL_INTERVAL_MS, 60 * 1000)
+                .with(PostgresConnectorConfig.SNAPSHOT_FETCH_SIZE, 1)
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE_CUSTOM_NAME, CustomLifecycleHookTestSnapshot.class.getName())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+
+        DebeziumEngine.CompletionCallback completionCallback = (success, message, error) -> {
+            if (error != null) {
+                latch.countDown();
+            }
+            else {
+                fail("A controlled exception was expected....");
+            }
+        };
+
+        start(PostgresConnector.class, configBuilder.build(), completionCallback, stopOnPKPredicate(1));
+
+        // wait until we know we've raised the exception at startup AND the engine has been shutdown
+        if (!latch.await(TestHelper.waitTimeForRecords() * 5, TimeUnit.SECONDS)) {
+            fail("did not reach stop condition in time");
+        }
+
+        try (PostgresConnection connection = TestHelper.create()) {
+            List<String> snapshotCompleteState = connection.queryAndMap(
+                    "SELECT state FROM s1.lifecycle_state WHERE hook like 'snapshotComplete'",
+                    rs -> {
+                        final List<String> ret = new ArrayList<>();
+                        while (rs.next()) {
+                            ret.add(rs.getString(1));
+                        }
+                        return ret;
+                    });
+            assertEquals(Collections.singletonList("aborted"), snapshotCompleteState);
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-6249")
+    public void shouldThrowRightExceptionWhenNoCustomSnapshotClassProvided() {
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        AtomicReference<String> message = new AtomicReference<>();
+        AtomicReference<Boolean> status = new AtomicReference<>();
+
+        AtomicBoolean finished = new AtomicBoolean(false);
+
+        Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.CUSTOM.getValue())
+                .build();
+        start(PostgresConnector.class, config, (success, msg, err) -> {
+            error.set(err);
+            message.set(msg);
+            status.set(success);
+            finished.set(true);
+        });
+        Awaitility.await()
+                .pollInterval(100, TimeUnit.MILLISECONDS)
+                .atMost(waitTimeForRecords() * 30L, TimeUnit.SECONDS)
+                .until(() -> finished.get());
+        assertThat(status.get()).isFalse();
+        assertNotNull(error.get());
+        assertThat(error.get()).isInstanceOf(DebeziumException.class);
+        assertThat(message.get()).contains("snapshot.mode.custom.name cannot be empty when snapshot.mode 'custom' is defined");
+    }
+
+    @Test
+    @FixFor("DBZ-5917")
+    public void shouldIncludeTableWithBackSlashInName() throws Exception {
+        String setupStmt = "DROP SCHEMA IF EXISTS s1 CASCADE;" +
+                "CREATE SCHEMA s1;" +
+                "CREATE TABLE s1.\"back\\slash\" (pk SERIAL, aa integer, bb integer, PRIMARY KEY(pk));" +
+                "CREATE TABLE s1.another_table (pk SERIAL, aa integer, bb integer, PRIMARY KEY(pk));" + // we need some excluded table to reproduce the issue
+                "INSERT INTO s1.\"back\\slash\" (aa, bb) VALUES (1, 1);" +
+                "INSERT INTO s1.\"back\\slash\" (aa, bb) VALUES (2, 2);";
+        TestHelper.execute(setupStmt);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.name())
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.back\\\\slash");
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+
+        TestHelper.execute("INSERT INTO s1.\"back\\slash\" (aa, bb) VALUES (3, 3);");
+
+        final int EXPECTED_RECORDS = 3; // 2 from snapshot, 1 from streaming
+        SourceRecords actualRecords = consumeRecordsByTopic(EXPECTED_RECORDS);
+        List<SourceRecord> records = actualRecords.recordsForTopic(topicName("s1.back_slash"));
+        assertThat(records.size()).isEqualTo(EXPECTED_RECORDS);
+        AtomicInteger pkValue = new AtomicInteger(1);
+        records.forEach(record -> {
+            if (pkValue.get() <= 2) {
+                VerifyRecord.isValidRead(record, PK_FIELD, pkValue.getAndIncrement());
+            }
+            else {
+                VerifyRecord.isValidInsert(record, PK_FIELD, pkValue.getAndIncrement());
+            }
+        });
+    }
+
+    @Test
+    @FixFor("DBZ-6076")
+    public void shouldAddNewFieldToSourceInfo() throws InterruptedException {
+        TestHelper.execute(
+                "DROP TABLE IF EXISTS s1.DBZ6076;",
+                "CREATE SCHEMA IF NOT EXISTS s1;",
+                "CREATE TABLE s1.DBZ6076 (pk SERIAL, aa integer, PRIMARY KEY(pk));",
+                "INSERT INTO s1.DBZ6076 (aa) VALUES (1);");
+        start(PostgresConnector.class, TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL.name())
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "s1.DBZ6076")
+                .with(PostgresConnectorConfig.SOURCE_INFO_STRUCT_MAKER, CustomPostgresSourceInfoStructMaker.class.getName())
+                .build());
+        assertConnectorIsRunning();
+
+        // check records from snapshot
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+        actualRecords.forEach(sourceRecord -> {
+            assertTrue(sourceRecord.value() instanceof Struct);
+            Struct source = ((Struct) sourceRecord.value()).getStruct("source");
+            assertEquals("newFieldValue", source.getString("newField"));
+        });
+
+        // insert 2 new records
+        TestHelper.execute("INSERT INTO s1.DBZ6076 (aa) VALUES (2);");
+        // check records from streaming
+        actualRecords = consumeRecordsByTopic(1);
+        actualRecords.forEach(sourceRecord -> {
+            assertTrue(sourceRecord.value() instanceof Struct);
+            Struct source = ((Struct) sourceRecord.value()).getStruct("source");
+            assertEquals("newFieldValue", source.getString("newField"));
+        });
+    }
+
+    @Test
+    @FixFor("DBZ-6076")
+    public void shouldUseDefaultSourceInfoStructMaker() throws InterruptedException {
+        TestHelper.execute(SETUP_TABLES_STMT);
+        start(PostgresConnector.class, TestHelper.defaultConfig()
+                .build());
+        assertConnectorIsRunning();
+
+        // check records from snapshot
+        SourceRecords actualRecords = consumeRecordsByTopic(2);
+        actualRecords.forEach(sourceRecord -> {
+            assertTrue(sourceRecord.value() instanceof Struct);
+            Struct source = ((Struct) sourceRecord.value()).getStruct("source");
+            assertEquals("io.debezium.connector.postgresql.Source", source.schema().name()); // each connector have different schema name.
+            assertNotNull(source.getInt64(SourceInfo.LSN_KEY));
+        });
+
+        // insert 2 new records
+        TestHelper.execute(INSERT_STMT);
+        // check records from streaming
+        actualRecords = consumeRecordsByTopic(2);
+        actualRecords.forEach(sourceRecord -> {
+            assertTrue(sourceRecord.value() instanceof Struct);
+            Struct source = ((Struct) sourceRecord.value()).getStruct("source");
+            assertEquals("io.debezium.connector.postgresql.Source", source.schema().name());
+            assertNotNull(source.getInt64(SourceInfo.LSN_KEY));
+        });
+    }
+
+    @Test
+    public void shouldFailWhenReadOnlyIsNotSupported() {
+
+        PostgresDatabaseVersionResolver databaseVersionResolver = new PostgresDatabaseVersionResolver();
+
+        start(PostgresConnector.class, TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.READ_ONLY_CONNECTION, true)
+                .build(), (success, message, error) -> {
+
+                    if (databaseVersionResolver.getVersion().isLessThan(13, 0, 0)) {
+                        assertThat(error)
+                                .isInstanceOf(DebeziumException.class)
+                                .hasMessage("Read only is not supported for version minor to 13");
+                    }
+                    else {
+                        assertTrue(success);
+                    }
+                });
+    }
+
+    @Test
+    @FixFor("DBZ-8156")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "Publication configuration only valid for PGOUTPUT decoder")
+    public void shouldProduceOnlyLogicalDecodingMessages() throws Exception {
+        TestHelper.dropAllSchemas();
+        TestHelper.dropPublication("cdc");
+
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PUBLICATION_NAME, "cdc")
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.NO_TABLES.getValue());
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForSnapshotToBeCompleted();
+
+        TestHelper.execute("SELECT pg_logical_emit_message(false, 'foo', '{}');");
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+        assertThat(actualRecords.topics()).hasSize(1);
+
+        List<SourceRecord> logicalDecodingMessages = actualRecords.recordsForTopic(topicName("message"));
+        assertThat(logicalDecodingMessages).hasSize(1);
+        logicalDecodingMessages.forEach(sourceRecord -> {
+            assertTrue(sourceRecord.value() instanceof Struct);
+            assertEquals("m", ((Struct) sourceRecord.value()).getString("op"));
+
+            Struct message = ((Struct) sourceRecord.value()).getStruct("message");
+            assertEquals("foo", message.getString("prefix"));
+            assertEquals("{}", new String(message.getBytes("content")));
         });
     }
 
@@ -2176,14 +3613,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         IntStream.range(0, expectedCountPerSchema).forEach(i -> VerifyRecord.isValidInsert(recordsForTopicS2.remove(0), PK_FIELD, pks[i]));
     }
 
-    protected void assertSourceInfoMicrosecondTransactionTimestamp(SourceRecord record, long ts_usec, long tolerance_usec) {
-        assertTrue(record.value() instanceof Struct);
-        Struct source = ((Struct) record.value()).getStruct("source");
-        // 1 minute difference is okay
-        System.out.println("TS_USEC\t" + source.getInt64("ts_usec"));
-        assertTrue(Math.abs(ts_usec - source.getInt64("ts_usec")) < tolerance_usec);
-    }
-
     protected void assertSourceInfoMillisecondTransactionTimestamp(SourceRecord record, long ts_ms, long tolerance_ms) {
         assertTrue(record.value() instanceof Struct);
         Struct source = ((Struct) record.value()).getStruct("source");
@@ -2192,7 +3621,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertTrue(Math.abs(ts_ms - source.getInt64("ts_ms")) < tolerance_ms);
     }
 
-    private <T> void validateField(Config config, Field field, T expectedValue) {
+    private <T> void validateConfigField(Config config, Field field, T expectedValue) {
         assertNoConfigurationErrors(config, field);
         Object actualValue = configValue(config, field.name()).value();
         if (actualValue == null) {
@@ -2221,7 +3650,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertThat(key.importance).isEqualTo(expected.importance());
         assertThat(key.documentation).isEqualTo(expected.description());
         assertThat(key.type).isEqualTo(expected.type());
-        assertThat(key.defaultValue).isEqualTo(expected.defaultValue());
+        assertThat(key.defaultValue).isEqualTo(ConfigDef.parseType(expected.name(), expected.defaultValue(), expected.type()));
         assertThat(key.dependents).isEqualTo(expected.dependents());
         assertThat(key.width).isNotNull();
         assertThat(key.group).isNotNull();

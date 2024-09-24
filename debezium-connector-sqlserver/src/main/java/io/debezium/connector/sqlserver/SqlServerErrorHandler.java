@@ -5,10 +5,13 @@
  */
 package io.debezium.connector.sqlserver;
 
-import com.microsoft.sqlserver.jdbc.SQLServerException;
+import java.io.IOException;
+import java.sql.SQLException;
+import java.util.Set;
 
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.pipeline.ErrorHandler;
+import io.debezium.util.Collect;
 
 /**
  * Error handler for SQL Server.
@@ -17,16 +20,13 @@ import io.debezium.pipeline.ErrorHandler;
  */
 public class SqlServerErrorHandler extends ErrorHandler {
 
-    public SqlServerErrorHandler(String logicalName, ChangeEventQueue<?> queue) {
-        super(SqlServerConnector.class, logicalName, queue);
+    public SqlServerErrorHandler(SqlServerConnectorConfig connectorConfig, ChangeEventQueue<?> queue,
+                                 SqlServerErrorHandler errorHandler) {
+        super(SqlServerConnector.class, connectorConfig, queue, errorHandler);
     }
 
     @Override
-    protected boolean isRetriable(Throwable throwable) {
-        return throwable instanceof SQLServerException
-                && (throwable.getMessage().contains("Connection timed out (Read failed)")
-                        || throwable.getMessage().contains("The connection has been closed.")
-                        || throwable.getMessage().contains("Connection reset")
-                        || throwable.getMessage().contains("SHUTDOWN is in progress"));
+    protected Set<Class<? extends Exception>> communicationExceptions() {
+        return Collect.unmodifiableSet(IOException.class, SQLException.class);
     }
 }

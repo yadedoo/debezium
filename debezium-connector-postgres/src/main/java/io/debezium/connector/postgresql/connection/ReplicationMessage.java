@@ -11,6 +11,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.OffsetTime;
 import java.util.List;
+import java.util.OptionalLong;
 
 import org.postgresql.geometric.PGbox;
 import org.postgresql.geometric.PGcircle;
@@ -18,7 +19,6 @@ import org.postgresql.geometric.PGline;
 import org.postgresql.geometric.PGpath;
 import org.postgresql.geometric.PGpoint;
 import org.postgresql.geometric.PGpolygon;
-import org.postgresql.util.PGmoney;
 
 import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource;
 import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
@@ -39,10 +39,12 @@ public interface ReplicationMessage {
      * Data modification operation executed
      *
      */
-    public enum Operation {
+    enum Operation {
         INSERT,
         UPDATE,
         DELETE,
+        TRUNCATE,
+        MESSAGE,
         BEGIN,
         COMMIT,
         NOOP
@@ -51,18 +53,17 @@ public interface ReplicationMessage {
     /**
      * A representation of column value delivered as a part of replication message
      */
-    public interface Column {
+    interface Column {
         String getName();
 
         PostgresType getType();
 
         /**
-         * Returns additional metadata about this column's type. May only be called
-         * after checking {@link ReplicationMessage#hasMetadata()}.
+         * Returns additional metadata about this column's type.
          */
         ColumnTypeMetadata getTypeMetadata();
 
-        Object getValue(final PgConnectionSupplier connection, boolean includeUnknownDatatypes);
+        Object getValue(PgConnectionSupplier connection, boolean includeUnknownDatatypes);
 
         boolean isOptional();
 
@@ -71,13 +72,13 @@ public interface ReplicationMessage {
         }
     }
 
-    public interface ColumnTypeMetadata {
+    interface ColumnTypeMetadata {
         int getLength();
 
         int getScale();
     }
 
-    public interface ColumnValue<T> {
+    interface ColumnValue<T> {
         T getRawValue();
 
         boolean isNull();
@@ -120,7 +121,7 @@ public interface ReplicationMessage {
 
         Object asLseg();
 
-        PGmoney asMoney();
+        Object asMoney();
 
         PGpath asPath();
 
@@ -138,37 +139,33 @@ public interface ReplicationMessage {
     /**
      * @return A data operation executed
      */
-    public Operation getOperation();
+    Operation getOperation();
 
     /**
      * @return Transaction commit time for this change
      */
-    public Instant getCommitTime();
+    Instant getCommitTime();
 
     /**
-     * @return An id of transaction to which this change belongs
+     * @return An id of transaction to which this change belongs; will not be
+     *         present for non-transactional logical decoding messages for instance
      */
-    public long getTransactionId();
+    OptionalLong getTransactionId();
 
     /**
      * @return Table changed
      */
-    public String getTable();
+    String getTable();
 
     /**
      * @return Set of original values of table columns, null for INSERT
      */
-    public List<Column> getOldTupleList();
+    List<Column> getOldTupleList();
 
     /**
      * @return Set of new values of table columns, null for DELETE
      */
-    public List<Column> getNewTupleList();
-
-    /**
-     * @return true if type metadata are passed as a part of message
-     */
-    boolean hasTypeMetadata();
+    List<Column> getNewTupleList();
 
     /**
      * @return true if this is the last message in the batch of messages with same LSN
@@ -189,70 +186,17 @@ public interface ReplicationMessage {
         return getOperation() == Operation.BEGIN || getOperation() == Operation.COMMIT;
     }
 
-    public class TransactionMessage implements ReplicationMessage {
-
-        private final long transationId;
-        private final Instant commitTime;
-        private final Operation operation;
-
-        public TransactionMessage(Operation operation, long transactionId, Instant commitTime) {
-            this.operation = operation;
-            this.transationId = transactionId;
-            this.commitTime = commitTime;
-        }
-
-        @Override
-        public boolean isLastEventForLsn() {
-            return true;
-        }
-
-        @Override
-        public boolean hasTypeMetadata() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public long getTransactionId() {
-            return transationId;
-        }
-
-        @Override
-        public String getTable() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Operation getOperation() {
-            return operation;
-        }
-
-        @Override
-        public List<Column> getOldTupleList() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public List<Column> getNewTupleList() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Instant getCommitTime() {
-            return commitTime;
-        }
-    };
-
     /**
      * A special message type that is used to replace event filtered already at {@link MessageDecoder}.
      * Enables {@link PostgresStreamingChangeEventSource} to advance LSN forward even in case of such messages.
      */
-    public class NoopMessage implements ReplicationMessage {
+    class NoopMessage implements ReplicationMessage {
 
-        private final long transactionId;
+        private final Long transactionId;
         private final Instant commitTime;
         private final Operation operation;
 
-        public NoopMessage(long transactionId, Instant commitTime) {
+        public NoopMessage(Long transactionId, Instant commitTime) {
             this.operation = Operation.NOOP;
             this.transactionId = transactionId;
             this.commitTime = commitTime;
@@ -264,13 +208,8 @@ public interface ReplicationMessage {
         }
 
         @Override
-        public boolean hasTypeMetadata() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public long getTransactionId() {
-            return transactionId;
+        public OptionalLong getTransactionId() {
+            return transactionId == null ? OptionalLong.empty() : OptionalLong.of(transactionId);
         }
 
         @Override

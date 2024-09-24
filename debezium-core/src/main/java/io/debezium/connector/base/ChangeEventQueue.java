@@ -6,22 +6,30 @@
 package io.debezium.connector.base;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingDeque;
+import java.util.Queue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
-import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.annotation.SingleThreadAccess;
+import io.debezium.annotation.ThreadSafe;
 import io.debezium.config.ConfigurationDefaults;
+import io.debezium.pipeline.Sizeable;
 import io.debezium.time.Temporals;
 import io.debezium.util.Clock;
 import io.debezium.util.LoggingContext;
 import io.debezium.util.LoggingContext.PreviousContext;
-import io.debezium.util.Metronome;
 import io.debezium.util.Threads;
 import io.debezium.util.Threads.Timer;
 
@@ -33,7 +41,7 @@ import io.debezium.util.Threads.Timer;
  * time to sleep (block) between two subsequent poll calls. See the
  * {@link Builder} for the different options. The queue applies back-pressure
  * semantics, i.e. if it holds the maximum number of elements, subsequent calls
- * to {@link #enqueue(Object)} will block until elements have been removed from
+ * to {@link #enqueue(T)} will block until elements have been removed from
  * the queue.
  * <p>
  * If an exception occurs on the producer side, the producer should make that
@@ -45,39 +53,67 @@ import io.debezium.util.Threads.Timer;
  * @author Gunnar Morling
  *
  * @param <T>
- *            the type of events in this queue. Usually {@link SourceRecord} is
+ *            the type of events in this queue. Usually {@link Sizeable} is
  *            used, but in cases where additional metadata must be passed from
- *            producers to the consumer, a custom type wrapping source records
+ *            producers to the consumer, a custom type extending source records
  *            may be used.
  */
-public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
+@ThreadSafe
+public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMetrics {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ChangeEventQueue.class);
 
     private final Duration pollInterval;
     private final int maxBatchSize;
     private final int maxQueueSize;
-    private final BlockingQueue<T> queue;
-    private final Metronome metronome;
+    private final long maxQueueSizeInBytes;
+
+    private final Lock lock;
+    private final Condition isFull;
+    private final Condition isNotFull;
+
+    private final Queue<T> queue;
     private final Supplier<PreviousContext> loggingContextSupplier;
+    private final Queue<Long> sizeInBytesQueue;
+    private long currentQueueSizeInBytes = 0;
+
+    // Sometimes it is necessary to update the record before it is delivered depending on the content
+    // of the following record. In that cases the easiest solution is to provide a single cell buffer
+    // that will allow the modification of it during the explicit flush.
+    // Typical example is MySQL connector when sometimes it is impossible to detect when the record
+    // in process is the last one. In this case the snapshot flags are set during the explicit flush.
+    @SingleThreadAccess("producer thread")
+    private boolean buffering;
+
+    private final AtomicReference<T> bufferedEvent = new AtomicReference<>();
 
     private volatile RuntimeException producerException;
 
-    private ChangeEventQueue(Duration pollInterval, int maxQueueSize, int maxBatchSize, Supplier<LoggingContext.PreviousContext> loggingContextSupplier) {
+    private ChangeEventQueue(Duration pollInterval, int maxQueueSize, int maxBatchSize, Supplier<LoggingContext.PreviousContext> loggingContextSupplier,
+                             long maxQueueSizeInBytes, boolean buffering) {
         this.pollInterval = pollInterval;
         this.maxBatchSize = maxBatchSize;
         this.maxQueueSize = maxQueueSize;
-        this.queue = new LinkedBlockingDeque<>(maxQueueSize);
-        this.metronome = Metronome.sleeper(pollInterval, Clock.SYSTEM);
+
+        this.lock = new ReentrantLock();
+        this.isFull = lock.newCondition();
+        this.isNotFull = lock.newCondition();
+
+        this.queue = new ArrayDeque<>(maxQueueSize);
         this.loggingContextSupplier = loggingContextSupplier;
+        this.sizeInBytesQueue = new ArrayDeque<>(maxQueueSize);
+        this.maxQueueSizeInBytes = maxQueueSizeInBytes;
+        this.buffering = buffering;
     }
 
-    public static class Builder<T> {
+    public static class Builder<T extends Sizeable> {
 
         private Duration pollInterval;
         private int maxQueueSize;
         private int maxBatchSize;
         private Supplier<LoggingContext.PreviousContext> loggingContextSupplier;
+        private long maxQueueSizeInBytes;
+        private boolean buffering;
 
         public Builder<T> pollInterval(Duration pollInterval) {
             this.pollInterval = pollInterval;
@@ -99,8 +135,18 @@ public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
             return this;
         }
 
+        public Builder<T> maxQueueSizeInBytes(long maxQueueSizeInBytes) {
+            this.maxQueueSizeInBytes = maxQueueSizeInBytes;
+            return this;
+        }
+
+        public Builder<T> buffering() {
+            this.buffering = true;
+            return this;
+        }
+
         public ChangeEventQueue<T> build() {
-            return new ChangeEventQueue<T>(pollInterval, maxQueueSize, maxBatchSize, loggingContextSupplier);
+            return new ChangeEventQueue<T>(pollInterval, maxQueueSize, maxBatchSize, loggingContextSupplier, maxQueueSizeInBytes, buffering);
         }
     }
 
@@ -123,12 +169,78 @@ public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
             throw new InterruptedException();
         }
 
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Enqueuing source record '{}'", record);
+        if (buffering) {
+            record = bufferedEvent.getAndSet(record);
+            if (record == null) {
+                // Can happen only for the first coming event
+                return;
+            }
         }
 
-        // this will also raise an InterruptedException if the thread is interrupted while waiting for space in the queue
-        queue.put(record);
+        doEnqueue(record);
+    }
+
+    /**
+     * Applies a function to the event and the buffer and adds it to the queue. Buffer is emptied.
+     *
+     * @param recordModifier
+     * @throws InterruptedException
+     */
+    public void flushBuffer(Function<T, T> recordModifier) throws InterruptedException {
+        assert buffering : "Unsupported for queues with disabled buffering";
+        T record = bufferedEvent.getAndSet(null);
+        if (record != null) {
+            doEnqueue(recordModifier.apply(record));
+        }
+    }
+
+    /**
+     * Disable buffering for the queue
+     */
+    public void disableBuffering() {
+        assert bufferedEvent.get() == null : "Buffer must be flushed";
+        buffering = false;
+    }
+
+    /**
+     * Enable buffering for the queue
+     */
+    public void enableBuffering() {
+        buffering = true;
+    }
+
+    protected void doEnqueue(T record) throws InterruptedException {
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("Enqueuing source record '{}'", record);
+        }
+
+        try {
+            this.lock.lock();
+
+            while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
+                // signal poll() to drain queue
+                this.isFull.signalAll();
+                // queue size or queue sizeInBytes threshold reached, so wait a bit
+                this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+            }
+
+            queue.add(record);
+            // If we pass a positiveLong max.queue.size.in.bytes to enable handling queue size in bytes feature
+            if (maxQueueSizeInBytes > 0) {
+                long messageSize = record.objectSize();
+                sizeInBytesQueue.add(messageSize);
+                currentQueueSizeInBytes += messageSize;
+            }
+
+            // batch size or queue sizeInBytes threshold reached
+            if (queue.size() >= maxBatchSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
+                // signal poll() to start draining queue and do not wait
+                this.isFull.signalAll();
+            }
+        }
+        finally {
+            this.lock.unlock();
+        }
     }
 
     /**
@@ -144,21 +256,58 @@ public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
 
         try {
             LOGGER.debug("polling records...");
-            List<T> records = new ArrayList<>();
             final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
-            while (!timeout.expired() && queue.drainTo(records, maxBatchSize) == 0) {
+            try {
+                this.lock.lock();
+                List<T> records = new ArrayList<>(Math.min(maxBatchSize, queue.size()));
                 throwProducerExceptionIfPresent();
+                while (drainRecords(records, maxBatchSize - records.size()) < maxBatchSize
+                        && (maxQueueSizeInBytes == 0 || currentQueueSizeInBytes < maxQueueSizeInBytes)
+                        && !timeout.expired()) {
+                    throwProducerExceptionIfPresent();
 
-                LOGGER.debug("no records available yet, sleeping a bit...");
-                // no records yet, so wait a bit
-                metronome.pause();
-                LOGGER.debug("checking for more records...");
+                    LOGGER.debug("no records available or batch size not reached yet, sleeping a bit...");
+                    long remainingTimeoutMills = timeout.remaining().toMillis();
+                    if (remainingTimeoutMills > 0) {
+                        // signal doEnqueue() to add more records
+                        this.isNotFull.signalAll();
+                        // no records available or batch size not reached yet, so wait a bit
+                        this.isFull.await(remainingTimeoutMills, TimeUnit.MILLISECONDS);
+                    }
+                    LOGGER.debug("checking for more records...");
+                }
+                // signal doEnqueue() to add more records
+                this.isNotFull.signalAll();
+                return records;
             }
-            return records;
+            finally {
+                this.lock.unlock();
+            }
         }
         finally {
             previousContext.restore();
         }
+    }
+
+    private long drainRecords(List<T> records, int maxElements) {
+        int queueSize = queue.size();
+        if (queueSize == 0) {
+            return records.size();
+        }
+        int recordsToDrain = Math.min(queueSize, maxElements);
+        T[] drainedRecords = (T[]) new Sizeable[recordsToDrain];
+        for (int i = 0; i < recordsToDrain; i++) {
+            T record = queue.poll();
+            drainedRecords[i] = record;
+        }
+        if (maxQueueSizeInBytes > 0) {
+            for (int i = 0; i < recordsToDrain; i++) {
+                Long objectSize = sizeInBytesQueue.poll();
+                currentQueueSizeInBytes -= (objectSize == null ? 0L : objectSize);
+            }
+        }
+        records.addAll(Arrays.asList(drainedRecords));
+        return records.size();
     }
 
     public void producerException(final RuntimeException producerException) {
@@ -178,6 +327,20 @@ public class ChangeEventQueue<T> implements ChangeEventQueueMetrics {
 
     @Override
     public int remainingCapacity() {
-        return queue.remainingCapacity();
+        return maxQueueSize - queue.size();
+    }
+
+    @Override
+    public long maxQueueSizeInBytes() {
+        return maxQueueSizeInBytes;
+    }
+
+    @Override
+    public long currentQueueSizeInBytes() {
+        return currentQueueSizeInBytes;
+    }
+
+    public boolean isBuffered() {
+        return buffering;
     }
 }

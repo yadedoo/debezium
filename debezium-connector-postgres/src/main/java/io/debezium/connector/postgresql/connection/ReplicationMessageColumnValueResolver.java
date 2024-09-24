@@ -5,7 +5,6 @@
  */
 package io.debezium.connector.postgresql.connection;
 
-import org.postgresql.util.PGmoney;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,12 +70,12 @@ public class ReplicationMessageColumnValueResolver {
             case "serial":
             case "serial2":
             case "serial4":
-            case "oid":
                 return value.asInteger();
 
             case "bigint":
             case "bigserial":
             case "int8":
+            case "oid":
                 return value.asLong();
 
             case "real":
@@ -137,8 +136,7 @@ public class ReplicationMessageColumnValueResolver {
             case "lseg":
                 return value.asLseg();
             case "money":
-                final Object v = value.asMoney();
-                return (v instanceof PGmoney) ? ((PGmoney) v).val : v;
+                return value.asMoney();
             case "path":
                 return value.asPath();
             case "point":
@@ -170,6 +168,15 @@ public class ReplicationMessageColumnValueResolver {
             case "int4range":
             case "numrange":
             case "int8range":
+            case "ltree":
+            case "isbn":
+                return value.asString();
+
+            // PgVector types are string encoded values
+            // ValueConverter turns them into the correct types
+            case "vector":
+            case "halfvec":
+            case "sparsevec":
                 return value.asString();
 
             // catch-all for other known/builtin PG types

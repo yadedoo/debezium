@@ -5,13 +5,14 @@
  */
 package io.debezium.connector.postgresql;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.AbstractSourceInfoStructMaker;
 import io.debezium.data.VerifyRecord;
@@ -31,7 +32,7 @@ public class SourceInfoTest {
     public void beforeEach() {
         source = new SourceInfo(new PostgresConnectorConfig(
                 Configuration.create()
-                        .with(PostgresConnectorConfig.SERVER_NAME, "serverX")
+                        .with(CommonConnectorConfig.TOPIC_PREFIX, "serverX")
                         .with(PostgresConnectorConfig.DATABASE_NAME, "serverX")
                         .build()));
         source.update(Conversions.toInstantFromMicros(123_456_789L), new TableId("catalogNameX", "schemaNameX", "tableNameX"));
@@ -50,7 +51,7 @@ public class SourceInfoTest {
     @Test
     @FixFor("DBZ-934")
     public void canHandleNullValues() {
-        source.update(null, null, null, null, null);
+        source.update(null, null, null, null, null, null);
     }
 
     @Test
@@ -68,6 +69,9 @@ public class SourceInfoTest {
                 .field("ts_ms", Schema.INT64_SCHEMA)
                 .field("snapshot", AbstractSourceInfoStructMaker.SNAPSHOT_RECORD_SCHEMA)
                 .field("db", Schema.STRING_SCHEMA)
+                .field("sequence", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("ts_us", Schema.OPTIONAL_INT64_SCHEMA)
+                .field("ts_ns", Schema.OPTIONAL_INT64_SCHEMA)
                 .field("schema", Schema.STRING_SCHEMA)
                 .field("table", Schema.STRING_SCHEMA)
                 .field("txId", Schema.OPTIONAL_INT64_SCHEMA)

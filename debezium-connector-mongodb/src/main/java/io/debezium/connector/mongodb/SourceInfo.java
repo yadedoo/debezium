@@ -6,24 +6,21 @@
 package io.debezium.connector.mongodb;
 
 import java.time.Instant;
-import java.util.Collections;
-import java.util.Map;
-import java.util.OptionalLong;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.Optional;
 
 import org.apache.kafka.connect.data.Struct;
-import org.apache.kafka.connect.errors.ConnectException;
+import org.bson.BsonDocument;
 import org.bson.BsonTimestamp;
-import org.bson.Document;
 import org.bson.types.BSONTimestamp;
+
+import com.mongodb.client.MongoChangeStreamCursor;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 
 import io.debezium.annotation.Immutable;
 import io.debezium.annotation.NotThreadSafe;
 import io.debezium.connector.SnapshotRecord;
 import io.debezium.connector.common.BaseSourceInfo;
-import io.debezium.util.Collect;
+import io.debezium.connector.mongodb.events.BufferingChangeStreamCursor.ResumableChangeStreamEvent;
 
 /**
  * Information about the source of information, which includes the partitions and offsets within those partitions. The MongoDB
@@ -32,7 +29,7 @@ import io.debezium.util.Collect;
  * finds a particular record. As the connector uses the Kafka Connect framework to process each record in a partition, Kafka
  * Connect keeps track of the most recent offset for that partition.
  * <p>
- * The {@link #partition(String) source partition} information identifies the particular MongoDB replica set and the connector's
+ * The {@link #partition() source partition} information identifies the particular MongoDB replica set and the connector's
  * logical name of the MongoDB server. A JSON-like representation of the source partition for a database named "customers" hosted
  * in a MongoDB replica set named "myMongoServer" is as follows:
  *
@@ -44,7 +41,7 @@ import io.debezium.util.Collect;
  * </pre>
  *
  * <p>
- * The {@link #lastOffset(String) source offset} information describes the position within a particular partition of each record.
+ * The {@link #lastOffset() source offset} information describes the position within a particular partition of each record.
  * Since each event in MongoDB's oplog is identified by a {@link BSONTimestamp} that tracks the time and the order of the
  * event for that particular time (e.g., multiple events that occur at the same time will have unique orders), the offset
  * includes the BSONTimetamp representation. (The event's {@code h} field is the unique ID for the operation, so this is also
@@ -66,52 +63,45 @@ import io.debezium.util.Collect;
 @NotThreadSafe
 public final class SourceInfo extends BaseSourceInfo {
 
-    public static final int SCHEMA_VERSION = 1;
-
-    public static final String SERVER_ID_KEY = "server_id";
-    public static final String REPLICA_SET_NAME = "rs";
-    public static final String NAMESPACE = "ns";
+    public static final String RESUME_TOKEN = "resume_token";
     public static final String TIMESTAMP = "sec";
     public static final String ORDER = "ord";
-    public static final String OPERATION_ID = "h";
-    public static final String TX_ORD = "tord";
-    public static final String SESSION_TXN_ID = "stxnid";
     public static final String INITIAL_SYNC = "initsync";
     public static final String COLLECTION = "collection";
+    public static final String LSID = "lsid";
+    public static final String TXN_NUMBER = "txnNumber";
 
+    public static final String WALL_TIME = "wallTime";
+
+    // Change Stream fields
     private static final BsonTimestamp INITIAL_TIMESTAMP = new BsonTimestamp();
-    private static final Position INITIAL_POSITION = new Position(INITIAL_TIMESTAMP, null, 0, null);
-
-    private final ConcurrentMap<String, Map<String, String>> sourcePartitionsByReplicaSetName = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Position> positionsByReplicaSetName = new ConcurrentHashMap<>();
-    private final Set<String> initialSyncReplicaSets = Collections.newSetFromMap(new ConcurrentHashMap<>());
-
-    private String replicaSetName;
+    private static final Position INITIAL_POSITION = new Position(INITIAL_TIMESTAMP, null, null);
+    public boolean initialSnapshot = false;
+    private final MongoDbConnectorConfig connectorConfig;
 
     /**
      * Id of collection the current event applies to. May be {@code null} after noop events,
      * after which the recorded offset may be retrieved but not the source struct.
      */
     private CollectionId collectionId;
-    private Position position;
+    private Position position = null;
+
+    private long wallTime;
 
     @Immutable
     protected static final class Position {
-        private final Long opId;
         private final BsonTimestamp ts;
-        private final long txOrder;
-        private final String sessionTxnId;
+        private final SessionTransactionId changeStreamSessionTxnId;
+        private final String resumeToken;
 
-        public Position(int ts, int order, Long opId, long txOrder, String sessionTxnId) {
-            this(new BsonTimestamp(ts, order), opId, txOrder, sessionTxnId);
+        public Position(BsonTimestamp ts, SessionTransactionId changeStreamsSessionTxnId, String resumeToken) {
+            this.ts = ts;
+            this.changeStreamSessionTxnId = changeStreamsSessionTxnId;
+            this.resumeToken = resumeToken;
         }
 
-        public Position(BsonTimestamp ts, Long opId, long txOrder, String sessionTxnId) {
-            this.ts = ts;
-            this.opId = opId;
-            this.txOrder = txOrder;
-            this.sessionTxnId = sessionTxnId;
-            assert this.ts != null;
+        public static Position changeStreamPosition(BsonTimestamp ts, String resumeToken, SessionTransactionId sessionTxnId) {
+            return new Position(ts, sessionTxnId, resumeToken);
         }
 
         public BsonTimestamp getTimestamp() {
@@ -119,39 +109,43 @@ public final class SourceInfo extends BaseSourceInfo {
         }
 
         public int getTime() {
-            return this.ts.getTime();
+            return (this.ts != null) ? this.ts.getTime() : 0;
         }
 
         public int getInc() {
-            return this.ts.getInc();
+            return (this.ts != null) ? this.ts.getInc() : -1;
         }
 
-        public Long getOperationId() {
-            return this.opId;
+        public SessionTransactionId getChangeStreamSessionTxnId() {
+            return changeStreamSessionTxnId;
         }
 
-        public String getSessionTxnId() {
-            return sessionTxnId;
+        public Optional<String> getResumeToken() {
+            return Optional.ofNullable(resumeToken);
         }
 
-        public OptionalLong getTxOrder() {
-            return txOrder == 0 ? OptionalLong.empty() : OptionalLong.of(txOrder);
+        @Override
+        public String toString() {
+            return "Position [ts=" + ts + ", changeStreamSessionTxnId=" + changeStreamSessionTxnId + ", resumeToken="
+                    + resumeToken + "]";
         }
     }
 
-    /**
-     * Get the replica set name for the given partition.
-     *
-     * @param partition the partition map
-     * @return the replica set name (when the partition is valid), or {@code null} if the partition is null or has no replica
-     *         set name entry
-     */
-    public static String replicaSetNameForPartition(Map<String, ?> partition) {
-        return partition != null ? (String) partition.get(REPLICA_SET_NAME) : null;
+    static final class SessionTransactionId {
+
+        public final String lsid;
+        public final Long txnNumber;
+
+        SessionTransactionId(String lsid, Long txnNumber) {
+            super();
+            this.txnNumber = txnNumber;
+            this.lsid = lsid;
+        }
     }
 
     public SourceInfo(MongoDbConnectorConfig connectorConfig) {
         super(connectorConfig);
+        this.connectorConfig = connectorConfig;
     }
 
     CollectionId collectionId() {
@@ -159,303 +153,134 @@ public final class SourceInfo extends BaseSourceInfo {
     }
 
     Position position() {
-        return position;
+        return position != null ? position : INITIAL_POSITION;
+    }
+
+    public String lastResumeToken() {
+        return position != null ? position.resumeToken : null;
+    }
+
+    public BsonTimestamp lastTimestamp() {
+        return position != null ? position.getTimestamp() : null;
     }
 
     /**
-     * Get the Kafka Connect detail about the source "partition" for the given database in the replica set. If the database is
-     * not known, this method records the new partition.
+     * Get a {@link Struct} representation of the source partition and offset
+     * information where we have last read. The Struct complies with the {@link #schema} for the MongoDB connector.
      *
-     * @param replicaSetName the name of the replica set name for which the partition is to be obtained; may not be null
-     * @return the source partition information; never null
-     */
-    public Map<String, String> partition(String replicaSetName) {
-        if (replicaSetName == null) {
-            throw new IllegalArgumentException("Replica set name may not be null");
-        }
-        return sourcePartitionsByReplicaSetName.computeIfAbsent(replicaSetName, rsName -> {
-            return Collect.hashMapOf(SERVER_ID_KEY, serverName(), REPLICA_SET_NAME, rsName);
-        });
-    }
-
-    /**
-     * Get the MongoDB timestamp of the last offset position for the replica set.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @return the timestamp of the last offset, or the beginning of time if there is none
-     */
-    public BsonTimestamp lastOffsetTimestamp(String replicaSetName) {
-        Position existing = positionsByReplicaSetName.get(replicaSetName);
-        return existing != null ? existing.ts : INITIAL_TIMESTAMP;
-    }
-
-    /**
-     * Get the MongoDB transaction order of the last offset position for the replica set.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @return the tx order of the transaction in progress or 0 in case of non-transactional event
-     */
-    public OptionalLong lastOffsetTxOrder(String replicaSetName) {
-        Position existing = positionsByReplicaSetName.get(replicaSetName);
-        return existing != null ? existing.getTxOrder() : OptionalLong.empty();
-    }
-
-    /**
-     * Get the Kafka Connect detail about the source "offset" for the named database, which describes the given position in the
-     * database where we have last read. If the database has not yet been seen, this records the starting position
-     * for that database. However, if there is a position for the database, the offset representation is returned.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @return a copy of the current offset for the database; never null
-     */
-    public Map<String, ?> lastOffset(String replicaSetName) {
-        Position existing = positionsByReplicaSetName.get(replicaSetName);
-        if (existing == null) {
-            existing = INITIAL_POSITION;
-        }
-        if (isInitialSyncOngoing(replicaSetName)) {
-            return Collect.hashMapOf(TIMESTAMP, Integer.valueOf(existing.getTime()),
-                    ORDER, Integer.valueOf(existing.getInc()),
-                    OPERATION_ID, existing.getOperationId(),
-                    SESSION_TXN_ID, existing.getSessionTxnId(),
-                    INITIAL_SYNC, true);
-        }
-        Map<String, Object> offset = Collect.hashMapOf(TIMESTAMP, Integer.valueOf(existing.getTime()),
-                ORDER, Integer.valueOf(existing.getInc()),
-                OPERATION_ID, existing.getOperationId(),
-                SESSION_TXN_ID, existing.getSessionTxnId());
-
-        existing.getTxOrder().ifPresent(txOrder -> offset.put(TX_ORD, txOrder));
-
-        return offset;
-    }
-
-    /**
-     * Get a {@link Struct} representation of the source {@link #partition(String) partition} and {@link #lastOffset(String)
-     * offset} information where we have last read. The Struct complies with the {@link #schema} for the MongoDB connector.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
      * @param collectionId the event's collection identifier; may not be null
-     * @return the source partition and offset {@link Struct}; never null
      * @see #schema()
      */
-    public void collectionEvent(String replicaSetName, CollectionId collectionId) {
-        onEvent(replicaSetName, collectionId, positionsByReplicaSetName.get(replicaSetName));
+    public void collectionEvent(CollectionId collectionId, long wallTime) {
+        onEvent(collectionId, position, wallTime);
     }
 
-    /**
-     * Get a {@link Struct} representation of the source {@link #partition(String) partition} and {@link #lastOffset(String)
-     * offset} information. The Struct complies with the {@link #schema} for the MongoDB connector.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @param oplogEvent the replica set oplog event that was last read; may be null if the position is the start of
-     *            the oplog
-     * @param masterEvent the replica set oplog event that contains event metadata; same as oplogEvent for non-transactional changes
-     * @param orderInTx order in transaction batch, 0 for non-transactional events
-     * @see #schema()
-     */
-    public void opLogEvent(String replicaSetName, Document oplogEvent, Document masterEvent, long orderInTx) {
+    public void initEvent(MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor) {
+        if (cursor == null) {
+            return;
+        }
+
+        ChangeStreamDocument<BsonDocument> result = cursor.tryNext();
+        if (result == null) {
+            noEvent(cursor);
+        }
+        else {
+            changeStreamEvent(result);
+        }
+    }
+
+    public void noEvent(ResumableChangeStreamEvent<BsonDocument> event) {
+        if (event.hasDocument()) {
+            return;
+        }
+        noEvent(ResumeTokens.toBase64(event.resumeToken));
+    }
+
+    public void noEvent(MongoChangeStreamCursor<?> cursor) {
+        if (cursor == null || cursor.getResumeToken() == null) {
+            return;
+        }
+        noEvent(ResumeTokens.toBase64(cursor.getResumeToken()));
+    }
+
+    public void noEvent(BsonTimestamp timestamp) {
+        if (timestamp == null) {
+            return;
+        }
+        Position position = Position.changeStreamPosition(timestamp, null, null);
+        noEvent(position);
+    }
+
+    private void noEvent(String resumeToken) {
+        if (resumeToken == null) {
+            return;
+        }
+        Position position = Position.changeStreamPosition(null, resumeToken, null);
+        noEvent(position);
+    }
+
+    private void noEvent(Position position) {
+        String namespace = "";
+        long wallTime = 0L;
+        onEvent(CollectionId.parse(namespace), position, wallTime);
+    }
+
+    public void changeStreamEvent(ChangeStreamDocument<BsonDocument> changeStreamEvent) {
         Position position = INITIAL_POSITION;
         String namespace = "";
-        if (oplogEvent != null) {
-            BsonTimestamp ts = extractEventTimestamp(masterEvent);
-            Long opId = masterEvent.getLong("h");
-            String sessionTxnId = extractSessionTxnId(masterEvent);
-            position = new Position(ts, opId, orderInTx, sessionTxnId);
-            namespace = oplogEvent.getString("ns");
+        long wallTime = 0L;
+        if (changeStreamEvent != null) {
+            String resumeToken = ResumeTokens.toBase64(changeStreamEvent.getResumeToken());
+            BsonTimestamp ts = changeStreamEvent.getClusterTime();
+            position = Position.changeStreamPosition(ts, resumeToken, MongoUtils.getChangeStreamSessionTransactionId(changeStreamEvent));
+            namespace = changeStreamEvent.getNamespace().getFullName();
+            if (changeStreamEvent.getWallTime() != null) {
+                wallTime = changeStreamEvent.getWallTime().getValue();
+            }
         }
-        positionsByReplicaSetName.put(replicaSetName, position);
 
-        onEvent(replicaSetName, CollectionId.parse(replicaSetName, namespace), position);
+        onEvent(CollectionId.parse(namespace), position, wallTime);
     }
 
-    /**
-     * Get a {@link Struct} representation of the source {@link #partition(String) partition} and {@link #lastOffset(String)
-     * offset} information. The Struct complies with the {@link #schema} for the MongoDB connector.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @param oplogEvent the replica set oplog event that was last read; may be null if the position is the start of
-     *            the oplog
-     * @see #schema()
-     */
-    public void opLogEvent(String replicaSetName, Document oplogEvent) {
-        opLogEvent(replicaSetName, oplogEvent, oplogEvent, 0);
-    }
-
-    /**
-     * Utility to extract the {@link BsonTimestamp timestamp} value from the event.
-     *
-     * @param oplogEvent the event
-     * @return the timestamp, or null if the event is null or there is no {@code ts} field
-     */
-    protected static BsonTimestamp extractEventTimestamp(Document oplogEvent) {
-        return oplogEvent != null ? oplogEvent.get("ts", BsonTimestamp.class) : null;
-    }
-
-    /**
-     * Utility to extract the {@link String unique transaction id} value from the event.
-     *
-     * @param oplogEvent the event
-     * @return the session transaction id or null
-     */
-    protected static String extractSessionTxnId(Document oplogEvent) {
-        // In MongoDB prior to 4.2, the h field is populated.
-        // For backward compatibility if h is not present or contains a zero value, then proeeed to extract
-        // the session transaction unique identifier value.
-        Long opId = oplogEvent.getLong("h");
-        if (opId == null || opId == 0L) {
-            // For MongoDB 4.2+, the h field no longer has a non-zero value.
-            // In this case, the lsid and the associated txnNumber fields must be extracted and combined to
-            // represent a unique identifier for the individual operation. Therefore, the return value will
-            // carry the same semantics as h did for MongoDB platforms prior to 4.2.
-            return MongoUtil.getOplogSessionTransactionId(oplogEvent);
-        }
-        return null;
-    }
-
-    private void onEvent(String replicaSetName, CollectionId collectionId, Position position) {
-        this.replicaSetName = replicaSetName;
+    private void onEvent(CollectionId collectionId, Position position, long wallTime) {
         this.position = (position == null) ? INITIAL_POSITION : position;
         this.collectionId = collectionId;
+        this.wallTime = wallTime;
     }
 
     /**
      * Determine whether we have previously recorded a MongoDB timestamp for the replica set.
      *
-     * @param replicaSetName the name of the replica set name; may not be null
      * @return {@code true} if an offset has been recorded for the replica set, or {@code false} if the replica set has not
      *         yet been seen
      */
-    public boolean hasOffset(String replicaSetName) {
-        return positionsByReplicaSetName.containsKey(replicaSetName);
+    public boolean hasPosition() {
+        return position != null;
     }
 
-    /**
-     * Set the source offset, as read from Kafka Connect, for the given replica set. This method does nothing if the supplied map
-     * is null.
-     *
-     * @param replicaSetName the name of the replica set name for which the new offset is to be obtained; may not be null
-     * @param sourceOffset the previously-recorded Kafka Connect source offset; may be null
-     * @return {@code true} if the offset was recorded, or {@code false} if the source offset is null
-     * @throws ConnectException if any offset parameter values are missing, invalid, or of the wrong type
-     */
-    public boolean setOffsetFor(String replicaSetName, Map<String, ?> sourceOffset) {
-        if (replicaSetName == null) {
-            throw new IllegalArgumentException("The replica set name may not be null");
-        }
-        if (sourceOffset == null) {
-            return false;
-        }
-        // We have previously recorded at least one offset for this database ...
-        boolean initSync = booleanOffsetValue(sourceOffset, INITIAL_SYNC);
-        if (initSync) {
-            return false;
-        }
-        int time = intOffsetValue(sourceOffset, TIMESTAMP);
-        int order = intOffsetValue(sourceOffset, ORDER);
-        long operationId = longOffsetValue(sourceOffset, OPERATION_ID);
-        long txOrder = longOffsetValue(sourceOffset, TX_ORD);
-        String sessionTxnId = stringOffsetValue(sourceOffset, SESSION_TXN_ID);
-        positionsByReplicaSetName.put(replicaSetName, new Position(time, order, operationId, txOrder, sessionTxnId));
-        return true;
-    }
-
-    /**
-     * Set the source offset, as read from Kafka Connect, for the given replica set. This method does nothing if the supplied map
-     * is null.
-     *
-     * @param partition the partition information; may not be null
-     * @param sourceOffset the previously-recorded Kafka Connect source offset; may be null
-     * @return {@code true} if the offset was recorded, or {@code false} if the source offset is null
-     * @throws ConnectException if any offset parameter values are missing, invalid, or of the wrong type
-     */
-    public boolean setOffsetFor(Map<String, String> partition, Map<String, ?> sourceOffset) {
-        String replicaSetName = partition.get(REPLICA_SET_NAME);
-        return setOffsetFor(replicaSetName, sourceOffset);
+    public void setPosition(Position position) {
+        this.position = position;
     }
 
     /**
      * Record that an initial sync has started for the given replica set.
-     *
-     * @param replicaSetName the name of the replica set; never null
      */
-    public void startInitialSync(String replicaSetName) {
-        initialSyncReplicaSets.add(replicaSetName);
+    public void startInitialSnapshot() {
+        this.initialSnapshot = true;
     }
 
     /**
      * Record that an initial sync has stopped for the given replica set.
-     *
-     * @param replicaSetName the name of the replica set; never null
      */
-    public void stopInitialSync(String replicaSetName) {
-        initialSyncReplicaSets.remove(replicaSetName);
-    }
-
-    /**
-     * Determine if the initial sync for the given replica set is still ongoing.
-     *
-     * @param replicaSetName the name of the replica set; never null
-     * @return {@code true} if the initial sync for this replica is still ongoing or was not completed before restarting, or
-     *         {@code false} if there is currently no initial sync operation for this replica set
-     */
-    public boolean isInitialSyncOngoing(String replicaSetName) {
-        return initialSyncReplicaSets.contains(replicaSetName);
+    public void stopInitialSnapshot() {
+        this.initialSnapshot = false;
     }
 
     /**
      * Returns whether any replica sets are still running a snapshot.
      */
     public boolean isSnapshotRunning() {
-        return !initialSyncReplicaSets.isEmpty();
-    }
-
-    private static int intOffsetValue(Map<String, ?> values, String key) {
-        Object obj = values.get(key);
-        if (obj == null) {
-            return 0;
-        }
-        if (obj instanceof Number) {
-            return ((Number) obj).intValue();
-        }
-        try {
-            return Integer.parseInt(obj.toString());
-        }
-        catch (NumberFormatException e) {
-            throw new ConnectException("Source offset '" + key + "' parameter value " + obj + " could not be converted to an integer");
-        }
-    }
-
-    private static long longOffsetValue(Map<String, ?> values, String key) {
-        Object obj = values.get(key);
-        if (obj == null) {
-            return 0;
-        }
-        if (obj instanceof Number) {
-            return ((Number) obj).longValue();
-        }
-        try {
-            return Long.parseLong(obj.toString());
-        }
-        catch (NumberFormatException e) {
-            throw new ConnectException("Source offset '" + key + "' parameter value " + obj + " could not be converted to a long");
-        }
-    }
-
-    private static String stringOffsetValue(Map<String, ?> values, String key) {
-        Object obj = values.get(key);
-        if (obj == null) {
-            return null;
-        }
-        return (String) obj;
-    }
-
-    private static boolean booleanOffsetValue(Map<String, ?> values, String key) {
-        Object obj = values.get(key);
-        if (obj != null && obj instanceof Boolean) {
-            return ((Boolean) obj).booleanValue();
-        }
-        return false;
+        return initialSnapshot;
     }
 
     @Override
@@ -464,8 +289,9 @@ public final class SourceInfo extends BaseSourceInfo {
     }
 
     @Override
-    protected SnapshotRecord snapshot() {
-        return isInitialSyncOngoing(replicaSetName) ? SnapshotRecord.TRUE : SnapshotRecord.FALSE;
+    public SnapshotRecord snapshot() {
+        return isSnapshotRunning() ? SnapshotRecord.TRUE
+                : snapshotRecord == SnapshotRecord.INCREMENTAL ? SnapshotRecord.INCREMENTAL : SnapshotRecord.FALSE;
     }
 
     @Override
@@ -473,11 +299,12 @@ public final class SourceInfo extends BaseSourceInfo {
         return collectionId != null ? collectionId.dbName() : null;
     }
 
-    String replicaSetName() {
-        return replicaSetName;
+    long wallTime() {
+        return wallTime;
     }
 
-    protected OptionalLong transactionPosition() {
-        return position.getTxOrder();
+    @Override
+    public String toString() {
+        return "SourceInfo [initialSync=" + initialSnapshot + ", collectionId=" + collectionId + ", position=" + position + "]";
     }
 }

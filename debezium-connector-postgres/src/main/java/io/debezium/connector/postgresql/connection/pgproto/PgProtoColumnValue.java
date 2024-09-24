@@ -19,7 +19,6 @@ import java.util.Arrays;
 
 import org.postgresql.geometric.PGpoint;
 import org.postgresql.jdbc.PgArray;
-import org.postgresql.util.PGmoney;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,7 +28,7 @@ import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.AbstractColumnValue;
-import io.debezium.connector.postgresql.connection.wal2json.DateTimeFormat;
+import io.debezium.connector.postgresql.connection.DateTimeFormat;
 import io.debezium.connector.postgresql.proto.PgProto;
 import io.debezium.data.SpecialValueDecimal;
 import io.debezium.time.Conversions;
@@ -42,6 +41,18 @@ import io.debezium.time.Conversions;
 public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PgProtoColumnValue.class);
+
+    /**
+     * A number used by PostgreSQL to define minimum timestamp (inclusive).
+     * Defined in timestamp.h
+     */
+    private static final long TIMESTAMP_MIN = -211813488000000000L;
+
+    /**
+     * A number used by PostgreSQL to define maximum timestamp (exclusive).
+     * Defined in timestamp.h
+     */
+    private static final long TIMESTAMP_MAX = 9223371331200000000L;
 
     private PgProto.DatumMessage value;
 
@@ -182,6 +193,14 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     @Override
     public OffsetDateTime asOffsetDateTimeAtUtc() {
         if (value.hasDatumInt64()) {
+            if (value.getDatumInt64() >= TIMESTAMP_MAX) {
+                LOGGER.trace("Infinite(+) value '{}' arrived from database", value.getDatumInt64());
+                return PostgresValueConverter.POSITIVE_INFINITY_OFFSET_DATE_TIME;
+            }
+            else if (value.getDatumInt64() < TIMESTAMP_MIN) {
+                LOGGER.trace("Infinite(-) value '{}' arrived from database", value.getDatumInt64());
+                return PostgresValueConverter.NEGATIVE_INFINITY_OFFSET_DATE_TIME;
+            }
             return Conversions.toInstantFromMicros(value.getDatumInt64()).atOffset(ZoneOffset.UTC);
         }
 
@@ -192,6 +211,14 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     @Override
     public Instant asInstant() {
         if (value.hasDatumInt64()) {
+            if (value.getDatumInt64() >= TIMESTAMP_MAX) {
+                LOGGER.trace("Infinite(+) value '{}' arrived from database", value.getDatumInt64());
+                return PostgresValueConverter.POSITIVE_INFINITY_INSTANT;
+            }
+            else if (value.getDatumInt64() < TIMESTAMP_MIN) {
+                LOGGER.trace("Infinite(-) value '{}' arrived from database", value.getDatumInt64());
+                return PostgresValueConverter.NEGATIVE_INFINITY_INSTANT;
+            }
             return Conversions.toInstantFromMicros(value.getDatumInt64());
         }
 
@@ -215,9 +242,9 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     }
 
     @Override
-    public PGmoney asMoney() {
+    public BigDecimal asMoney() {
         if (value.hasDatumInt64()) {
-            return new PGmoney(value.getDatumInt64() / 100.0);
+            return new BigDecimal(value.getDatumInt64()).divide(new BigDecimal(100.0));
         }
         return super.asMoney();
     }
@@ -225,7 +252,7 @@ public class PgProtoColumnValue extends AbstractColumnValue<PgProto.DatumMessage
     @Override
     public PGpoint asPoint() {
         if (value.hasDatumPoint()) {
-            PgProto.Point datumPoint = datumPoint = value.getDatumPoint();
+            PgProto.Point datumPoint = value.getDatumPoint();
             return new PGpoint(datumPoint.getX(), datumPoint.getY());
         }
         else if (value.hasDatumBytes()) {

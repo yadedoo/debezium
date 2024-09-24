@@ -12,6 +12,11 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.coordinator.group.GroupCoordinatorConfig;
+import org.apache.kafka.network.SocketServerConfigs;
+import org.apache.kafka.server.config.ServerConfigs;
+import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.server.config.ZkConfigs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,9 +24,9 @@ import io.debezium.annotation.ThreadSafe;
 import io.debezium.util.IoUtil;
 
 import kafka.admin.RackAwareMode;
-import kafka.log.Log;
 import kafka.server.KafkaConfig;
 import kafka.zk.AdminZkClient;
+import scala.Option;
 import scala.collection.JavaConverters;
 
 /**
@@ -97,12 +102,12 @@ public class KafkaServer {
      * @param props the configuration properties; never null
      */
     protected void populateDefaultConfiguration(Properties props) {
-        config.setProperty(KafkaConfig.NumPartitionsProp(), String.valueOf(1));
-        config.setProperty(KafkaConfig.LogFlushIntervalMessagesProp(), String.valueOf(Long.MAX_VALUE));
+        config.setProperty(ServerLogConfigs.NUM_PARTITIONS_CONFIG, String.valueOf(1));
+        config.setProperty(ServerLogConfigs.LOG_FLUSH_INTERVAL_MESSAGES_CONFIG, String.valueOf(Long.MAX_VALUE));
     }
 
     /**
-     * Set a configuration property. Several key properties that deal with Zookeeper, the host name, and the broker ID,
+     * Set a configuration property. Several key properties that deal with Zookeeper, and the broker ID,
      * may not be set via this method and are ignored since they are controlled elsewhere in this instance.
      *
      * @param name the property name; may not be null
@@ -114,9 +119,8 @@ public class KafkaServer {
         if (server != null) {
             throw new IllegalStateException("Unable to change the properties when already running");
         }
-        if (!KafkaConfig.ZkConnectProp().equalsIgnoreCase(name)
-                && !KafkaConfig.BrokerIdProp().equalsIgnoreCase(name)
-                && !KafkaConfig.HostNameProp().equalsIgnoreCase(name)) {
+        if (!ServerConfigs.BROKER_ID_CONFIG.equalsIgnoreCase(name)
+                && !ServerConfigs.BROKER_ID_CONFIG.equalsIgnoreCase(name)) {
             this.config.setProperty(name, value);
         }
         return this;
@@ -160,14 +164,14 @@ public class KafkaServer {
     public Properties config() {
         Properties runningConfig = new Properties();
         runningConfig.putAll(config);
-        runningConfig.setProperty(KafkaConfig.ZkConnectProp(), zookeeperConnection());
-        runningConfig.setProperty(KafkaConfig.BrokerIdProp(), Integer.toString(brokerId));
-        runningConfig.setProperty(KafkaConfig.HostNameProp(), "localhost");
-        runningConfig.setProperty(KafkaConfig.AutoCreateTopicsEnableProp(), String.valueOf(config.getOrDefault(KafkaConfig.AutoCreateTopicsEnableProp(), Boolean.TRUE)));
+        runningConfig.setProperty(ZkConfigs.ZK_CONNECT_CONFIG, zookeeperConnection());
+        runningConfig.setProperty(ServerConfigs.BROKER_ID_CONFIG, Integer.toString(brokerId));
+        runningConfig.setProperty(ServerLogConfigs.AUTO_CREATE_TOPICS_ENABLE_CONFIG,
+                String.valueOf(config.getOrDefault(ServerLogConfigs.AUTO_CREATE_TOPICS_ENABLE_CONFIG, Boolean.TRUE)));
         // 1 partition for the __consumer_offsets_ topic should be enough
-        runningConfig.setProperty(KafkaConfig.OffsetsTopicPartitionsProp(), Integer.toString(1));
+        runningConfig.setProperty(GroupCoordinatorConfig.OFFSETS_TOPIC_PARTITIONS_CONFIG, Integer.toString(1));
         // Disable delay during every re-balance
-        runningConfig.setProperty(KafkaConfig.GroupInitialRebalanceDelayMsProp(), Integer.toString(0));
+        runningConfig.setProperty(GroupCoordinatorConfig.GROUP_INITIAL_REBALANCE_DELAY_MS_CONFIG, Integer.toString(0));
         return runningConfig;
     }
 
@@ -204,22 +208,23 @@ public class KafkaServer {
                 throw new RuntimeException("Unable to create temporary directory", e);
             }
         }
-        config.setProperty(KafkaConfig.LogDirProp(), logsDir.getAbsolutePath());
-        config.setProperty(KafkaConfig.OffsetsTopicReplicationFactorProp(), String.valueOf(1));
+        config.setProperty(ServerLogConfigs.LOG_DIR_CONFIG, logsDir.getAbsolutePath());
+        config.setProperty(GroupCoordinatorConfig.OFFSETS_TOPIC_REPLICATION_FACTOR_CONFIG, String.valueOf(1));
 
         // Determine the port and adjust the configuration ...
         port = desiredPort > 0 ? desiredPort : IoUtil.getAvailablePort();
-        config.setProperty(KafkaConfig.PortProp(), Integer.toString(port));
+        config.setProperty(SocketServerConfigs.LISTENERS_CONFIG, "PLAINTEXT://localhost:" + port);
         // config.setProperty("metadata.broker.list", getConnection());
 
         // Start the server ...
         try {
             LOGGER.debug("Starting Kafka broker {} at {} with storage in {}", brokerId, getConnection(), logsDir.getAbsolutePath());
-            server = new kafka.server.KafkaServer(new KafkaConfig(config), Time.SYSTEM, scala.Option.apply(null),
-                    new scala.collection.mutable.ArraySeq<>(0));
+            final var kafkaConfig = new KafkaConfig(config);
+            server = new kafka.server.KafkaServer(kafkaConfig, Time.SYSTEM, scala.Option.apply(null),
+                    false);
             server.startup();
             LOGGER.info("Started Kafka server {} at {} with storage in {}", brokerId, getConnection(), logsDir.getAbsolutePath());
-            adminZkClient = new AdminZkClient(server.zkClient());
+            adminZkClient = new AdminZkClient(server.zkClient(), Option.apply(kafkaConfig));
             return this;
         }
         catch (RuntimeException e) {
@@ -240,7 +245,8 @@ public class KafkaServer {
                 if (deleteLogs) {
                     // as of 0.10.1.1 if logs are not deleted explicitly, there are open File Handles left on .timeindex files
                     // at least on Windows courtesy of the TimeIndex.scala class
-                    JavaConverters.asJavaIterableConverter(server.logManager().allLogs()).asJava().forEach(Log::delete);
+                    // NOTE: specifically do not use method reference to ensure compatibility between Kafka 3.0.x and 3.1+
+                    JavaConverters.asJavaIterableConverter(server.logManager().allLogs()).asJava().forEach(l -> l.delete());
                 }
                 LOGGER.info("Stopped Kafka server {} at {}", brokerId, getConnection());
             }
@@ -309,7 +315,7 @@ public class KafkaServer {
      */
     public void createTopic(String topic, int numPartitions, int replicationFactor) {
         RackAwareMode rackAwareMode = null;
-        getAdminZkClient().createTopic(topic, numPartitions, replicationFactor, new Properties(), rackAwareMode);
+        getAdminZkClient().createTopic(topic, numPartitions, replicationFactor, new Properties(), rackAwareMode, false);
     }
 
     /**

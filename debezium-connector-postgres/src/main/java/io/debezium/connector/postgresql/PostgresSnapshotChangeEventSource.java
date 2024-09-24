@@ -5,64 +5,79 @@
  */
 package io.debezium.connector.postgresql;
 
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import org.postgresql.util.PGmoney;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.postgresql.PostgresOffsetContext.Loader;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.spi.SlotCreationResult;
 import io.debezium.connector.postgresql.spi.SlotState;
-import io.debezium.connector.postgresql.spi.Snapshotter;
-import io.debezium.data.SpecialValueDecimal;
+import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
-import io.debezium.pipeline.spi.OffsetContext;
-import io.debezium.relational.Column;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables;
 import io.debezium.schema.SchemaChangeEvent;
-import io.debezium.schema.SchemaChangeEvent.SchemaChangeEventType;
+import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 
-public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeEventSource {
+public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeEventSource<PostgresPartition, PostgresOffsetContext> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresSnapshotChangeEventSource.class);
 
     private final PostgresConnectorConfig connectorConfig;
     private final PostgresConnection jdbcConnection;
     private final PostgresSchema schema;
-    private final Snapshotter snapshotter;
     private final SlotCreationResult slotCreatedInfo;
     private final SlotState startingSlotInfo;
 
-    public PostgresSnapshotChangeEventSource(PostgresConnectorConfig connectorConfig, Snapshotter snapshotter, PostgresOffsetContext previousOffset,
-                                             PostgresConnection jdbcConnection, PostgresSchema schema, EventDispatcher<TableId> dispatcher, Clock clock,
-                                             SnapshotProgressListener snapshotProgressListener, SlotCreationResult slotCreatedInfo, SlotState startingSlotInfo) {
-        super(connectorConfig, previousOffset, jdbcConnection, dispatcher, clock, snapshotProgressListener);
+    public PostgresSnapshotChangeEventSource(PostgresConnectorConfig connectorConfig, SnapshotterService snapshotterService,
+                                             MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory, PostgresSchema schema,
+                                             EventDispatcher<PostgresPartition, TableId> dispatcher, Clock clock,
+                                             SnapshotProgressListener<PostgresPartition> snapshotProgressListener, SlotCreationResult slotCreatedInfo,
+                                             SlotState startingSlotInfo, NotificationService<PostgresPartition, PostgresOffsetContext> notificationService) {
+        super(connectorConfig, connectionFactory, schema, dispatcher, clock, snapshotProgressListener, notificationService, snapshotterService);
         this.connectorConfig = connectorConfig;
-        this.jdbcConnection = jdbcConnection;
+        this.jdbcConnection = connectionFactory.mainConnection();
         this.schema = schema;
-        this.snapshotter = snapshotter;
         this.slotCreatedInfo = slotCreatedInfo;
         this.startingSlotInfo = startingSlotInfo;
     }
 
     @Override
-    protected SnapshottingTask getSnapshottingTask(OffsetContext previousOffset) {
-        boolean snapshotSchema = true;
-        boolean snapshotData = true;
+    public SnapshottingTask getSnapshottingTask(PostgresPartition partition, PostgresOffsetContext previousOffset) {
 
-        snapshotData = snapshotter.shouldSnapshot();
+        boolean snapshotSchema = true;
+
+        List<String> dataCollectionsToBeSnapshotted = connectorConfig.getDataCollectionsToBeSnapshotted();
+        Map<DataCollectionId, String> snapshotSelectOverridesByTable = connectorConfig.getSnapshotSelectOverridesByTable();
+
+        boolean offsetExists = previousOffset != null;
+        boolean snapshotInProgress = false;
+
+        if (offsetExists) {
+            snapshotInProgress = previousOffset.isSnapshotRunning();
+        }
+
+        if (offsetExists && !previousOffset.isSnapshotRunning()) {
+            LOGGER.info("A previous offset indicating a completed snapshot has been found.");
+        }
+
+        boolean snapshotData = snapshotterService.getSnapshotter().shouldSnapshotData(offsetExists, snapshotInProgress);
         if (snapshotData) {
             LOGGER.info("According to the connector configuration data will be snapshotted");
         }
@@ -71,66 +86,87 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
             snapshotSchema = false;
         }
 
-        return new SnapshottingTask(snapshotSchema, snapshotData);
+        return new SnapshottingTask(snapshotSchema, snapshotData, dataCollectionsToBeSnapshotted, snapshotSelectOverridesByTable, false);
     }
 
     @Override
-    protected SnapshotContext prepare(ChangeEventSourceContext context) throws Exception {
-        return new PostgresSnapshotContext(connectorConfig.databaseName());
+    protected SnapshotContext<PostgresPartition, PostgresOffsetContext> prepare(PostgresPartition partition, boolean onDemand) {
+        return new PostgresSnapshotContext(partition, connectorConfig.databaseName(), onDemand);
     }
 
     @Override
-    protected void connectionCreated(RelationalSnapshotContext snapshotContext) throws Exception {
+    protected void connectionCreated(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext)
+            throws Exception {
         // If using catch up streaming, the connector opens the transaction that the snapshot will eventually use
         // before the catch up streaming starts. By looking at the current wal location, the transaction can determine
         // where the catch up streaming should stop. The transaction is held open throughout the catch up
         // streaming phase so that the snapshot is performed from a consistent view of the data. Since the isolation
         // level on the transaction used in catch up streaming has already set the isolation level and executed
         // statements, the transaction does not need to get set the level again here.
-        if (snapshotter.shouldStreamEventsStartingFromSnapshot() && startingSlotInfo == null) {
-            setSnapshotTransactionIsolationLevel();
+        if (snapshotterService.getSnapshotter().shouldStreamEventsStartingFromSnapshot() && startingSlotInfo == null) {
+            setSnapshotTransactionIsolationLevel(snapshotContext.onDemand);
         }
         schema.refresh(jdbcConnection, false);
     }
 
     @Override
-    protected Set<TableId> getAllTableIds(RelationalSnapshotContext ctx) throws Exception {
-        return jdbcConnection.readTableNames(ctx.catalogName, null, null, new String[]{ "TABLE" });
+    protected Set<TableId> getAllTableIds(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> ctx)
+            throws Exception {
+        return jdbcConnection.getAllTableIds(ctx.catalogName);
     }
 
     @Override
-    protected void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext)
-            throws SQLException, InterruptedException {
-        final Duration lockTimeout = connectorConfig.snapshotLockTimeout();
-        final Optional<String> lockStatement = snapshotter.snapshotTableLockingStatement(lockTimeout, schema.tableIds());
+    protected void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext,
+                                               RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext)
+            throws SQLException {
 
-        if (lockStatement.isPresent()) {
+        final Duration lockTimeout = connectorConfig.snapshotLockTimeout();
+        final Set<String> capturedTablesNames = snapshotContext.capturedTables.stream().map(TableId::toDoubleQuotedString).collect(Collectors.toSet());
+
+        List<String> tableLockStatements = capturedTablesNames.stream()
+                .map(tableId -> snapshotterService.getSnapshotLock().tableLockingStatement(lockTimeout, tableId))
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(Collectors.toList());
+
+        if (!tableLockStatements.isEmpty()) {
+
+            String lineSeparator = System.lineSeparator();
+            StringBuilder statements = new StringBuilder();
+            statements.append("SET lock_timeout = ").append(lockTimeout.toMillis()).append(";").append(lineSeparator);
+            // we're locking in ACCESS SHARE MODE to avoid concurrent schema changes while we're taking the snapshot
+            // this does not prevent writes to the table, but prevents changes to the table's schema....
+            // DBZ-298 Quoting name in case it has been quoted originally; it doesn't do harm if it hasn't been quoted
+            tableLockStatements.forEach(tableStatement -> statements.append(tableStatement).append(lineSeparator));
+
             LOGGER.info("Waiting a maximum of '{}' seconds for each table lock", lockTimeout.getSeconds());
-            jdbcConnection.executeWithoutCommitting(lockStatement.get());
+            jdbcConnection.executeWithoutCommitting(statements.toString());
             // now that we have the locks, refresh the schema
             schema.refresh(jdbcConnection, false);
         }
-        else {
-            // if we are not in an exported snapshot, this may result in some inconsistencies.
-            // Let the user know
-            if (!snapshotter.exportSnapshot()) {
-                LOGGER.warn("Step 2: skipping locking each table, this may result in inconsistent schema!");
+    }
+
+    @Override
+    protected void releaseSchemaSnapshotLocks(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext)
+            throws SQLException {
+    }
+
+    @Override
+    protected void determineSnapshotOffset(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> ctx, PostgresOffsetContext previousOffset)
+            throws Exception {
+        PostgresOffsetContext offset = ctx.offset;
+        if (offset == null) {
+            if (previousOffset != null && !snapshotterService.getSnapshotter().shouldStreamEventsStartingFromSnapshot()) {
+                // The connect framework, not the connector, manages triggering committing offset state so the
+                // replication stream may not have flushed the latest offset state during catch up streaming.
+                // The previousOffset variable is shared between the catch up streaming and snapshot phases and
+                // has the latest known offset state.
+                offset = PostgresOffsetContext.initialContext(connectorConfig, jdbcConnection, getClock(),
+                        previousOffset.lastCommitLsn(), previousOffset.lastCompletelyProcessedLsn());
             }
             else {
-                LOGGER.info("Step 2: skipping locking each table in an exported snapshot");
+                offset = PostgresOffsetContext.initialContext(connectorConfig, jdbcConnection, getClock());
             }
-        }
-    }
-
-    @Override
-    protected void releaseSchemaSnapshotLocks(RelationalSnapshotContext snapshotContext) throws SQLException {
-    }
-
-    @Override
-    protected void determineSnapshotOffset(RelationalSnapshotContext ctx) throws Exception {
-        PostgresOffsetContext offset = (PostgresOffsetContext) ctx.offset;
-        if (offset == null) {
-            offset = PostgresOffsetContext.initialContext(connectorConfig, jdbcConnection, getClock());
             ctx.offset = offset;
         }
 
@@ -139,11 +175,11 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
 
     private void updateOffsetForSnapshot(PostgresOffsetContext offset) throws SQLException {
         final Lsn xlogStart = getTransactionStartLsn();
-        final long txId = jdbcConnection.currentTransactionId().longValue();
+        final Long txId = jdbcConnection.currentTransactionId();
         LOGGER.info("Read xlogStart at '{}' from transaction '{}'", xlogStart, txId);
 
         // use the old xmin, as we don't want to update it if in xmin recovery
-        offset.updateWalPosition(xlogStart, offset.lastCompletelyProcessedLsn(), clock.currentTime(), txId, null, offset.xmin());
+        offset.updateWalPosition(xlogStart, offset.lastCompletelyProcessedLsn(), clock.currentTime(), txId, offset.xmin(), null, null);
     }
 
     protected void updateOffsetForPreSnapshotCatchUpStreaming(PostgresOffsetContext offset) throws SQLException {
@@ -152,14 +188,14 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     }
 
     private Lsn getTransactionStartLsn() throws SQLException {
-        if (snapshotter.exportSnapshot() && slotCreatedInfo != null) {
+        if (slotCreatedInfo != null) {
             // When performing an exported snapshot based on a newly created replication slot, the txLogStart position
             // should be based on the replication slot snapshot transaction point. This is crucial so that if any
             // SQL operations occur mid-snapshot that they'll be properly captured when streaming begins; otherwise
             // they'll be lost.
             return slotCreatedInfo.startLsn();
         }
-        else if (!snapshotter.shouldStreamEventsStartingFromSnapshot() && startingSlotInfo != null) {
+        else if (!snapshotterService.getSnapshotter().shouldStreamEventsStartingFromSnapshot() && startingSlotInfo != null) {
             // Allow streaming to resume from where streaming stopped last rather than where the current snapshot starts.
             SlotState currentSlotState = jdbcConnection.getReplicationSlotState(connectorConfig.slotName(),
                     connectorConfig.plugin().getPostgresPluginName());
@@ -170,7 +206,10 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     }
 
     @Override
-    protected void readTableStructure(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext) throws SQLException, InterruptedException {
+    protected void readTableStructure(ChangeEventSourceContext sourceContext,
+                                      RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext,
+                                      PostgresOffsetContext offsetContext, SnapshottingTask snapshottingTask)
+            throws SQLException, InterruptedException {
         Set<String> schemas = snapshotContext.capturedTables.stream()
                 .map(TableId::schema)
                 .collect(Collectors.toSet());
@@ -183,12 +222,16 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
                 throw new InterruptedException("Interrupted while reading structure of schema " + schema);
             }
 
-            LOGGER.info("Reading structure of schema '{}'", snapshotContext.catalogName);
+            LOGGER.info("Reading structure of schema '{}' of catalog '{}'", schema, snapshotContext.catalogName);
+
+            Tables.TableFilter tableFilter = snapshottingTask.isOnDemand() ? Tables.TableFilter.fromPredicate(snapshotContext.capturedTables::contains)
+                    : connectorConfig.getTableFilters().dataCollectionFilter();
+
             jdbcConnection.readSchema(
                     snapshotContext.tables,
                     snapshotContext.catalogName,
                     schema,
-                    connectorConfig.getTableFilters().dataCollectionFilter(),
+                    tableFilter,
                     null,
                     false);
         }
@@ -196,100 +239,70 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     }
 
     @Override
-    protected SchemaChangeEvent getCreateTableEvent(RelationalSnapshotContext snapshotContext, Table table) throws SQLException {
-        return new SchemaChangeEvent(
-                snapshotContext.offset.getPartition(),
-                snapshotContext.offset.getOffset(),
-                snapshotContext.offset.getSourceInfo(),
-                snapshotContext.catalogName,
-                table.id().schema(),
-                null,
-                table,
-                SchemaChangeEventType.CREATE,
-                true);
+    protected SchemaChangeEvent getCreateTableEvent(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext,
+                                                    Table table) {
+        return SchemaChangeEvent.ofSnapshotCreate(snapshotContext.partition, snapshotContext.offset, snapshotContext.catalogName, table);
     }
 
     @Override
-    protected void complete(SnapshotContext snapshotContext) {
+    protected void completed(SnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext) {
+        snapshotterService.getSnapshotter().snapshotCompleted();
     }
 
     @Override
-    protected Optional<String> getSnapshotSelect(RelationalSnapshotContext snapshotContext, TableId tableId) {
-        return snapshotter.buildSnapshotQuery(tableId);
+    protected void aborted(SnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext) {
+        snapshotterService.getSnapshotter().snapshotAborted();
     }
 
+    /**
+     * Generate a valid Postgres query string for the specified table and columns
+     *
+     * @param tableId the table to generate a query for
+     * @return a valid query string
+     */
     @Override
-    protected Object getColumnValue(ResultSet rs, int columnIndex, Column column) throws SQLException {
-        try {
-            final ResultSetMetaData metaData = rs.getMetaData();
-            final String columnTypeName = metaData.getColumnTypeName(columnIndex);
-            final PostgresType type = schema.getTypeRegistry().get(columnTypeName);
+    protected Optional<String> getSnapshotSelect(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext,
+                                                 TableId tableId, List<String> columns) {
 
-            LOGGER.trace("Type of incoming data is: {}", type.getOid());
-            LOGGER.trace("ColumnTypeName is: {}", columnTypeName);
-            LOGGER.trace("Type is: {}", type);
-
-            if (type.isArrayType()) {
-                return rs.getArray(columnIndex);
-            }
-
-            switch (type.getOid()) {
-                case PgOid.MONEY:
-                    // TODO author=Horia Chiorean date=14/11/2016 description=workaround for https://github.com/pgjdbc/pgjdbc/issues/100
-                    final String sMoney = rs.getString(columnIndex);
-                    if (sMoney == null) {
-                        return sMoney;
-                    }
-                    if (sMoney.startsWith("-")) {
-                        // PGmoney expects negative values to be provided in the format of "($XXXXX.YY)"
-                        final String negativeMoney = "(" + sMoney.substring(1) + ")";
-                        return new PGmoney(negativeMoney).val;
-                    }
-                    return new PGmoney(sMoney).val;
-                case PgOid.BIT:
-                    return rs.getString(columnIndex);
-                case PgOid.NUMERIC:
-                    final String s = rs.getString(columnIndex);
-                    if (s == null) {
-                        return s;
-                    }
-
-                    Optional<SpecialValueDecimal> value = PostgresValueConverter.toSpecialValue(s);
-                    return value.isPresent() ? value.get() : new SpecialValueDecimal(rs.getBigDecimal(columnIndex));
-                case PgOid.TIME:
-                    // To handle time 24:00:00 supported by TIME columns, read the column as a string.
-                case PgOid.TIMETZ:
-                    // In order to guarantee that we resolve TIMETZ columns with proper microsecond precision,
-                    // read the column as a string instead and then re-parse inside the converter.
-                    return rs.getString(columnIndex);
-                default:
-                    Object x = rs.getObject(columnIndex);
-                    if (x != null) {
-                        LOGGER.trace("rs getobject returns class: {}; rs getObject value is: {}", x.getClass(), x);
-                    }
-                    return x;
-            }
-        }
-        catch (SQLException e) {
-            // not a known type
-            return super.getColumnValue(rs, columnIndex, column);
-        }
+        return snapshotterService.getSnapshotQuery().snapshotQuery(tableId.toDoubleQuotedString(), columns);
     }
 
-    protected void setSnapshotTransactionIsolationLevel() throws SQLException {
+    protected void setSnapshotTransactionIsolationLevel(boolean isOnDemand) throws SQLException {
         LOGGER.info("Setting isolation level");
-        String transactionStatement = snapshotter.snapshotTransactionIsolationLevelStatement(slotCreatedInfo);
+        String transactionStatement = snapshotTransactionIsolationLevelStatement(slotCreatedInfo, isOnDemand);
         LOGGER.info("Opening transaction with statement {}", transactionStatement);
         jdbcConnection.executeWithoutCommitting(transactionStatement);
+    }
+
+    private String snapshotTransactionIsolationLevelStatement(SlotCreationResult newSlotInfo, boolean isOnDemand) {
+
+        if (newSlotInfo != null && !isOnDemand) {
+            /*
+             * For an on demand blocking snapshot we don't need to reuse
+             * the same snapshot from the existing exported transaction as for the initial snapshot.
+             */
+            String snapSet = String.format("SET TRANSACTION SNAPSHOT '%s';", newSlotInfo.snapshotName());
+            return "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; \n" + snapSet;
+        }
+
+        // TODO should this customizable?
+
+        // we're using the same isolation level that pg_backup uses
+        return "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE;";
     }
 
     /**
      * Mutable context which is populated in the course of snapshotting.
      */
-    private static class PostgresSnapshotContext extends RelationalSnapshotContext {
+    private static class PostgresSnapshotContext extends RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> {
 
-        public PostgresSnapshotContext(String catalogName) throws SQLException {
-            super(catalogName);
+        PostgresSnapshotContext(PostgresPartition partition, String catalogName, boolean onDemand) {
+            super(partition, catalogName, onDemand);
         }
+    }
+
+    @Override
+    protected PostgresOffsetContext copyOffset(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext) {
+        return new Loader(connectorConfig).load(snapshotContext.offset.getOffset());
     }
 }

@@ -5,6 +5,7 @@
  */
 package io.debezium.util;
 
+import java.time.Duration;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -23,35 +24,21 @@ public interface ElapsedTimeStrategy {
     boolean hasElapsed();
 
     /**
-     * Create an elapsed time strategy that always is elapsed.
-     *
-     * @return the strategy; never null
-     */
-    public static ElapsedTimeStrategy none() {
-        return () -> true;
-    }
-
-    /**
      * Create a strategy whose time periods are constant.
      *
      * @param clock the clock used to determine if sufficient time has elapsed; may not be null
      * @param delayInMilliseconds the time period; must be positive
      * @return the strategy; never null
      */
-    public static ElapsedTimeStrategy constant(Clock clock, long delayInMilliseconds) {
+    static ElapsedTimeStrategy constant(Clock clock, long delayInMilliseconds) {
         if (delayInMilliseconds <= 0) {
             throw new IllegalArgumentException("Initial delay must be positive");
         }
         return new ElapsedTimeStrategy() {
-            private long nextTimestamp = 0L;
+            private long nextTimestamp = clock.currentTimeInMillis() + delayInMilliseconds;
 
             @Override
             public boolean hasElapsed() {
-                if (nextTimestamp == 0L) {
-                    // Initialize ...
-                    nextTimestamp = clock.currentTimeInMillis() + delayInMilliseconds;
-                    return true;
-                }
                 long current = clock.currentTimeInMillis();
                 if (current >= nextTimestamp) {
                     do {
@@ -66,43 +53,45 @@ public interface ElapsedTimeStrategy {
     }
 
     /**
+     * Create a strategy whose time periods are constant.
+     */
+    static ElapsedTimeStrategy constant(Clock clock, Duration delay) {
+        return constant(clock, delay.toMillis());
+    }
+
+    /**
      * Create a strategy whose time periods start out at one length but then change to another length after another
      * period has elapsed.
      *
      * @param clock the clock used to determine if sufficient time has elapsed; may not be null
-     * @param preStepDelayInMilliseconds the time period before the step has occurred; must be positive
+     * @param preStepDelay the time period before the step has occurred; must be positive
      * @param stepFunction the function that determines if the step time has elapsed; may not be null
-     * @param postStepDelayInMilliseconds the time period before the step has occurred; must be positive
+     * @param postStepDelay the time period before the step has occurred; must be positive
      * @return the strategy; never null
      */
-    public static ElapsedTimeStrategy step(Clock clock,
-                                           long preStepDelayInMilliseconds,
-                                           BooleanSupplier stepFunction,
-                                           long postStepDelayInMilliseconds) {
-        if (preStepDelayInMilliseconds <= 0) {
+    static ElapsedTimeStrategy step(Clock clock,
+                                    Duration preStepDelay,
+                                    BooleanSupplier stepFunction,
+                                    Duration postStepDelay) {
+        long preStepDelayinMillis = preStepDelay.toMillis();
+        long postStepDelayinMillis = postStepDelay.toMillis();
+        if (preStepDelayinMillis <= 0) {
             throw new IllegalArgumentException("Pre-step delay must be positive");
         }
-        if (postStepDelayInMilliseconds <= 0) {
+        if (postStepDelayinMillis <= 0) {
             throw new IllegalArgumentException("Post-step delay must be positive");
         }
         return new ElapsedTimeStrategy() {
-            private long nextTimestamp = 0L;
-            private boolean elapsed = false;
-            private long delta = 0L;
+            private boolean elapsed = stepFunction.getAsBoolean();
+            private long delta = elapsed ? postStepDelayinMillis : preStepDelayinMillis;
+            private long nextTimestamp = clock.currentTimeInMillis() + delta;
 
             @Override
             public boolean hasElapsed() {
-                if (nextTimestamp == 0L) {
-                    // Initialize ...
-                    elapsed = stepFunction.getAsBoolean();
-                    delta = elapsed ? postStepDelayInMilliseconds : preStepDelayInMilliseconds;
-                    nextTimestamp = clock.currentTimeInMillis() + delta;
-                    return true;
-                }
                 if (!elapsed) {
                     elapsed = stepFunction.getAsBoolean();
                     if (elapsed) {
-                        delta = postStepDelayInMilliseconds;
+                        delta = postStepDelayinMillis;
                     }
                 }
                 long current = clock.currentTimeInMillis();
@@ -123,25 +112,20 @@ public interface ElapsedTimeStrategy {
      * Create a strategy whose time periods linearly increase in length.
      *
      * @param clock the clock used to determine if sufficient time has elapsed; may not be null
-     * @param delayInMilliseconds the initial delay; must be positive
+     * @param delay the initial delay; must be positive
      * @return the strategy; never null
      */
-    public static ElapsedTimeStrategy linear(Clock clock, long delayInMilliseconds) {
+    static ElapsedTimeStrategy linear(Clock clock, Duration delay) {
+        long delayInMilliseconds = delay.toMillis();
         if (delayInMilliseconds <= 0) {
             throw new IllegalArgumentException("Initial delay must be positive");
         }
         return new ElapsedTimeStrategy() {
-            private long nextTimestamp = 0L;
+            private long nextTimestamp = clock.currentTimeInMillis() + delayInMilliseconds;
             private long counter = 1L;
 
             @Override
             public boolean hasElapsed() {
-                if (nextTimestamp == 0L) {
-                    // Initialize ...
-                    nextTimestamp = clock.currentTimeInMillis() + delayInMilliseconds;
-                    counter = 1L;
-                    return true;
-                }
                 long current = clock.currentTimeInMillis();
                 if (current >= nextTimestamp) {
                     do {
@@ -161,14 +145,14 @@ public interface ElapsedTimeStrategy {
      * Create a strategy whose time periods increase exponentially.
      *
      * @param clock the clock used to determine if sufficient time has elapsed; may not be null
-     * @param initialDelayInMilliseconds the initial delay; must be positive
-     * @param maxDelayInMilliseconds the maximum delay; must be greater than the initial delay
+     * @param initialDelay the initial delay; must be positive
+     * @param maxDelay the maximum delay; must be greater than the initial delay
      * @return the strategy; never null
      */
-    public static ElapsedTimeStrategy exponential(Clock clock,
-                                                  long initialDelayInMilliseconds,
-                                                  long maxDelayInMilliseconds) {
-        return exponential(clock, initialDelayInMilliseconds, maxDelayInMilliseconds, 2.0);
+    static ElapsedTimeStrategy exponential(Clock clock,
+                                           Duration initialDelay,
+                                           Duration maxDelay) {
+        return exponential(clock, initialDelay.toMillis(), maxDelay.toMillis(), 2.0);
     }
 
     /**
@@ -180,10 +164,10 @@ public interface ElapsedTimeStrategy {
      * @param multiplier the factor by which the delay increases each pass
      * @return the strategy
      */
-    public static ElapsedTimeStrategy exponential(Clock clock,
-                                                  long initialDelayInMilliseconds,
-                                                  long maxDelayInMilliseconds,
-                                                  double multiplier) {
+    static ElapsedTimeStrategy exponential(Clock clock,
+                                           long initialDelayInMilliseconds,
+                                           long maxDelayInMilliseconds,
+                                           double multiplier) {
         if (multiplier <= 1.0) {
             throw new IllegalArgumentException("Multiplier must be greater than 1");
         }
@@ -194,17 +178,11 @@ public interface ElapsedTimeStrategy {
             throw new IllegalArgumentException("Maximum delay must be greater than initial delay");
         }
         return new ElapsedTimeStrategy() {
-            private long nextTimestamp = 0L;
-            private long previousDelay = 0L;
+            private long previousDelay = initialDelayInMilliseconds;
+            private long nextTimestamp = clock.currentTimeInMillis() + initialDelayInMilliseconds;
 
             @Override
             public boolean hasElapsed() {
-                if (nextTimestamp == 0L) {
-                    // Initialize ...
-                    nextTimestamp = clock.currentTimeInMillis() + initialDelayInMilliseconds;
-                    previousDelay = initialDelayInMilliseconds;
-                    return true;
-                }
                 long current = clock.currentTimeInMillis();
                 if (current >= nextTimestamp) {
                     do {

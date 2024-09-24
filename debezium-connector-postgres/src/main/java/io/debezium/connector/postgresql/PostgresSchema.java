@@ -6,9 +6,7 @@
 
 package io.debezium.connector.postgresql;
 
-import java.nio.charset.Charset;
 import java.sql.SQLException;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -21,16 +19,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.NotThreadSafe;
+import io.debezium.connector.postgresql.PostgresConnectorConfig.LogicalDecoder;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
-import io.debezium.connector.postgresql.connection.ServerInfo;
+import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
+import io.debezium.connector.postgresql.connection.ReplicaIdentityInfo;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.RelationalDatabaseSchema;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.Tables;
-import io.debezium.schema.TopicSelector;
-import io.debezium.util.SchemaNameAdjuster;
+import io.debezium.spi.topic.TopicNamingStrategy;
 
 /**
  * Component that records the schema information for the {@link PostgresConnector}. The schema information contains
@@ -46,45 +45,33 @@ public class PostgresSchema extends RelationalDatabaseSchema {
     protected final static String PUBLIC_SCHEMA_NAME = "public";
     private final static Logger LOGGER = LoggerFactory.getLogger(PostgresSchema.class);
 
-    private final TypeRegistry typeRegistry;
-
     private final Map<TableId, List<String>> tableIdToToastableColumns;
     private final Map<Integer, TableId> relationIdToTableId;
     private final boolean readToastableColumns;
+    private final PostgresConnectorConfig connectorConfig;
 
     /**
      * Create a schema component given the supplied {@link PostgresConnectorConfig Postgres connector configuration}.
      *
      * @param config the connector configuration, which is presumed to be valid
      */
-    protected PostgresSchema(PostgresConnectorConfig config, TypeRegistry typeRegistry, Charset databaseCharset,
-                             TopicSelector<TableId> topicSelector) {
-        super(config, topicSelector, new Filters(config).tableFilter(),
-                new Filters(config).columnFilter(), getTableSchemaBuilder(config, typeRegistry, databaseCharset), false,
-                config.getKeyMapper());
+    protected PostgresSchema(PostgresConnectorConfig config, PostgresDefaultValueConverter defaultValueConverter,
+                             TopicNamingStrategy<TableId> topicNamingStrategy, PostgresValueConverter valueConverter) {
+        super(config, topicNamingStrategy, config.getTableFilters().dataCollectionFilter(),
+                config.getColumnFilter(), getTableSchemaBuilder(config, valueConverter, defaultValueConverter),
+                false, config.getKeyMapper());
 
-        this.typeRegistry = typeRegistry;
+        this.connectorConfig = config;
         this.tableIdToToastableColumns = new HashMap<>();
         this.relationIdToTableId = new HashMap<>();
         this.readToastableColumns = config.skipRefreshSchemaOnMissingToastableData();
     }
 
-    private static TableSchemaBuilder getTableSchemaBuilder(PostgresConnectorConfig config, TypeRegistry typeRegistry, Charset databaseCharset) {
-        PostgresValueConverter valueConverter = new PostgresValueConverter(
-                databaseCharset,
-                config.getDecimalMode(),
-                config.getTemporalPrecisionMode(),
-                ZoneOffset.UTC,
-                null,
-                config.includeUnknownDatatypes(),
-                typeRegistry,
-                config.hStoreHandlingMode(),
-                config.binaryHandlingMode(),
-                config.intervalHandlingMode(),
-                config.toastedValuePlaceholder());
-
-        return new TableSchemaBuilder(valueConverter, SchemaNameAdjuster.create(LOGGER), config.customConverterRegistry(), config.getSourceInfoStructMaker().schema(),
-                config.getSanitizeFieldNames());
+    private static TableSchemaBuilder getTableSchemaBuilder(PostgresConnectorConfig config, PostgresValueConverter valueConverter,
+                                                            PostgresDefaultValueConverter defaultValueConverter) {
+        return new TableSchemaBuilder(valueConverter, defaultValueConverter, config.schemaNameAdjuster(),
+                config.customConverterRegistry(), config.getSourceInfoStructMaker().schema(),
+                config.getFieldNamer(), false);
     }
 
     /**
@@ -112,7 +99,7 @@ public class PostgresSchema extends RelationalDatabaseSchema {
 
     private void printReplicaIdentityInfo(PostgresConnection connection, TableId tableId) {
         try {
-            ServerInfo.ReplicaIdentity replicaIdentity = connection.readReplicaIdentityInfo(tableId);
+            ReplicaIdentityInfo replicaIdentity = connection.readReplicaIdentityInfo(tableId);
             LOGGER.info("REPLICA IDENTITY for '{}' is '{}'; {}", tableId, replicaIdentity, replicaIdentity.description());
         }
         catch (SQLException e) {
@@ -126,9 +113,10 @@ public class PostgresSchema extends RelationalDatabaseSchema {
      * @param connection a {@link JdbcConnection} instance, never {@code null}
      * @param tableId the table identifier; may not be null
      * @param refreshToastableColumns refreshes the cache of toastable columns for `tableId`, if {@code true}
+     * @param removeGeneratedColumns removes the GENERATED columns from `tableId`, if {@code true}
      * @throws SQLException if there is a problem refreshing the schema from the database server
      */
-    protected void refresh(PostgresConnection connection, TableId tableId, boolean refreshToastableColumns) throws SQLException {
+    private void refresh(PostgresConnection connection, TableId tableId, boolean refreshToastableColumns, boolean removeGeneratedColumns) throws SQLException {
         Tables temp = new Tables();
         connection.readSchema(temp, null, null, tableId::equals, null, true);
 
@@ -137,8 +125,18 @@ public class PostgresSchema extends RelationalDatabaseSchema {
             LOGGER.warn("Refresh of {} was requested but the table no longer exists", tableId);
             return;
         }
+
+        var updatedTable = temp.forTable(tableId);
+        if (removeGeneratedColumns) {
+            var editor = updatedTable.edit();
+            final var notGeneratedColumns = updatedTable.filterColumns(x -> !x.isGenerated());
+            LOGGER.debug("Removing generated columns, the new column list is '{}'", notGeneratedColumns);
+            editor.setColumns(notGeneratedColumns);
+            updatedTable = editor.create();
+        }
+
         // overwrite (add or update) or views of the tables
-        tables().overwriteTable(temp.forTable(tableId));
+        tables().overwriteTable(updatedTable);
         // refresh the schema
         refreshSchema(tableId);
 
@@ -149,15 +147,26 @@ public class PostgresSchema extends RelationalDatabaseSchema {
     }
 
     /**
-     * Refreshes the schema content with a table constructed externally
+     * Refreshes this schema's content for a particular table
      *
-     * @param table constructed externally - typically from decoder metadata
+     * @param connection a {@link JdbcConnection} instance, never {@code null}
+     * @param tableId the table identifier; may not be null
+     * @param refreshToastableColumns refreshes the cache of toastable columns for `tableId`, if {@code true}
+     * @throws SQLException if there is a problem refreshing the schema from the database server
      */
-    protected void refresh(Table table) {
-        // overwrite (add or update) or views of the tables
-        tables().overwriteTable(table);
-        // and refresh the schema
-        refreshSchema(table.id());
+    protected void refresh(PostgresConnection connection, TableId tableId, boolean refreshToastableColumns) throws SQLException {
+        refresh(connection, tableId, refreshToastableColumns, false);
+    }
+
+    /**
+     * Refreshes this schema's content for a particular table in incremental snapshot
+     *
+     * @param connection a {@link JdbcConnection} instance, never {@code null}
+     * @param tableId the table identifier; may not be null
+     * @throws SQLException if there is a problem refreshing the schema from the database server
+     */
+    protected void refreshFromIncrementalSnapshot(PostgresConnection connection, TableId tableId) throws SQLException {
+        refresh(connection, tableId, true, connectorConfig.plugin() == LogicalDecoder.PGOUTPUT);
     }
 
     protected boolean isFilteredOut(TableId id) {
@@ -172,15 +181,6 @@ public class PostgresSchema extends RelationalDatabaseSchema {
 
         // Create TableSchema instances for any existing table ...
         tableIds().forEach(this::refreshSchema);
-    }
-
-    private void refreshSchema(TableId id) {
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("refreshing DB schema for table '{}'", id);
-        }
-        Table table = tableFor(id);
-
-        buildAndRegisterSchema(table);
     }
 
     private void refreshToastableColumnsMap(PostgresConnection connection, TableId tableId) {
@@ -240,10 +240,6 @@ public class PostgresSchema extends RelationalDatabaseSchema {
             return null;
         }
         return tableId.schema() == null ? new TableId(tableId.catalog(), PUBLIC_SCHEMA_NAME, tableId.table()) : tableId;
-    }
-
-    public TypeRegistry getTypeRegistry() {
-        return typeRegistry;
     }
 
     public List<String> getToastableColumnsForTableId(TableId tableId) {

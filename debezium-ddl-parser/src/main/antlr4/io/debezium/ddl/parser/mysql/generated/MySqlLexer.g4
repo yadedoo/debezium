@@ -4,7 +4,7 @@ The MIT License (MIT).
 Copyright (c) 2015-2017, Ivan Kochurkin (kvanttt@gmail.com), Positive Technologies.
 Copyright (c) 2017, Ivan Khudyashev (IHudyashov@ptsecurity.com)
 
-https://github.com/antlr/grammars-v4/blob/master/mysql/MySqlLexer.g4
+https://github.com/antlr/grammars-v4/blob/master/sql/mysql/Positive-Technologies/MySqlLexer.g4
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -23,7 +23,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
 */
 
 lexer grammar MySqlLexer;
@@ -36,8 +35,8 @@ SPACE:                               [ \t\r\n]+    -> channel(HIDDEN);
 SPEC_MYSQL_COMMENT:                  '/*!' .+? '*/' -> channel(MYSQLCOMMENT);
 COMMENT_INPUT:                       '/*' .*? '*/' -> channel(HIDDEN);
 LINE_COMMENT:                        (
-                                       ('-- ' | '#') ~[\r\n]* ('\r'? '\n' | EOF) 
-                                       | '--' ('\r'? '\n' | EOF) 
+                                       ('--' [ \t]* | '#') ~[\r\n]* ('\r'? '\n' | EOF)
+                                       | '--' ('\r'? '\n' | EOF)
                                      ) -> channel(HIDDEN);
 
 
@@ -50,11 +49,15 @@ ALTER:                               'ALTER';
 ALWAYS:                              'ALWAYS';
 ANALYZE:                             'ANALYZE';
 AND:                                 'AND';
+ARRAY:                               'ARRAY';
 AS:                                  'AS';
 ASC:                                 'ASC';
+ATTRIBUTE:                           'ATTRIBUTE';
+AUTO:                                'AUTO'; // MariaDB-specific
 BEFORE:                              'BEFORE';
 BETWEEN:                             'BETWEEN';
 BOTH:                                'BOTH';
+BUCKETS:                             'BUCKETS';
 BY:                                  'BY';
 CALL:                                'CALL';
 CASCADE:                             'CASCADE';
@@ -72,6 +75,7 @@ CONVERT:                             'CONVERT';
 CREATE:                              'CREATE';
 CROSS:                               'CROSS';
 CURRENT:                             'CURRENT';
+CURRENT_ROLE:                        'CURRENT_ROLE';
 CURRENT_USER:                        'CURRENT_USER';
 CURSOR:                              'CURSOR';
 DATABASE:                            'DATABASE';
@@ -90,8 +94,11 @@ DROP:                                'DROP';
 EACH:                                'EACH';
 ELSE:                                'ELSE';
 ELSEIF:                              'ELSEIF';
+EMPTY:                               'EMPTY';
 ENCLOSED:                            'ENCLOSED';
+ENFORCED:                            'ENFORCED';
 ESCAPED:                             'ESCAPED';
+EXCEPT:                              'EXCEPT';
 EXISTS:                              'EXISTS';
 EXIT:                                'EXIT';
 EXPLAIN:                             'EXPLAIN';
@@ -106,10 +113,13 @@ GENERATED:                           'GENERATED';
 GET:                                 'GET';
 GRANT:                               'GRANT';
 GROUP:                               'GROUP';
+GROUP_REPLICATION_STREAM:            'GROUP_REPLICATION_STREAM';
 HAVING:                              'HAVING';
 HIGH_PRIORITY:                       'HIGH_PRIORITY';
+HISTOGRAM:                           'HISTOGRAM';
 IF:                                  'IF';
 IGNORE:                              'IGNORE';
+IGNORED:                             'IGNORED';
 IN:                                  'IN';
 INDEX:                               'INDEX';
 INFILE:                              'INFILE';
@@ -124,6 +134,7 @@ JOIN:                                'JOIN';
 KEY:                                 'KEY';
 KEYS:                                'KEYS';
 KILL:                                'KILL';
+LATERAL:                             'LATERAL';
 LEADING:                             'LEADING';
 LEAVE:                               'LEAVE';
 LEFT:                                'LEFT';
@@ -133,12 +144,14 @@ LINEAR:                              'LINEAR';
 LINES:                               'LINES';
 LOAD:                                'LOAD';
 LOCK:                                'LOCK';
+LOCKED:                              'LOCKED';
 LOOP:                                'LOOP';
 LOW_PRIORITY:                        'LOW_PRIORITY';
 MASTER_BIND:                         'MASTER_BIND';
 MASTER_SSL_VERIFY_SERVER_CERT:       'MASTER_SSL_VERIFY_SERVER_CERT';
 MATCH:                               'MATCH';
 MAXVALUE:                            'MAXVALUE';
+MINVALUE:                            'MINVALUE';
 MODIFIES:                            'MODIFIES';
 NATURAL:                             'NATURAL';
 NOT:                                 'NOT';
@@ -148,12 +161,14 @@ NUMBER:                              'NUMBER';
 ON:                                  'ON';
 OPTIMIZE:                            'OPTIMIZE';
 OPTION:                              'OPTION';
+OPTIONAL:                            'OPTIONAL';
 OPTIONALLY:                          'OPTIONALLY';
 OR:                                  'OR';
 ORDER:                               'ORDER';
 OUT:                                 'OUT';
 OUTER:                               'OUTER';
 OUTFILE:                             'OUTFILE';
+OVER:                                'OVER';
 PARTITION:                           'PARTITION';
 PRIMARY:                             'PRIMARY';
 PROCEDURE:                           'PROCEDURE';
@@ -170,6 +185,7 @@ REPLACE:                             'REPLACE';
 REQUIRE:                             'REQUIRE';
 RESIGNAL:                            'RESIGNAL';
 RESTRICT:                            'RESTRICT';
+RETAIN:                              'RETAIN';
 RETURN:                              'RETURN';
 REVOKE:                              'REVOKE';
 RIGHT:                               'RIGHT';
@@ -181,6 +197,8 @@ SET:                                 'SET';
 SEPARATOR:                           'SEPARATOR';
 SHOW:                                'SHOW';
 SIGNAL:                              'SIGNAL';
+SKIP_:                               'SKIP';
+SKIP_QUERY_REWRITE:                  'SKIP_QUERY_REWRITE';
 SPATIAL:                             'SPATIAL';
 SQL:                                 'SQL';
 SQLEXCEPTION:                        'SQLEXCEPTION';
@@ -192,7 +210,9 @@ SQL_SMALL_RESULT:                    'SQL_SMALL_RESULT';
 SSL:                                 'SSL';
 STACKED:                             'STACKED';
 STARTING:                            'STARTING';
+STATEMENT:                           'STATEMENT';
 STRAIGHT_JOIN:                       'STRAIGHT_JOIN';
+SYSTEM_TIME:                         'SYSTEM_TIME'; // MariaDB-specific
 TABLE:                               'TABLE';
 TERMINATED:                          'TERMINATED';
 THEN:                                'THEN';
@@ -217,7 +237,6 @@ WITH:                                'WITH';
 WRITE:                               'WRITE';
 XOR:                                 'XOR';
 ZEROFILL:                            'ZEROFILL';
-
 
 // DATA TYPE Keywords
 
@@ -265,7 +284,7 @@ LONGTEXT:                            'LONGTEXT';
 ENUM:                                'ENUM';
 VARYING:                             'VARYING';
 SERIAL:                              'SERIAL';
-
+VECTOR:                              'VECTOR';
 
 // Interval type Keywords
 
@@ -275,15 +294,48 @@ DAY_MINUTE:                          'DAY_MINUTE';
 DAY_SECOND:                          'DAY_SECOND';
 HOUR_MINUTE:                         'HOUR_MINUTE';
 HOUR_SECOND:                         'HOUR_SECOND';
-MINUTE_SECOND:                       'MINUTE_SECOND'; 
+MINUTE_SECOND:                       'MINUTE_SECOND';
 SECOND_MICROSECOND:                  'SECOND_MICROSECOND';
 MINUTE_MICROSECOND:                  'MINUTE_MICROSECOND';
 HOUR_MICROSECOND:                    'HOUR_MICROSECOND';
 DAY_MICROSECOND:                     'DAY_MICROSECOND';
 
 // JSON keywords
-JSON_VALID:                          'JSON_VALID';
+JSON_ARRAY:                          'JSON_ARRAY';
+JSON_ARRAYAGG:                       'JSON_ARRAYAGG';
+JSON_ARRAY_APPEND:                   'JSON_ARRAY_APPEND';
+JSON_ARRAY_INSERT:                   'JSON_ARRAY_INSERT';
+JSON_CONTAINS:                       'JSON_CONTAINS';
+JSON_CONTAINS_PATH:                  'JSON_CONTAINS_PATH';
+JSON_DEPTH:                          'JSON_DEPTH';
+JSON_EXTRACT:                        'JSON_EXTRACT';
+JSON_INSERT:                         'JSON_INSERT';
+JSON_KEYS:                           'JSON_KEYS';
+JSON_LENGTH:                         'JSON_LENGTH';
+JSON_MERGE:                          'JSON_MERGE';
+JSON_MERGE_PATCH:                    'JSON_MERGE_PATCH';
+JSON_MERGE_PRESERVE:                 'JSON_MERGE_PRESERVE';
+JSON_OBJECT:                         'JSON_OBJECT';
+JSON_OBJECTAGG:                      'JSON_OBJECTAGG';
+JSON_OVERLAPS:                       'JSON_OVERLAPS';
+JSON_PRETTY:                         'JSON_PRETTY';
+JSON_QUOTE:                          'JSON_QUOTE';
+JSON_REMOVE:                         'JSON_REMOVE';
+JSON_REPLACE:                        'JSON_REPLACE';
 JSON_SCHEMA_VALID:                   'JSON_SCHEMA_VALID';
+JSON_SCHEMA_VALIDATION_REPORT:       'JSON_SCHEMA_VALIDATION_REPORT';
+JSON_SEARCH:                         'JSON_SEARCH';
+JSON_SET:                            'JSON_SET';
+JSON_STORAGE_FREE:                   'JSON_STORAGE_FREE';
+JSON_STORAGE_SIZE:                   'JSON_STORAGE_SIZE';
+JSON_TABLE:                          'JSON_TABLE';
+JSON_TYPE:                           'JSON_TYPE';
+JSON_UNQUOTE:                        'JSON_UNQUOTE';
+JSON_VALID:                          'JSON_VALID';
+JSON_VALUE:                          'JSON_VALUE';
+NESTED:                              'NESTED';
+ORDINALITY:                          'ORDINALITY';
+PATH:                                'PATH';
 
 // Group function Keywords
 
@@ -292,9 +344,20 @@ BIT_AND:                             'BIT_AND';
 BIT_OR:                              'BIT_OR';
 BIT_XOR:                             'BIT_XOR';
 COUNT:                               'COUNT';
+CUME_DIST:                           'CUME_DIST';
+DENSE_RANK:                          'DENSE_RANK';
+FIRST_VALUE:                         'FIRST_VALUE';
 GROUP_CONCAT:                        'GROUP_CONCAT';
+LAG:                                 'LAG';
+LAST_VALUE:                          'LAST_VALUE';
+LEAD:                                'LEAD';
 MAX:                                 'MAX';
 MIN:                                 'MIN';
+NTILE:                               'NTILE';
+NTH_VALUE:                           'NTH_VALUE';
+PERCENT_RANK:                        'PERCENT_RANK';
+RANK:                                'RANK';
+ROW_NUMBER:                          'ROW_NUMBER';
 STD:                                 'STD';
 STDDEV:                              'STDDEV';
 STDDEV_POP:                          'STDDEV_POP';
@@ -359,6 +422,7 @@ CIPHER:                              'CIPHER';
 CLASS_ORIGIN:                        'CLASS_ORIGIN';
 CLIENT:                              'CLIENT';
 CLOSE:                               'CLOSE';
+CLUSTERING:                          'CLUSTERING';
 COALESCE:                            'COALESCE';
 CODE:                                'CODE';
 COLUMNS:                             'COLUMNS';
@@ -369,8 +433,9 @@ COMMIT:                              'COMMIT';
 COMPACT:                             'COMPACT';
 COMPLETION:                          'COMPLETION';
 COMPRESSED:                          'COMPRESSED';
-COMPRESSION:                         QUOTE_SYMB? 'COMPRESSION' QUOTE_SYMB?;
+COMPRESSION:                         'COMPRESSION' | QUOTE_SYMB? 'COMPRESSION' QUOTE_SYMB?;
 CONCURRENT:                          'CONCURRENT';
+CONNECT:                             'CONNECT';
 CONNECTION:                          'CONNECTION';
 CONSISTENT:                          'CONSISTENT';
 CONSTRAINT_CATALOG:                  'CONSTRAINT_CATALOG';
@@ -381,6 +446,7 @@ CONTEXT:                             'CONTEXT';
 CONTRIBUTORS:                        'CONTRIBUTORS';
 COPY:                                'COPY';
 CPU:                                 'CPU';
+CYCLE:                               'CYCLE';
 CURSOR_NAME:                         'CURSOR_NAME';
 DATA:                                'DATA';
 DATAFILE:                            'DATAFILE';
@@ -398,7 +464,9 @@ DUMPFILE:                            'DUMPFILE';
 DUPLICATE:                           'DUPLICATE';
 DYNAMIC:                             'DYNAMIC';
 ENABLE:                              'ENABLE';
+ENCRYPTED:                           'ENCRYPTED';
 ENCRYPTION:                          'ENCRYPTION';
+ENCRYPTION_KEY_ID:                   'ENCRYPTION_KEY_ID';
 END:                                 'END';
 ENDS:                                'ENDS';
 ENGINE:                              'ENGINE';
@@ -416,6 +484,7 @@ EXPIRE:                              'EXPIRE';
 EXPORT:                              'EXPORT';
 EXTENDED:                            'EXTENDED';
 EXTENT_SIZE:                         'EXTENT_SIZE';
+FAILED_LOGIN_ATTEMPTS:               'FAILED_LOGIN_ATTEMPTS';
 FAST:                                'FAST';
 FAULTS:                              'FAULTS';
 FIELDS:                              'FIELDS';
@@ -424,6 +493,7 @@ FILTER:                              'FILTER';
 FIRST:                               'FIRST';
 FIXED:                               'FIXED';
 FLUSH:                               'FLUSH';
+FOLLOWING:                           'FOLLOWING';
 FOLLOWS:                             'FOLLOWS';
 FOUND:                               'FOUND';
 FULL:                                'FULL';
@@ -435,11 +505,13 @@ GROUP_REPLICATION:                   'GROUP_REPLICATION';
 HANDLER:                             'HANDLER';
 HASH:                                'HASH';
 HELP:                                'HELP';
+HISTORY:                             'HISTORY';
 HOST:                                'HOST';
 HOSTS:                               'HOSTS';
 IDENTIFIED:                          'IDENTIFIED';
 IGNORE_SERVER_IDS:                   'IGNORE_SERVER_IDS';
 IMPORT:                              'IMPORT';
+INCREMENT:                           'INCREMENT';
 INDEXES:                             'INDEXES';
 INITIAL_SIZE:                        'INITIAL_SIZE';
 INPLACE:                             'INPLACE';
@@ -510,8 +582,15 @@ NCHAR:                               'NCHAR';
 NEVER:                               'NEVER';
 NEXT:                                'NEXT';
 NO:                                  'NO';
+NOCACHE:                             'NOCACHE';
+NOCOPY:                              'NOCOPY';
+NOCYCLE:                             'NOCYCLE';
+NOMAXVALUE:                          'NOMAXVALUE';
+NOMINVALUE:                          'NOMINVALUE';
+NOWAIT:                              'NOWAIT';
 NODEGROUP:                           'NODEGROUP';
 NONE:                                'NONE';
+ODBC:                                'ODBC';
 OFFLINE:                             'OFFLINE';
 OFFSET:                              'OFFSET';
 OF:                                  'OF';
@@ -526,17 +605,21 @@ OPTIONS:                             'OPTIONS';
 OWNER:                               'OWNER';
 PACK_KEYS:                           'PACK_KEYS';
 PAGE:                                'PAGE';
+PAGE_COMPRESSED:                     'PAGE_COMPRESSED';
+PAGE_COMPRESSION_LEVEL:              'PAGE_COMPRESSION_LEVEL';
 PARSER:                              'PARSER';
 PARTIAL:                             'PARTIAL';
 PARTITIONING:                        'PARTITIONING';
 PARTITIONS:                          'PARTITIONS';
 PASSWORD:                            'PASSWORD';
+PASSWORD_LOCK_TIME:                  'PASSWORD_LOCK_TIME';
 PHASE:                               'PHASE';
 PLUGIN:                              'PLUGIN';
 PLUGIN_DIR:                          'PLUGIN_DIR';
 PLUGINS:                             'PLUGINS';
 PORT:                                'PORT';
 PRECEDES:                            'PRECEDES';
+PRECEDING:                           'PRECEDING';
 PREPARE:                             'PREPARE';
 PRESERVE:                            'PRESERVE';
 PREV:                                'PREV';
@@ -548,6 +631,7 @@ QUERY:                               'QUERY';
 QUICK:                               'QUICK';
 REBUILD:                             'REBUILD';
 RECOVER:                             'RECOVER';
+RECURSIVE:                           'RECURSIVE';
 REDO_BUFFER_SIZE:                    'REDO_BUFFER_SIZE';
 REDUNDANT:                           'REDUNDANT';
 RELAY:                               'RELAY';
@@ -566,9 +650,12 @@ REPLICATE_WILD_DO_TABLE:             'REPLICATE_WILD_DO_TABLE';
 REPLICATE_WILD_IGNORE_TABLE:         'REPLICATE_WILD_IGNORE_TABLE';
 REPLICATION:                         'REPLICATION';
 RESET:                               'RESET';
+RESTART:                             'RESTART';
 RESUME:                              'RESUME';
 RETURNED_SQLSTATE:                   'RETURNED_SQLSTATE';
+RETURNING:                           'RETURNING';
 RETURNS:                             'RETURNS';
+REUSE:                               'REUSE';
 ROLE:                                'ROLE';
 ROLLBACK:                            'ROLLBACK';
 ROLLUP:                              'ROLLUP';
@@ -576,9 +663,11 @@ ROTATE:                              'ROTATE';
 ROW:                                 'ROW';
 ROWS:                                'ROWS';
 ROW_FORMAT:                          'ROW_FORMAT';
+RTREE:                               'RTREE';
 SAVEPOINT:                           'SAVEPOINT';
 SCHEDULE:                            'SCHEDULE';
 SECURITY:                            'SECURITY';
+SEQUENCE:                            'SEQUENCE';
 SERVER:                              'SERVER';
 SESSION:                             'SESSION';
 SHARE:                               'SHARE';
@@ -619,6 +708,7 @@ SWAPS:                               'SWAPS';
 SWITCHES:                            'SWITCHES';
 TABLE_NAME:                          'TABLE_NAME';
 TABLESPACE:                          'TABLESPACE';
+TABLE_TYPE:                          'TABLE_TYPE';
 TEMPORARY:                           'TEMPORARY';
 TEMPTABLE:                           'TEMPTABLE';
 THAN:                                'THAN';
@@ -627,6 +717,7 @@ TRANSACTION:                         'TRANSACTION';
 TRANSACTIONAL:                       'TRANSACTIONAL';
 TRIGGERS:                            'TRIGGERS';
 TRUNCATE:                            'TRUNCATE';
+UNBOUNDED:                           'UNBOUNDED';
 UNDEFINED:                           'UNDEFINED';
 UNDOFILE:                            'UNDOFILE';
 UNDO_BUFFER_SIZE:                    'UNDO_BUFFER_SIZE';
@@ -645,13 +736,14 @@ VIRTUAL:                             'VIRTUAL';
 VISIBLE:                             'VISIBLE';
 WAIT:                                'WAIT';
 WARNINGS:                            'WARNINGS';
+WINDOW:                              'WINDOW';
 WITHOUT:                             'WITHOUT';
 WORK:                                'WORK';
 WRAPPER:                             'WRAPPER';
 X509:                                'X509';
 XA:                                  'XA';
 XML:                                 'XML';
-
+YES:                                 'YES';
 
 // Date format Keywords
 
@@ -674,40 +766,65 @@ SECOND:                              'SECOND';
 MICROSECOND:                         'MICROSECOND';
 
 
+// MariaDB: userstat plugin Keywords
+
+USER_STATISTICS:                     'USER_STATISTICS';
+CLIENT_STATISTICS:                   'CLIENT_STATISTICS';
+INDEX_STATISTICS:                    'INDEX_STATISTICS';
+TABLE_STATISTICS:                    'TABLE_STATISTICS';
+
+// Azure Database for MySQL Single Server instance:
+FIREWALL_RULES:                      'FIREWALL_RULES';
+
+
 // PRIVILEGES
 
-TABLES:                              'TABLES';
-ROUTINE:                             'ROUTINE';
-EXECUTE:                             'EXECUTE';
-FILE:                                'FILE';
-PROCESS:                             'PROCESS';
-RELOAD:                              'RELOAD';
-SHUTDOWN:                            'SHUTDOWN';
-SUPER:                               'SUPER';
-PRIVILEGES:                          'PRIVILEGES';
+ADMIN:                               'ADMIN';
 APPLICATION_PASSWORD_ADMIN:          'APPLICATION_PASSWORD_ADMIN';
 AUDIT_ADMIN:                         'AUDIT_ADMIN';
+AUDIT_ABORT_EXEMPT:                  'AUDIT_ABORT_EXEMPT';
+AUTHENTICATION_POLICY_ADMIN:         'AUTHENTICATION_POLICY_ADMIN';
 BACKUP_ADMIN:                        'BACKUP_ADMIN';
 BINLOG_ADMIN:                        'BINLOG_ADMIN';
 BINLOG_ENCRYPTION_ADMIN:             'BINLOG_ENCRYPTION_ADMIN';
 CLONE_ADMIN:                         'CLONE_ADMIN';
 CONNECTION_ADMIN:                    'CONNECTION_ADMIN';
 ENCRYPTION_KEY_ADMIN:                'ENCRYPTION_KEY_ADMIN';
+EXECUTE:                             'EXECUTE';
+FILE:                                'FILE';
 FIREWALL_ADMIN:                      'FIREWALL_ADMIN';
+FIREWALL_EXEMPT:                     'FIREWALL_EXEMPT';
 FIREWALL_USER:                       'FIREWALL_USER';
+FLUSH_OPTIMIZER_COSTS:               'FLUSH_OPTIMIZER_COSTS';
+FLUSH_STATUS:                        'FLUSH_STATUS';
+FLUSH_TABLES:                        'FLUSH_TABLES';
+FLUSH_USER_RESOURCES:                'FLUSH_USER_RESOURCES';
 GROUP_REPLICATION_ADMIN:             'GROUP_REPLICATION_ADMIN';
 INNODB_REDO_LOG_ARCHIVE:             'INNODB_REDO_LOG_ARCHIVE';
+INNODB_REDO_LOG_ENABLE:              'INNODB_REDO_LOG_ENABLE';
+INVOKE:                              'INVOKE';
+LAMBDA:                              'LAMBDA';
 NDB_STORED_USER:                     'NDB_STORED_USER';
+PASSWORDLESS_USER_ADMIN:             'PASSWORDLESS_USER_ADMIN';
 PERSIST_RO_VARIABLES_ADMIN:          'PERSIST_RO_VARIABLES_ADMIN';
+PRIVILEGES:                          'PRIVILEGES';
+PROCESS:                             'PROCESS';
+RELOAD:                              'RELOAD';
 REPLICATION_APPLIER:                 'REPLICATION_APPLIER';
 REPLICATION_SLAVE_ADMIN:             'REPLICATION_SLAVE_ADMIN';
 RESOURCE_GROUP_ADMIN:                'RESOURCE_GROUP_ADMIN';
 RESOURCE_GROUP_USER:                 'RESOURCE_GROUP_USER';
 ROLE_ADMIN:                          'ROLE_ADMIN';
+ROUTINE:                             'ROUTINE';
+S3:                                  'S3';
+SERVICE_CONNECTION_ADMIN:            'SERVICE_CONNECTION_ADMIN';
 SESSION_VARIABLES_ADMIN:             QUOTE_SYMB? 'SESSION_VARIABLES_ADMIN' QUOTE_SYMB?;
 SET_USER_ID:                         'SET_USER_ID';
 SHOW_ROUTINE:                        'SHOW_ROUTINE';
+SHUTDOWN:                            'SHUTDOWN';
+SUPER:                               'SUPER';
 SYSTEM_VARIABLES_ADMIN:              'SYSTEM_VARIABLES_ADMIN';
+TABLES:                              'TABLES';
 TABLE_ENCRYPTION_ADMIN:              'TABLE_ENCRYPTION_ADMIN';
 VERSION_TOKEN_ADMIN:                 'VERSION_TOKEN_ADMIN';
 XA_RECOVER_ADMIN:                    'XA_RECOVER_ADMIN';
@@ -729,6 +846,7 @@ CP932:                               'CP932';
 DEC8:                                'DEC8';
 EUCJPMS:                             'EUCJPMS';
 EUCKR:                               'EUCKR';
+GB18030:                             'GB18030';
 GB2312:                              'GB2312';
 GBK:                                 'GBK';
 GEOSTD8:                             'GEOSTD8';
@@ -855,10 +973,12 @@ DES_DECRYPT:                         'DES_DECRYPT';
 DES_ENCRYPT:                         'DES_ENCRYPT';
 DIMENSION:                           'DIMENSION';
 DISJOINT:                            'DISJOINT';
+DISTANCE:                            'DISTANCE';
 ELT:                                 'ELT';
 ENCODE:                              'ENCODE';
 ENCRYPT:                             'ENCRYPT';
 ENDPOINT:                            'ENDPOINT';
+ENGINE_ATTRIBUTE:                    'ENGINE_ATTRIBUTE';
 ENVELOPE:                            'ENVELOPE';
 EQUALS:                              'EQUALS';
 EXP:                                 'EXP';
@@ -974,6 +1094,7 @@ POWER:                               'POWER';
 QUOTE:                               'QUOTE';
 RADIANS:                             'RADIANS';
 RAND:                                'RAND';
+RANDOM:                              'RANDOM';
 RANDOM_BYTES:                        'RANDOM_BYTES';
 RELEASE_LOCK:                        'RELEASE_LOCK';
 REVERSE:                             'REVERSE';
@@ -982,6 +1103,8 @@ ROW_COUNT:                           'ROW_COUNT';
 RPAD:                                'RPAD';
 RTRIM:                               'RTRIM';
 SEC_TO_TIME:                         'SEC_TO_TIME';
+SECONDARY_ENGINE_ATTRIBUTE:          'SECONDARY_ENGINE_ATTRIBUTE';
+SENSITIVE_VARIABLES_OBSERVER:        'SENSITIVE_VARIABLES_OBSERVER';
 SESSION_USER:                        'SESSION_USER';
 SHA:                                 'SHA';
 SHA1:                                'SHA1';
@@ -1055,11 +1178,14 @@ ST_UNION:                            'ST_UNION';
 ST_WITHIN:                           'ST_WITHIN';
 ST_X:                                'ST_X';
 ST_Y:                                'ST_Y';
+STRING_TO_VECTOR:                    'STRING_TO_VECTOR';
 SUBDATE:                             'SUBDATE';
 SUBSTRING_INDEX:                     'SUBSTRING_INDEX';
 SUBTIME:                             'SUBTIME';
 SYSTEM_USER:                         'SYSTEM_USER';
+SYSTEM:                              'SYSTEM';
 TAN:                                 'TAN';
+TELEMETRY_LOG_ADMIN:                 'TELEMETRY_LOG_ADMIN';
 TIMEDIFF:                            'TIMEDIFF';
 TIMESTAMPADD:                        'TIMESTAMPADD';
 TIMESTAMPDIFF:                       'TIMESTAMPDIFF';
@@ -1069,6 +1195,7 @@ TOUCHES:                             'TOUCHES';
 TO_BASE64:                           'TO_BASE64';
 TO_DAYS:                             'TO_DAYS';
 TO_SECONDS:                          'TO_SECONDS';
+TP_CONNECTION_ADMIN:                 'TP_CONNECTION_ADMIN';
 UCASE:                               'UCASE';
 UNCOMPRESS:                          'UNCOMPRESS';
 UNCOMPRESSED_LENGTH:                 'UNCOMPRESSED_LENGTH';
@@ -1079,7 +1206,10 @@ UPPER:                               'UPPER';
 UUID:                                'UUID';
 UUID_SHORT:                          'UUID_SHORT';
 VALIDATE_PASSWORD_STRENGTH:          'VALIDATE_PASSWORD_STRENGTH';
+VECTOR_DIM:                          'VECTOR_DIM';
+VECTOR_TO_STRING:                    'VECTOR_TO_STRING';
 VERSION:                             'VERSION';
+VERSIONING:                          'VERSIONING';
 WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS:   'WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS';
 WEEKDAY:                             'WEEKDAY';
 WEEKOFYEAR:                          'WEEKOFYEAR';
@@ -1089,6 +1219,23 @@ YEARWEEK:                            'YEARWEEK';
 Y_FUNCTION:                          'Y';
 X_FUNCTION:                          'X';
 
+
+// MariaDB tokens
+VIA:                                 'VIA';
+LASTVAL:                             'LASTVAL';
+NEXTVAL:                             'NEXTVAL';
+SETVAL:                              'SETVAL';
+PREVIOUS:                            'PREVIOUS';
+PERSISTENT:                          'PERSISTENT'; // Same as STORED for MySQL
+BINLOG_MONITOR:                      'BINLOG_MONITOR';
+BINLOG_REPLAY:                       'BINLOG_REPLAY';
+FEDERATED_ADMIN:                     'FEDERATED_ADMIN';
+READ_ONLY_ADMIN:                     'READ_ONLY_ADMIN';
+REPLICA:                             'REPLICA';
+REPLICATION_MASTER_ADMIN:            'REPLICATION_MASTER_ADMIN';
+MONITOR:                             'MONITOR';
+READ_ONLY:                           'READ_ONLY';
+REPLAY:                              'REPLAY';
 
 
 // Operators
@@ -1111,7 +1258,6 @@ STAR:                                '*';
 DIVIDE:                              '/';
 MODULE:                              '%';
 PLUS:                                '+';
-MINUSMINUS:                          '--';
 MINUS:                               '-';
 DIV:                                 'DIV';
 MOD:                                 'MOD';
@@ -1177,7 +1323,7 @@ DECIMAL_LITERAL:                     DEC_DIGIT+;
 HEXADECIMAL_LITERAL:                 'X' '\'' (HEX_DIGIT HEX_DIGIT)+ '\''
                                      | '0X' HEX_DIGIT+;
 
-REAL_LITERAL:                        (DEC_DIGIT+)? '.' DEC_DIGIT+
+REAL_LITERAL:                        (DEC_DIGIT+)? '.' DEC_DIGIT*
                                      | DEC_DIGIT+ '.' EXPONENT_NUM_PART
                                      | (DEC_DIGIT+)? '.' (DEC_DIGIT+ EXPONENT_NUM_PART)
                                      | DEC_DIGIT+ EXPONENT_NUM_PART;
@@ -1200,49 +1346,39 @@ DOT_ID:                              '.' ID_LITERAL;
 
 ID:                                  ID_LITERAL;
 // DOUBLE_QUOTE_ID:                  '"' ~'"'+ '"';
-REVERSE_QUOTE_ID:                    '`' ~'`'+ '`';
-STRING_USER_NAME:                    (
-                                       SQUOTA_STRING | DQUOTA_STRING 
-                                       | BQUOTA_STRING | ID_LITERAL
-                                     ) '@' 
+REVERSE_QUOTE_ID:                    BQUOTA_STRING;
+HOST_IP_ADDRESS:                     (AT_SIGN IP_ADDRESS);
+LOCAL_ID:                            AT_SIGN
                                      (
-                                       SQUOTA_STRING | DQUOTA_STRING 
-                                       | BQUOTA_STRING | ID_LITERAL
+                                       STRING_LITERAL | [A-Z0-9._$\u0080-\uFFFF]+
                                      );
-LOCAL_ID:                            '@'
-                                (
-                                  [A-Z0-9._$]+ 
-                                  | SQUOTA_STRING
-                                  | DQUOTA_STRING
-                                  | BQUOTA_STRING
-                                );
-GLOBAL_ID:                           '@' '@' 
-                                (
-                                  [A-Z0-9._$]+ 
-                                  | BQUOTA_STRING
-                                );
+GLOBAL_ID:                           AT_SIGN AT_SIGN
+                                     (
+                                       [A-Z0-9._$\u0080-\uFFFF]+ | BQUOTA_STRING
+                                     );
 
 
 // Fragments for Literal primitives
 
-fragment CHARSET_NAME:               ARMSCII8 | ASCII | BIG5 | BINARY | CP1250 
-                                     | CP1251 | CP1256 | CP1257 | CP850 
-                                     | CP852 | CP866 | CP932 | DEC8 | EUCJPMS 
-                                     | EUCKR | GB2312 | GBK | GEOSTD8 | GREEK 
-                                     | HEBREW | HP8 | KEYBCS2 | KOI8R | KOI8U 
-                                     | LATIN1 | LATIN2 | LATIN5 | LATIN7 
-                                     | MACCE | MACROMAN | SJIS | SWE7 | TIS620 
-                                     | UCS2 | UJIS | UTF16 | UTF16LE | UTF32 
+fragment CHARSET_NAME:               ARMSCII8 | ASCII | BIG5 | BINARY | CP1250
+                                     | CP1251 | CP1256 | CP1257 | CP850
+                                     | CP852 | CP866 | CP932 | DEC8 | EUCJPMS
+                                     | EUCKR | GB2312 | GBK | GEOSTD8 | GREEK
+                                     | HEBREW | HP8 | KEYBCS2 | KOI8R | KOI8U
+                                     | LATIN1 | LATIN2 | LATIN5 | LATIN7
+                                     | MACCE | MACROMAN | SJIS | SWE7 | TIS620
+                                     | UCS2 | UJIS | UTF16 | UTF16LE | UTF32
                                      | UTF8 | UTF8MB3 | UTF8MB4;
 
 fragment EXPONENT_NUM_PART:          'E' [-+]? DEC_DIGIT+;
-fragment ID_LITERAL:                 [A-Z_$0-9]*?[A-Z_$]+?[A-Z_$0-9]*;
+fragment ID_LITERAL:                 [A-Z_$0-9\u0080-\uFFFF]*?[A-Z_$\u0080-\uFFFF]+?[A-Z_$0-9\u0080-\uFFFF]*;
 fragment DQUOTA_STRING:              '"' ( '\\'. | '""' | ~('"'| '\\') )* '"';
 fragment SQUOTA_STRING:              '\'' ('\\'. | '\'\'' | ~('\'' | '\\'))* '\'';
-fragment BQUOTA_STRING:              '`' ( '\\'. | '``' | ~('`'|'\\'))* '`';
+fragment BQUOTA_STRING:              '`' ( ~'`' | '``' )* '`';
 fragment HEX_DIGIT:                  [0-9A-F];
 fragment DEC_DIGIT:                  [0-9];
 fragment BIT_STRING_L:               'B' '\'' [01]+ '\'';
+fragment IP_ADDRESS:                 [0-9]+ '.' [0-9.]+ | [0-9A-F]* ':' [0-9A-F]* ':' [0-9A-F:]+;
 
 
 

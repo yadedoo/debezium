@@ -18,7 +18,7 @@ public abstract class BaseSourceInfo extends AbstractSourceInfo {
     }
 
     public boolean isSnapshot() {
-        return snapshotRecord == SnapshotRecord.TRUE || snapshotRecord == SnapshotRecord.LAST;
+        return snapshotRecord != SnapshotRecord.INCREMENTAL && snapshotRecord != SnapshotRecord.FALSE;
     }
 
     /**
@@ -29,7 +29,7 @@ public abstract class BaseSourceInfo extends AbstractSourceInfo {
     }
 
     @Override
-    protected SnapshotRecord snapshot() {
+    public SnapshotRecord snapshot() {
         return snapshotRecord;
     }
 }

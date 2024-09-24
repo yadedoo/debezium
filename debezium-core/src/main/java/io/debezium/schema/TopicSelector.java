@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.ThreadSafe;
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.BoundedConcurrentHashMap;
 import io.debezium.util.BoundedConcurrentHashMap.Eviction;
 
@@ -21,7 +22,9 @@ import io.debezium.util.BoundedConcurrentHashMap.Eviction;
  *
  * @param <I>
  *            The type of {@link DataCollectionId} used by a given implementation
+ * @deprecated Use {@link io.debezium.spi.topic.TopicNamingStrategy} instead.
  */
+@Deprecated
 public class TopicSelector<I extends DataCollectionId> {
 
     private final String prefix;
@@ -103,7 +106,7 @@ public class TopicSelector<I extends DataCollectionId> {
 
         private final DataCollectionTopicNamer<I> delegate;
 
-        public TopicNameSanitizer(DataCollectionTopicNamer<I> delegate) {
+        TopicNameSanitizer(DataCollectionTopicNamer<I> delegate) {
             this.delegate = delegate;
         }
 
@@ -140,7 +143,7 @@ public class TopicSelector<I extends DataCollectionId> {
          * Whether the given character is a legal character of a Kafka topic name. Legal characters are
          * {@code [a-zA-Z0-9._-]}.
          *
-         * @see https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/internals/Topic.java
+         * @link https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/internals/Topic.java
          */
         private boolean isValidTopicNameCharacter(char c) {
             return c == '.' || c == '_' || c == '-' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
@@ -156,7 +159,7 @@ public class TopicSelector<I extends DataCollectionId> {
         private final BoundedConcurrentHashMap<I, String> topicNames;
         private final DataCollectionTopicNamer<I> delegate;
 
-        public TopicNameCache(DataCollectionTopicNamer<I> delegate) {
+        TopicNameCache(DataCollectionTopicNamer<I> delegate) {
             this.topicNames = new BoundedConcurrentHashMap<>(10_000, 10, Eviction.LRU);
             this.delegate = delegate;
         }

@@ -23,7 +23,7 @@ import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
  * @author Jiri Pechanec
  *
  */
-public class SpecialValueDecimal implements Serializable {
+public class SpecialValueDecimal implements Serializable, ValueWrapper<BigDecimal> {
 
     private static final long serialVersionUID = 1L;
 
@@ -38,7 +38,7 @@ public class SpecialValueDecimal implements Serializable {
     /**
      * Special values for floating-point and numeric types
      */
-    private static enum SpecialValue {
+    private enum SpecialValue {
         NAN,
         POSITIVE_INFINITY,
         NEGATIVE_INFINITY;
@@ -100,12 +100,11 @@ public class SpecialValueDecimal implements Serializable {
     /**
      * Converts a value from its logical format (BigDecimal/special) to its string representation
      *
-     * @param struct the strut to put data in
      * @return the encoded value
      */
     @Override
     public String toString() {
-        return decimalValue != null ? decimalValue.toString() : specialValue.name();
+        return decimalValue != null ? decimalValue.toPlainString() : specialValue.name();
     }
 
     @Override
@@ -144,7 +143,7 @@ public class SpecialValueDecimal implements Serializable {
     }
 
     /**
-     * Returns a {@link SchemaBuilder} for a decimal number depending on {@link JdbcValueConverters.DecimalMode}. You
+     * Returns a {@link SchemaBuilder} for a decimal number depending on {@link DecimalMode}. You
      * can use the resulting schema builder to set additional schema settings such as required/optional, default value,
      * and documentation.
      *
@@ -174,7 +173,7 @@ public class SpecialValueDecimal implements Serializable {
                 case PRECISE:
                     return value.getDecimalValue().get();
                 case STRING:
-                    return value.getDecimalValue().get().toString();
+                    return value.getDecimalValue().get().toPlainString();
             }
             throw new IllegalArgumentException("Unknown decimalMode");
         }
@@ -189,5 +188,10 @@ public class SpecialValueDecimal implements Serializable {
                 throw new ConnectException("Got a special value (NaN/Infinity) for Decimal type in column " + columnName + " but current mode does not handle it. "
                         + "If you need to support it then set decimal handling mode to 'string'.");
         }
+    }
+
+    @Override
+    public BigDecimal getWrappedValue() {
+        return decimalValue;
     }
 }

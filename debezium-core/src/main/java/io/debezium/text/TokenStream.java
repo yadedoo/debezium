@@ -17,7 +17,6 @@ import java.util.function.LongConsumer;
 import io.debezium.annotation.Immutable;
 import io.debezium.annotation.NotThreadSafe;
 import io.debezium.function.BooleanConsumer;
-import io.debezium.relational.ddl.DdlTokenizer;
 import io.debezium.util.Strings;
 
 /**
@@ -563,95 +562,6 @@ public class TokenStream {
      */
     public Position nextPosition() {
         return currentToken().position();
-    }
-
-    /**
-     * Convert the value of this token to an integer, return it, and move to the next token.
-     *
-     * @return the current token's value, converted to an integer
-     * @throws ParsingException if there is no such token to consume, or if the token cannot be converted to an integer
-     * @throws IllegalStateException if this method was called before the stream was {@link #start() started}
-     */
-    public int consumeInteger() throws ParsingException, IllegalStateException {
-        if (completed) {
-            throwNoMoreContent();
-        }
-        // Get the value from the current token ...
-        String value = currentToken().value().toUpperCase();
-        try {
-            List<Token> newTokens = new ArrayList<>();
-            int ePos = value.indexOf("E");
-            // Scientific format, need to identify mantissa and exponent and put it back to stream
-            if (ePos != -1) {
-                String mantissa = value.substring(0, ePos);
-                newTokens.add(new CaseInsensitiveToken(currentToken().startIndex() + ePos, currentToken().startIndex() + ePos + 1, DdlTokenizer.WORD,
-                        currentToken().position()));
-                // Number is in format xxxEyyy
-                if (ePos != value.length() - 1) {
-                    newTokens.add(
-                            new CaseInsensitiveToken(currentToken().startIndex() + ePos + 1, currentToken().endIndex(), DdlTokenizer.WORD, currentToken().position()));
-                }
-                value = mantissa;
-            }
-            int result = Integer.parseInt(value);
-            moveToNextToken(newTokens);
-            return result;
-        }
-        catch (NumberFormatException e) {
-            Position position = currentToken().position();
-            throw new ParsingException(position,
-                    "Expecting integer at line " + position.line() + ", column " + position.column() + " but found '" + value + "'");
-        }
-    }
-
-    /**
-     * Convert the value of this token to a long, return it, and move to the next token.
-     *
-     * @return the current token's value, converted to an integer
-     * @throws ParsingException if there is no such token to consume, or if the token cannot be converted to a long
-     * @throws IllegalStateException if this method was called before the stream was {@link #start() started}
-     */
-    public long consumeLong() throws ParsingException, IllegalStateException {
-        if (completed) {
-            throwNoMoreContent();
-        }
-        // Get the value from the current token ...
-        String value = currentToken().value();
-        try {
-            long result = Long.parseLong(value);
-            moveToNextToken();
-            return result;
-        }
-        catch (NumberFormatException e) {
-            Position position = currentToken().position();
-            throw new ParsingException(position,
-                    "Expecting long at line " + position.line() + ", column " + position.column() + " but found '" + value + "'");
-        }
-    }
-
-    /**
-     * Convert the value of this token to an integer, return it, and move to the next token.
-     *
-     * @return the current token's value, converted to an integer
-     * @throws ParsingException if there is no such token to consume, or if the token cannot be converted to an integer
-     * @throws IllegalStateException if this method was called before the stream was {@link #start() started}
-     */
-    public boolean consumeBoolean() throws ParsingException, IllegalStateException {
-        if (completed) {
-            throwNoMoreContent();
-        }
-        // Get the value from the current token ...
-        String value = currentToken().value();
-        try {
-            boolean result = Boolean.parseBoolean(value);
-            moveToNextToken();
-            return result;
-        }
-        catch (NumberFormatException e) {
-            Position position = currentToken().position();
-            throw new ParsingException(position,
-                    "Expecting boolean at line " + position.line() + ", column " + position.column() + " but found '" + value + "'");
-        }
     }
 
     /**
@@ -2128,7 +2038,7 @@ public class TokenStream {
      * Interface for a Tokenizer component responsible for processing the characters in a {@link CharacterStream} and constructing
      * the appropriate {@link Token} objects.
      */
-    public static interface Tokenizer {
+    public interface Tokenizer {
         /**
          * Process the supplied characters and construct the appropriate {@link Token} objects.
          *
@@ -2144,7 +2054,7 @@ public class TokenStream {
     /**
      * Interface used by a {@link Tokenizer} to iterate through the characters in the content input to the {@link TokenStream}.
      */
-    public static interface CharacterStream {
+    public interface CharacterStream {
 
         /**
          * Determine if there is another character available in this stream.
@@ -2284,7 +2194,7 @@ public class TokenStream {
     /**
      * A factory for Token objects, used by a {@link Tokenizer} to create tokens in the correct order.
      */
-    public static interface Tokens {
+    public interface Tokens {
         /**
          * Create a single-character token at the supplied index in the character stream. The token type is set to 0, meaning this
          * is equivalent to calling <code>addToken(index,index+1)</code> or <code>addToken(index,index+1,0)</code>.

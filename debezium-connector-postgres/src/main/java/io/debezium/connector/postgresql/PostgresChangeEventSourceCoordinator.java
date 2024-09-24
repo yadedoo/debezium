@@ -14,56 +14,63 @@ import org.slf4j.LoggerFactory;
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.postgresql.spi.SlotState;
-import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.metrics.spi.ChangeEventSourceMetricsFactory;
+import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.signal.SignalProcessor;
 import io.debezium.pipeline.source.spi.ChangeEventSource;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
-import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;
 import io.debezium.pipeline.source.spi.SnapshotChangeEventSource;
-import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.pipeline.spi.Offsets;
 import io.debezium.schema.DatabaseSchema;
+import io.debezium.snapshot.SnapshotterService;
 
 /**
  * Coordinates one or more {@link ChangeEventSource}s and executes them in order. Extends the base
  * {@link ChangeEventSourceCoordinator} to support a pre-snapshot catch up streaming phase.
  */
-public class PostgresChangeEventSourceCoordinator extends ChangeEventSourceCoordinator {
+public class PostgresChangeEventSourceCoordinator extends ChangeEventSourceCoordinator<PostgresPartition, PostgresOffsetContext> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresChangeEventSourceCoordinator.class);
 
-    private final Snapshotter snapshotter;
+    private final SnapshotterService snapshotterService;
     private final SlotState slotInfo;
 
-    public PostgresChangeEventSourceCoordinator(OffsetContext previousOffset, ErrorHandler errorHandler,
+    public PostgresChangeEventSourceCoordinator(Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets,
+                                                ErrorHandler errorHandler,
                                                 Class<? extends SourceConnector> connectorType,
                                                 CommonConnectorConfig connectorConfig,
-                                                ChangeEventSourceFactory changeEventSourceFactory,
-                                                ChangeEventSourceMetricsFactory changeEventSourceMetricsFactory,
-                                                EventDispatcher<?> eventDispatcher, DatabaseSchema<?> schema,
-                                                Snapshotter snapshotter, SlotState slotInfo) {
-        super(previousOffset, errorHandler, connectorType, connectorConfig, changeEventSourceFactory, changeEventSourceMetricsFactory, eventDispatcher, schema);
-        this.snapshotter = snapshotter;
+                                                PostgresChangeEventSourceFactory changeEventSourceFactory,
+                                                ChangeEventSourceMetricsFactory<PostgresPartition> changeEventSourceMetricsFactory,
+                                                EventDispatcher<PostgresPartition, ?> eventDispatcher, DatabaseSchema<?> schema,
+                                                SnapshotterService snapshotterService, SlotState slotInfo,
+                                                SignalProcessor<PostgresPartition, PostgresOffsetContext> signalProcessor,
+                                                NotificationService<PostgresPartition, PostgresOffsetContext> notificationService) {
+        super(previousOffsets, errorHandler, connectorType, connectorConfig, changeEventSourceFactory,
+                changeEventSourceMetricsFactory, eventDispatcher, schema, signalProcessor, notificationService, snapshotterService);
+        this.snapshotterService = snapshotterService;
         this.slotInfo = slotInfo;
     }
 
     @Override
-    protected CatchUpStreamingResult executeCatchUpStreaming(OffsetContext previousOffset, ChangeEventSourceContext context,
-                                                             SnapshotChangeEventSource snapshotSource)
+    protected CatchUpStreamingResult executeCatchUpStreaming(ChangeEventSourceContext context,
+                                                             SnapshotChangeEventSource<PostgresPartition, PostgresOffsetContext> snapshotSource,
+                                                             PostgresPartition partition,
+                                                             PostgresOffsetContext previousOffset)
             throws InterruptedException {
-        if (previousOffset != null && !snapshotter.shouldStreamEventsStartingFromSnapshot() && slotInfo != null) {
+        if (previousOffset != null && !snapshotterService.getSnapshotter().shouldStreamEventsStartingFromSnapshot() && slotInfo != null) {
             try {
                 setSnapshotStartLsn((PostgresSnapshotChangeEventSource) snapshotSource,
-                        (PostgresOffsetContext) previousOffset);
+                        previousOffset);
             }
             catch (SQLException e) {
                 throw new DebeziumException("Failed to determine catch-up streaming stopping LSN");
             }
             LOGGER.info("Previous connector state exists and will stream events until {} then perform snapshot",
-                    ((PostgresOffsetContext) previousOffset).getStreamingStoppingLsn());
-            streamEvents(previousOffset, context);
+                    previousOffset.getStreamingStoppingLsn());
+            streamEvents(context, partition, previousOffset);
             return new CatchUpStreamingResult(true);
         }
 
@@ -74,7 +81,7 @@ public class PostgresChangeEventSourceCoordinator extends ChangeEventSourceCoord
                                      PostgresOffsetContext offsetContext)
             throws SQLException {
         snapshotSource.createSnapshotConnection();
-        snapshotSource.setSnapshotTransactionIsolationLevel();
+        snapshotSource.setSnapshotTransactionIsolationLevel(false);
         snapshotSource.updateOffsetForPreSnapshotCatchUpStreaming(offsetContext);
     }
 

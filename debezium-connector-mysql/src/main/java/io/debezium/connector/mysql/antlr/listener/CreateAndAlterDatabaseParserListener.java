@@ -6,7 +6,7 @@
 
 package io.debezium.connector.mysql.antlr.listener;
 
-import io.debezium.connector.mysql.MySqlSystemVariables;
+import io.debezium.connector.binlog.jdbc.BinlogSystemVariables;
 import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
 import io.debezium.ddl.parser.mysql.generated.MySqlParser;
 import io.debezium.ddl.parser.mysql.generated.MySqlParserBaseListener;
@@ -46,11 +46,15 @@ public class CreateAndAlterDatabaseParserListener extends MySqlParserBaseListene
 
     @Override
     public void enterCreateDatabaseOption(MySqlParser.CreateDatabaseOptionContext ctx) {
+        String charsetName = parser.extractCharset(ctx.charsetName(), ctx.collationName());
         if (ctx.charsetName() != null) {
-            String charsetName = parser.withoutQuotes(ctx.charsetName());
             if ("DEFAULT".equalsIgnoreCase(charsetName)) {
-                charsetName = parser.systemVariables().getVariable(MySqlSystemVariables.CHARSET_NAME_SERVER);
+                charsetName = parser.systemVariables().getVariable(BinlogSystemVariables.CHARSET_NAME_SERVER);
             }
+            parser.charsetNameForDatabase().put(databaseName, charsetName);
+        }
+        // Collation is used only if the database charset was not set by charset setting
+        else if (ctx.charsetName() != null && !parser.charsetNameForDatabase().containsKey(charsetName)) {
             parser.charsetNameForDatabase().put(databaseName, charsetName);
         }
         super.enterCreateDatabaseOption(ctx);

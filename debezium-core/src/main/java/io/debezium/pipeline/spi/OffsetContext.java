@@ -11,8 +11,12 @@ import java.util.Map;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 
+import io.debezium.connector.SnapshotRecord;
+import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotChangeEventSource;
+import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotContext;
 import io.debezium.pipeline.txmetadata.TransactionContext;
-import io.debezium.schema.DataCollectionId;
+import io.debezium.pipeline.txmetadata.TransactionMonitor;
+import io.debezium.spi.schema.DataCollectionId;
 
 /**
  * Keeps track of the current offset within the source DB's change stream. This reflects in the offset as committed to
@@ -26,13 +30,9 @@ public interface OffsetContext {
     /**
      * Implementations load a connector-specific offset context based on the offset values stored in Kafka.
      */
-    interface Loader {
-        Map<String, ?> getPartition();
-
-        OffsetContext load(Map<String, ?> offset);
+    interface Loader<O extends OffsetContext> {
+        O load(Map<String, ?> offset);
     }
-
-    Map<String, ?> getPartition();
 
     Map<String, ?> getOffset();
 
@@ -47,9 +47,9 @@ public interface OffsetContext {
     boolean isSnapshotRunning();
 
     /**
-     * mark current record as the last one in the snapshot
+     * Mark the position of the record in the snapshot.
      */
-    void markLastSnapshotRecord();
+    void markSnapshotRecord(SnapshotRecord record);
 
     /**
      * Signals that a snapshot will begin, which should reflect in an updated offset state.
@@ -78,4 +78,21 @@ public interface OffsetContext {
      * @return transaction context
      */
     TransactionContext getTransactionContext();
+
+    /**
+     * Signals that the streaming of a batch of <i>incremental</i> snapshot events will begin,
+     * which should reflect in an updated offset state.
+     */
+    default void incrementalSnapshotEvents() {
+    }
+
+    /**
+     * Provide a context used by {@link IncrementalSnapshotChangeEventSource} so persist its internal state into offsets to survive
+     * between restarts.
+     *
+     * @return incremental snapshot context
+     */
+    default IncrementalSnapshotContext<?> getIncrementalSnapshotContext() {
+        return null;
+    };
 }

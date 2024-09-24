@@ -10,22 +10,21 @@ import org.apache.kafka.connect.data.Struct;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.AbstractSourceInfoStructMaker;
-import io.debezium.util.SchemaNameAdjuster;
 
 public class MongoDbSourceInfoStructMaker extends AbstractSourceInfoStructMaker<SourceInfo> {
 
-    private final Schema schema;
+    private Schema schema;
 
-    public MongoDbSourceInfoStructMaker(String connector, String version, CommonConnectorConfig connectorConfig) {
-        super(connector, version, connectorConfig);
+    @Override
+    public void init(String connector, String version, CommonConnectorConfig connectorConfig) {
+        super.init(connector, version, connectorConfig);
         schema = commonSchemaBuilder()
-                .name(SchemaNameAdjuster.defaultAdjuster().adjust("io.debezium.connector.mongo.Source"))
-                .field(SourceInfo.REPLICA_SET_NAME, Schema.STRING_SCHEMA)
+                .name(connectorConfig.schemaNameAdjuster().adjust("io.debezium.connector.mongo.Source"))
                 .field(SourceInfo.COLLECTION, Schema.STRING_SCHEMA)
                 .field(SourceInfo.ORDER, Schema.INT32_SCHEMA)
-                .field(SourceInfo.OPERATION_ID, Schema.OPTIONAL_INT64_SCHEMA)
-                .field(SourceInfo.TX_ORD, Schema.OPTIONAL_INT64_SCHEMA)
-                .field(SourceInfo.SESSION_TXN_ID, Schema.OPTIONAL_STRING_SCHEMA)
+                .field(SourceInfo.LSID, Schema.OPTIONAL_STRING_SCHEMA)
+                .field(SourceInfo.TXN_NUMBER, Schema.OPTIONAL_INT64_SCHEMA)
+                .field(SourceInfo.WALL_TIME, Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
     }
 
@@ -37,13 +36,17 @@ public class MongoDbSourceInfoStructMaker extends AbstractSourceInfoStructMaker<
     @Override
     public Struct struct(SourceInfo sourceInfo) {
         Struct struct = super.commonStruct(sourceInfo)
-                .put(SourceInfo.REPLICA_SET_NAME, sourceInfo.replicaSetName())
                 .put(SourceInfo.COLLECTION, sourceInfo.collectionId().name())
-                .put(SourceInfo.ORDER, sourceInfo.position().getInc())
-                .put(SourceInfo.OPERATION_ID, sourceInfo.position().getOperationId())
-                .put(SourceInfo.SESSION_TXN_ID, sourceInfo.position().getSessionTxnId());
+                .put(SourceInfo.ORDER, sourceInfo.position().getInc());
 
-        sourceInfo.transactionPosition().ifPresent(transactionPosition -> struct.put(SourceInfo.TX_ORD, transactionPosition));
+        if (sourceInfo.position().getChangeStreamSessionTxnId() != null) {
+            struct.put(SourceInfo.LSID, sourceInfo.position().getChangeStreamSessionTxnId().lsid)
+                    .put(SourceInfo.TXN_NUMBER, sourceInfo.position().getChangeStreamSessionTxnId().txnNumber);
+        }
+
+        if (sourceInfo.wallTime() != 0L) {
+            struct.put(SourceInfo.WALL_TIME, sourceInfo.wallTime());
+        }
 
         return struct;
     }

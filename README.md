@@ -1,8 +1,7 @@
 [![License](http://img.shields.io/:license-apache%202.0-brightgreen.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
 [![Maven Central](https://maven-badges.herokuapp.com/maven-central/io.debezium/debezium-parent/badge.svg)](http://search.maven.org/#search%7Cga%7C1%7Cg%3A%22io.debezium%22)
-[![Build Status](https://travis-ci.org/debezium/debezium.svg?branch=master)](https://travis-ci.org/debezium/debezium)
-[![User chat](https://img.shields.io/badge/chat-users-brightgreen.svg)](https://gitter.im/debezium/user)
-[![Developer chat](https://img.shields.io/badge/chat-devs-brightgreen.svg)](https://gitter.im/debezium/dev)
+[![User chat](https://img.shields.io/badge/chat-users-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302529-users)
+[![Developer chat](https://img.shields.io/badge/chat-devs-brightgreen.svg)](https://debezium.zulipchat.com/#narrow/stream/302533-dev)
 [![Google Group](https://img.shields.io/:mailing%20list-debezium-brightgreen.svg)](https://groups.google.com/forum/#!forum/debezium)
 [![Stack Overflow](http://img.shields.io/:stack%20overflow-debezium-brightgreen.svg)](http://stackoverflow.com/questions/tagged/debezium)
 
@@ -10,9 +9,11 @@ Copyright Debezium Authors.
 Licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0).
 The Antlr grammars within the debezium-ddl-parser module are licensed under the [MIT License](https://opensource.org/licenses/MIT).
 
+English | [Chinese](README_ZH.md) | [Japanese](README_JA.md) | [Korean](README_KO.md)
+
 # Debezium
 
-Debezium is an open source project that provides a low latency data streaming platform for change data capture (CDC). You setup and configure Debezium to monitor your databases, and then your applications consume events for each row-level change made to the database. Only committed changes are visible, so your application doesn't have to worry about transactions or changes that are rolled back. Debezium provides a single model of all change events, so your application does not have to worry about the intricacies of each kind of database management system. Additionally, since Debezium records the history of data changes in durable, replicated logs, your application can be stopped and restarted at any time, and it will be able to consume all of the events it missed while it was not running, ensuring that all events are processed correctly and completely.
+Debezium is an open source project that provides a low latency data streaming platform for change data capture (CDC). You set up and configure Debezium to monitor your databases, and then your applications consume events for each row-level change made to the database. Only committed changes are visible, so your application doesn't have to worry about transactions or changes that are rolled back. Debezium provides a single model of all change events, so your application does not have to worry about the intricacies of each kind of database management system. Additionally, since Debezium records the history of data changes in durable, replicated logs, your application can be stopped and restarted at any time, and it will be able to consume all of the events it missed while it was not running, ensuring that all events are processed correctly and completely.
 
 Monitoring databases and being notified when data changes has always been complicated. Relational database triggers can be useful, but are specific to each database and often limited to updating state within the same database (not communicating with external processes). Some databases offer APIs or frameworks for monitoring changes, but there is no standard so each database's approach is different and requires a lot of knowledged and specialized code. It still is very challenging to ensure that all changes are seen and processed in the same order while minimally impacting the database.
 
@@ -52,10 +53,11 @@ The [Command Query Responsibility Separation (CQRS)](http://martinfowler.com/bli
 
 The following software is required to work with the Debezium codebase and build it locally:
 
-* [Git 2.2.1](https://git-scm.com) or later
-* [JDK 8](http://www.oracle.com/technetwork/java/javase/downloads/jdk8-downloads-2133151.html) or [OpenJDK 8](http://openjdk.java.net/projects/jdk8/)
-* [Maven 3.2.1](https://maven.apache.org/index.html) or later
-* [Docker Engine 1.9](http://docs.docker.com/engine/installation/) or later
+* [Git](https://git-scm.com) 2.2.1 or later
+* JDK 17 or later, e.g. [OpenJDK](http://openjdk.java.net/projects/jdk/)
+* [Docker Engine](https://docs.docker.com/engine/install/) or [Docker Desktop](https://docs.docker.com/desktop/) 1.9 or later
+* [Apache Maven](https://maven.apache.org/index.html) 3.9.8 or later  
+  (or invoke the wrapper with `./mvnw` for Maven commands)
 
 See the links above for installation instructions on your platform. You can verify the versions are installed and running:
 
@@ -88,6 +90,15 @@ The Docker Maven Plugin will resolve the docker host by checking the following e
 
 These can be set automatically if using Docker Machine or something similar.
 
+#### Colima
+In order to run testcontainers against [colima](https://github.com/abiosoft/colima) the env vars below should be set (assume we use `default` profile of colima)
+
+    colima start
+    export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+    export TESTCONTAINERS_HOST_OVERRIDE="0.0.0.0"
+    export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+
+
 ### Building the code
 
 First obtain the code by cloning the Git repository:
@@ -97,7 +108,7 @@ First obtain the code by cloning the Git repository:
 
 Then build the code using Maven:
 
-    $ mvn clean install
+    $ mvn clean verify
 
 The build starts and uses several Docker containers for different DBMSes. Note that if Docker is not running or configured, you'll likely get an arcane error -- if this is the case, always verify that Docker is running, perhaps by using `docker ps` to list the running containers.
 
@@ -105,7 +116,16 @@ The build starts and uses several Docker containers for different DBMSes. Note t
 
 You can skip the integration tests and docker-builds with the following command:
 
-    $ mvn clean install -DskipITs
+    $ mvn clean verify -DskipITs
+
+### Building just the artifacts, without running tests, CheckStyle, etc.
+
+You can skip all non-essential plug-ins (tests, integration tests, CheckStyle, formatter, API compatibility check, etc.) using the "quick" build profile:
+
+    $ mvn clean verify -Dquick
+
+This provides the fastest way for solely producing the output artifacts, without running any of the QA related Maven plug-ins.
+This comes in handy for producing connector JARs and/or archives as quickly as possible, e.g. for manual testing in Kafka Connect.
 
 ### Running tests of the Postgres connector using the wal2json or pgoutput logical decoding plug-ins
 
@@ -121,6 +141,14 @@ To run the integration tests of the PG connector using pgoutput, enable the "pgo
 A few tests currently don't pass when using the wal2json plug-in.
 Look for references to the types defined in `io.debezium.connector.postgresql.DecoderDifferences` to find these tests.
 
+### Running tests of the Postgres connector with specific Apicurio Version
+To run the tests of PG connector using wal2json or pgoutput logical decoding plug-ins with a specific version of Apicurio, a test property can be passed as:
+
+    $ mvn clean install -pl debezium-connector-postgres -Pwal2json-decoder 
+          -Ddebezium.test.apicurio.version=1.3.1.Final
+
+In absence of the property the stable version of Apicurio will be fetched.
+
 ### Running tests of the Postgres connector against an external database, e.g. Amazon RDS
 Please note if you want to test against a *non-RDS* cluster, this test requires `<your user>` to be a superuser with not only `replication` but permissions
 to login to `all` databases in `pg_hba.conf`.  It also requires `postgis` packages to be available on the target server for some of the tests to pass.
@@ -134,6 +162,32 @@ Adjust the timeout value as needed.
 
 See [PostgreSQL on Amazon RDS](debezium-connector-postgres/RDS.md) for details on setting up a database on RDS to test against.
 
+### Running tests of the Oracle connector using Oracle XStream
+
+    $ mvn clean install -pl debezium-connector-oracle -Poracle-xstream,oracle-tests -Dinstantclient.dir=<path-to-instantclient>
+
+### Running tests of the Oracle connector with a non-CDB database
+
+    $ mvn clean install -pl debezium-connector-oracle -Poracle-tests -Dinstantclient.dir=<path-to-instantclient> -Ddatabase.pdb.name=
+
+### Running the tests for MongoDB with oplog capturing from an IDE
+
+When running the test without maven, please make sure you pass the correct parameters to the execution. Look for the correct parameters in `.github/workflows/mongodb-oplog-workflow.yml` and
+append them to the JVM execution parameters, prefixing them with `debezium.test`. As the execution will happen outside of the lifecycle execution, you need to start the MongoDB container manually
+from the MongoDB connector directory
+
+    $ mvn docker:start -B -am -Passembly -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip -Dcapture.mode=oplog -Dversion.mongo.server=3.6 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dcapture.mode=oplog -Dmongo.server=3.6
+
+The relevant portion of the line will look similar to the following:
+
+    java -ea -Ddebezium.test.capture.mode=oplog -Ddebezium.test.version.mongo.server=3.6 -Djava.awt.headless=true -Dconnector.mongodb.members.auto.discover=false -Dconnector.mongodb.name=mongo1 -DskipLongRunningTests=true [...]
+
 ## Contributing
 
 The Debezium community welcomes anyone that wants to help out in any way, whether that includes reporting problems, helping with documentation, or contributing code changes to fix bugs, add tests, or implement new features. See [this document](CONTRIBUTE.md) for details.
+
+A big thank you to all the Debezium contributors!
+
+<a href="https://github.com/debezium/debezium/graphs/contributors">
+  <img src="https://contributors-img.web.app/image?repo=debezium/debezium" />
+</a>

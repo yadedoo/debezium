@@ -11,7 +11,9 @@ import java.util.Map;
 import org.apache.kafka.connect.data.Struct;
 
 import io.debezium.pipeline.spi.OffsetContext;
-import io.debezium.schema.DataCollectionId;
+import io.debezium.pipeline.txmetadata.DefaultTransactionInfo;
+import io.debezium.pipeline.txmetadata.TransactionInfo;
+import io.debezium.spi.schema.DataCollectionId;
 
 /**
  * An interface implemented by each connector that enables metrics metadata to be extracted
@@ -45,5 +47,9 @@ public interface EventMetadataProvider {
                 .sourcePosition(getEventSourcePosition(source, offset, key, value))
                 .key(key)
                 .toString();
+    }
+
+    default TransactionInfo getTransactionInfo(DataCollectionId source, OffsetContext offset, Object key, Struct value) {
+        return new DefaultTransactionInfo(getTransactionId(source, offset, key, value));
     }
 }

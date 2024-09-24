@@ -5,13 +5,18 @@
  */
 package io.debezium.util;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.Before;
 import org.junit.Test;
 
-import io.debezium.util.SchemaNameAdjuster.ReplacementOccurred;
+import io.debezium.doc.FixFor;
+import io.debezium.schema.SchemaNameAdjuster;
+import io.debezium.schema.SchemaNameAdjuster.ReplacementOccurred;
+import io.debezium.schema.UnicodeReplacementFunction;
+import io.debezium.spi.common.ReplacementFunction;
 
 /**
  * @author Randall Hauch
@@ -19,11 +24,20 @@ import io.debezium.util.SchemaNameAdjuster.ReplacementOccurred;
  */
 public class SchemaNameAdjusterTest {
 
+    private ReplacementFunction underscoreReplacement;
+    private ReplacementFunction unicodeReplacement;
+
+    @Before
+    public void before() {
+        underscoreReplacement = ReplacementFunction.UNDERSCORE_REPLACEMENT;
+        unicodeReplacement = new UnicodeReplacementFunction();
+    }
+
     @Test
     public void shouldDetermineValidFirstCharacters() {
         String validChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
         for (int i = 0; i != validChars.length(); ++i) {
-            assertThat(SchemaNameAdjuster.isValidFullnameFirstCharacter(validChars.charAt(i))).isTrue();
+            assertThat(underscoreReplacement.isValidFirstCharacter(validChars.charAt(i))).isTrue();
         }
     }
 
@@ -31,7 +45,7 @@ public class SchemaNameAdjusterTest {
     public void shouldDetermineValidNonFirstCharacters() {
         String validChars = ".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         for (int i = 0; i != validChars.length(); ++i) {
-            assertThat(SchemaNameAdjuster.isValidFullnameNonFirstCharacter(validChars.charAt(i))).isTrue();
+            assertThat(underscoreReplacement.isValidNonFirstCharacter(validChars.charAt(i))).isTrue();
         }
     }
 
@@ -47,6 +61,27 @@ public class SchemaNameAdjusterTest {
     }
 
     @Test
+    public void shouldConsiderInvalidFirstCharacters() {
+        String invalidChars = "1_语言";
+        for (int i = 0; i < invalidChars.length(); i++) {
+            assertThat(unicodeReplacement.isValidFirstCharacter(invalidChars.charAt(i))).isFalse();
+        }
+
+        invalidChars = "_语言";
+        for (int i = 0; i < invalidChars.length(); i++) {
+            assertThat(unicodeReplacement.isValidNonFirstCharacter(invalidChars.charAt(i))).isFalse();
+        }
+    }
+
+    @Test
+    public void shouldConvertInvalidCharactersToUnicode() {
+        SchemaNameAdjuster unicodeAdjuster = SchemaNameAdjuster.AVRO_UNICODE;
+        String originName = "_hello_语言.";
+        String expectedName = "_u005fhello_u005f_u8bed_u8a00.";
+        assertThat(unicodeAdjuster.adjust(originName)).isEqualTo(expectedName);
+    }
+
+    @Test
     public void shouldReportReplacementEveryTime() {
         AtomicInteger counter = new AtomicInteger();
         AtomicInteger conflicts = new AtomicInteger();
@@ -56,7 +91,7 @@ public class SchemaNameAdjusterTest {
             }
             counter.incrementAndGet();
         };
-        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create(handler);
+        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create("_", handler);
         for (int i = 0; i != 20; ++i) {
             adjuster.adjust("some-invalid-fullname$");
         }
@@ -74,7 +109,7 @@ public class SchemaNameAdjusterTest {
             }
             counter.incrementAndGet();
         };
-        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create(handler.firstTimeOnly());
+        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create("_", handler.firstTimeOnly());
         for (int i = 0; i != 20; ++i) {
             adjuster.adjust("some-invalid-fullname$");
         }
@@ -92,11 +127,19 @@ public class SchemaNameAdjusterTest {
             }
             counter.incrementAndGet();
         };
-        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create(handler.firstTimeOnly());
+        SchemaNameAdjuster adjuster = SchemaNameAdjuster.create("_", handler.firstTimeOnly());
         adjuster.adjust("some-invalid-fullname$");
         adjuster.adjust("some-invalid%fullname_");
         assertThat(counter.get()).isEqualTo(2);
         assertThat(conflicts.get()).isEqualTo(1);
+    }
+
+    @Test
+    @FixFor("DBZ-6559")
+    public void whenFirstCharIsInvalidAddUnderscoreBeforeInsteadOfReplacingIt() {
+        SchemaNameAdjuster unicodeAdjuster = SchemaNameAdjuster.AVRO;
+        assertThat(unicodeAdjuster.adjust("24ColumnName")).isEqualTo("_24ColumnName");
+        assertThat(unicodeAdjuster.adjust("44ColumnName")).isEqualTo("_44ColumnName");
     }
 
     protected void assertValidFullname(String fullname) {

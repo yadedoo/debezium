@@ -21,6 +21,7 @@ import org.junit.Test;
 import org.junit.rules.TestRule;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.SnapshotRecord;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
@@ -90,7 +91,7 @@ public class PublicGeometryIT extends AbstractRecordsProducerTest {
 
     private void setupRecordsProducer(Configuration.Builder config) {
         start(PostgresConnector.class, config
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER)
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .build());
         assertConnectorIsRunning();
     }
@@ -103,7 +104,7 @@ public class PublicGeometryIT extends AbstractRecordsProducerTest {
         try {
             executeAndWait(statement);
             SourceRecord record = assertRecordInserted(expectedTopicName, pk != null ? PK_FIELD : null, pk);
-            assertRecordOffsetAndSnapshotSource(record, false, false);
+            assertRecordOffsetAndSnapshotSource(record, SnapshotRecord.FALSE);
             assertSourceInfo(record, "postgres", table.schema(), table.table());
             assertRecordSchemaAndValues(expectedSchemaAndValuesByColumn, record, Envelope.FieldName.AFTER);
         }

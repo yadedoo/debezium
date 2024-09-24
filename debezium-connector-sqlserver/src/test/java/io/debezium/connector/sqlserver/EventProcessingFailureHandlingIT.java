@@ -5,11 +5,12 @@
  */
 package io.debezium.connector.sqlserver;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 import java.sql.SQLException;
 import java.util.concurrent.TimeUnit;
 
 import org.awaitility.Awaitility;
-import org.fest.assertions.Assertions;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -20,6 +21,8 @@ import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
 import io.debezium.connector.sqlserver.util.TestHelper;
 import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.junit.logging.LogInterceptor;
+import io.debezium.pipeline.ErrorHandler;
+import io.debezium.pipeline.EventDispatcher;
 import io.debezium.util.Testing;
 
 /**
@@ -45,7 +48,7 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         TestHelper.enableTableCdc(connection, "tableb");
 
         initializeConnectorTestFramework();
-        Testing.Files.delete(TestHelper.DB_HISTORY_PATH);
+        Testing.Files.delete(TestHelper.SCHEMA_HISTORY_PATH);
     }
 
     @After
@@ -60,14 +63,20 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         final int RECORDS_PER_TABLE = 5;
         final int ID_START_1 = 10;
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(SqlServerConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE, EventProcessingFailureHandlingMode.WARN)
                 .build();
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(EventDispatcher.class);
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
-        TestHelper.waitForSnapshotToBeCompleted();
+        TestHelper.waitForStreamingStarted();
+
+        connection.execute("INSERT INTO tablea VALUES (1, 'seed')");
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).isNull();
 
         // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
         // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
@@ -81,13 +90,13 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
                     "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
-        SourceRecords records = consumeRecordsByTopic(RECORDS_PER_TABLE);
-        Assertions.assertThat(records.recordsForTopic("server1.dbo.tablea")).hasSize(RECORDS_PER_TABLE);
-        Assertions.assertThat(records.recordsForTopic("server1.dbo.tableb")).isNull();
+        records = consumeRecordsByTopic(RECORDS_PER_TABLE);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(RECORDS_PER_TABLE);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).isNull();
 
         Awaitility.await()
                 .alias("Found warning message in logs")
-                .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
+                .atMost(TestHelper.waitTimeForLogEntries(), TimeUnit.SECONDS).until(() -> {
                     return logInterceptor.containsWarnMessage("Error while processing event at offset {");
                 });
     }
@@ -97,13 +106,19 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         final int RECORDS_PER_TABLE = 5;
         final int ID_START_1 = 10;
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(SqlServerConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE, EventProcessingFailureHandlingMode.SKIP)
                 .build();
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
-        TestHelper.waitForSnapshotToBeCompleted();
+        TestHelper.waitForStreamingStarted();
+
+        connection.execute("INSERT INTO tablea VALUES (1, 'seed')");
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).isNull();
 
         // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
         // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
@@ -117,9 +132,9 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
                     "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
-        SourceRecords records = consumeRecordsByTopic(RECORDS_PER_TABLE);
-        Assertions.assertThat(records.recordsForTopic("server1.dbo.tablea")).hasSize(RECORDS_PER_TABLE);
-        Assertions.assertThat(records.recordsForTopic("server1.dbo.tableb")).isNull();
+        records = consumeRecordsByTopic(RECORDS_PER_TABLE);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(RECORDS_PER_TABLE);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).isNull();
     }
 
     @Test
@@ -127,13 +142,19 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
         final int RECORDS_PER_TABLE = 5;
         final int ID_START_1 = 10;
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .build();
-        final LogInterceptor logInterceptor = new LogInterceptor();
+        final LogInterceptor logInterceptor = new LogInterceptor(ErrorHandler.class);
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
-        TestHelper.waitForSnapshotToBeCompleted();
+        TestHelper.waitForStreamingStarted();
+
+        connection.execute("INSERT INTO tablea VALUES (1, 'seed')");
+
+        SourceRecords records = consumeRecordsByTopic(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tablea")).hasSize(1);
+        assertThat(records.recordsForTopic("server1.testDB1.dbo.tableb")).isNull();
 
         // Will allow insertion of strings into what was originally a BIGINT NOT NULL column
         // This will cause NumberFormatExceptions which return nulls and thus an error due to the column being NOT NULL
@@ -147,13 +168,11 @@ public class EventProcessingFailureHandlingIT extends AbstractConnectorTest {
                     "INSERT INTO tableb VALUES(" + id + ", 'b')");
         }
 
-        SourceRecords records = consumeRecordsByTopic(1);
-        Assertions.assertThat(records.recordsForTopic("server1.dbo.tablea")).hasSize(1);
         Awaitility.await()
-                .alias("Found warning message in logs")
-                .atMost(TestHelper.waitTimeForRecords(), TimeUnit.SECONDS).until(() -> {
+                .alias("Found error message in logs")
+                .atMost(TestHelper.waitTimeForLogEntries(), TimeUnit.SECONDS).until(() -> {
                     boolean foundErrorMessageInLogs = logInterceptor.containsStacktraceElement("Error while processing event at offset {");
-                    return foundErrorMessageInLogs && !engine.isRunning();
+                    return foundErrorMessageInLogs && !isEngineRunning.get();
                 });
     }
 }

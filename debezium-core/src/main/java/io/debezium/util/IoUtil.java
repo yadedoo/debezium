@@ -31,14 +31,17 @@ import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.EnumSet;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
 import io.debezium.annotation.Immutable;
 
 /**
@@ -145,7 +148,9 @@ public class IoUtil {
      * @throws IOException if an I/O error occurs
      */
     public static void readLines(Path path, Consumer<String> lineProcessor) throws IOException {
-        Files.lines(path).forEach(lineProcessor);
+        try (Stream<String> stream = Files.lines(path)) {
+            stream.forEach(lineProcessor);
+        }
     }
 
     /**
@@ -368,13 +373,13 @@ public class IoUtil {
     public static File createDirectory(Path path, boolean removeExistingContent) throws IOException {
         File dir = path.toAbsolutePath().toFile();
         if (dir.exists() && dir.canRead() && dir.canWrite()) {
-            if (dir.isDirectory()) {
-                if (removeExistingContent) {
-                    delete(path);
-                }
+            if (!dir.isDirectory()) {
+                throw new IllegalStateException("Expecting '" + path + "' to be a directory but found a file");
+            }
+            if (!removeExistingContent) {
                 return dir;
             }
-            throw new IllegalStateException("Expecting '" + path + "' to be a directory but found a file");
+            delete(path);
         }
         dir.mkdirs();
         return dir;
@@ -519,6 +524,21 @@ public class IoUtil {
      */
     public static Properties loadProperties(Class<?> clazz, String classpathResource) {
         return loadProperties(clazz::getClassLoader, classpathResource);
+    }
+
+    /**
+     * Read a resource on classpath as a String
+     * @param classpathResource
+     * @return the content of resource as String
+     */
+    public static String readClassPathResource(String classpathResource) {
+        try (InputStream stream = IoUtil.class.getClassLoader().getResourceAsStream(classpathResource)) {
+            Objects.requireNonNull(stream);
+            return IoUtil.read(stream);
+        }
+        catch (IOException e) {
+            throw new DebeziumException("Unable to read '" + classpathResource + "'");
+        }
     }
 
     private IoUtil() {

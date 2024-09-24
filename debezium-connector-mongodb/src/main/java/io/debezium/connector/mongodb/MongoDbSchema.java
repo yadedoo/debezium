@@ -5,24 +5,15 @@
  */
 package io.debezium.connector.mongodb;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Function;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
-import org.bson.Document;
-import org.bson.codecs.Encoder;
-import org.bson.json.JsonMode;
-import org.bson.json.JsonWriterSettings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.mongodb.DBCollection;
-import com.mongodb.MongoClient;
-import com.mongodb.util.JSONSerializers;
-import com.mongodb.util.ObjectSerializer;
-
+import io.debezium.annotation.ThreadSafe;
 import io.debezium.connector.mongodb.FieldSelector.FieldFilter;
 import io.debezium.data.Envelope;
 import io.debezium.data.Envelope.FieldName;
@@ -30,39 +21,38 @@ import io.debezium.data.Json;
 import io.debezium.pipeline.txmetadata.TransactionMonitor;
 import io.debezium.schema.DataCollectionSchema;
 import io.debezium.schema.DatabaseSchema;
-import io.debezium.schema.TopicSelector;
-import io.debezium.util.SchemaNameAdjuster;
+import io.debezium.schema.SchemaNameAdjuster;
+import io.debezium.spi.topic.TopicNamingStrategy;
 
 /**
  * @author Chris Cranford
  */
+@ThreadSafe
 public class MongoDbSchema implements DatabaseSchema<CollectionId> {
 
-    /**
-     * Common settings for writing JSON strings using a compact JSON format
-     */
-    public static final JsonWriterSettings COMPACT_JSON_SETTINGS = JsonWriterSettings.builder()
-            .outputMode(JsonMode.STRICT)
-            .indent(true)
-            .indentCharacters("")
-            .newLineCharacters("")
-            .build();
-
-    private static final ObjectSerializer jsonSerializer = JSONSerializers.getStrict();
     private static final Logger LOGGER = LoggerFactory.getLogger(MongoDbSchema.class);
 
-    private final Filters filters;
-    private final TopicSelector<CollectionId> topicSelector;
-    private final Schema sourceSchema;
-    private final SchemaNameAdjuster adjuster = SchemaNameAdjuster.create(LOGGER);
-    private final Function<Document, String> valueTransformer;
-    private final Map<CollectionId, MongoDbCollectionSchema> collections = new HashMap<>();
+    // Change Streams schemas
+    public static final String SCHEMA_NAME_UPDATED_DESCRIPTION = "io.debezium.connector.mongodb.changestream.updatedescription";
+    public static final String SCHEMA_NAME_TRUNCATED_ARRAY = "io.debezium.connector.mongodb.changestream.truncatedarray";
 
-    public MongoDbSchema(Filters filters, TopicSelector<CollectionId> topicSelector, Schema sourceSchema) {
+    public static final Schema TRUNCATED_ARRAY_SCHEMA = MongoDbSchemaFactory.get().truncatedArraySchema();
+
+    public static final Schema UPDATED_DESCRIPTION_SCHEMA = MongoDbSchemaFactory.get().updatedDescriptionSchema();
+
+    private final Filters filters;
+    private final TopicNamingStrategy<CollectionId> topicNamingStrategy;
+    private final Schema sourceSchema;
+    private final SchemaNameAdjuster adjuster;
+    private final ConcurrentMap<CollectionId, MongoDbCollectionSchema> collections = new ConcurrentHashMap<>();
+    private final JsonSerialization serialization = new JsonSerialization();
+
+    public MongoDbSchema(Filters filters, TopicNamingStrategy<CollectionId> topicNamingStrategy, Schema sourceSchema,
+                         SchemaNameAdjuster schemaNameAdjuster) {
         this.filters = filters;
-        this.topicSelector = topicSelector;
+        this.topicNamingStrategy = topicNamingStrategy;
         this.sourceSchema = sourceSchema;
-        this.valueTransformer = resolveValueTransformer();
+        this.adjuster = schemaNameAdjuster;
     }
 
     @Override
@@ -73,7 +63,7 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
     public DataCollectionSchema schemaFor(CollectionId collectionId) {
         return collections.computeIfAbsent(collectionId, id -> {
             final FieldFilter fieldFilter = filters.fieldFilterFor(id);
-            final String topicName = topicSelector.topicNameFor(id);
+            final String topicName = topicNamingStrategy.dataChangeTopic(id);
 
             final Schema keySchema = SchemaBuilder.struct()
                     .name(adjuster.adjust(topicName + ".Key"))
@@ -82,9 +72,10 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
 
             final Schema valueSchema = SchemaBuilder.struct()
                     .name(adjuster.adjust(Envelope.schemaName(topicName)))
+                    .field(FieldName.BEFORE, Json.builder().optional().build())
                     .field(FieldName.AFTER, Json.builder().optional().build())
-                    .field(MongoDbFieldName.PATCH, Json.builder().optional().build())
-                    .field(MongoDbFieldName.FILTER, Json.builder().optional().build())
+                    // Change Streams field
+                    .field(MongoDbFieldName.UPDATE_DESCRIPTION, UPDATED_DESCRIPTION_SCHEMA)
                     .field(FieldName.SOURCE, sourceSchema)
                     .field(FieldName.OPERATION, Schema.OPTIONAL_STRING_SCHEMA)
                     .field(FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA)
@@ -97,10 +88,10 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
                     id,
                     fieldFilter,
                     keySchema,
-                    this::getDocumentId,
+                    serialization::getDocumentId,
                     envelope,
                     valueSchema,
-                    this::getDocumentValue);
+                    serialization::getDocumentValue);
         });
     }
 
@@ -117,19 +108,8 @@ public class MongoDbSchema implements DatabaseSchema<CollectionId> {
         }
     }
 
-    private String getDocumentId(Document document) {
-        if (document == null) {
-            return null;
-        }
-        return jsonSerializer.serialize(document.get(DBCollection.ID_FIELD_NAME));
-    }
-
-    private String getDocumentValue(Document document) {
-        return valueTransformer.apply(document);
-    }
-
-    private static Function<Document, String> resolveValueTransformer() {
-        Encoder<Document> encoder = MongoClient.getDefaultCodecRegistry().get(Document.class);
-        return (doc) -> doc.toJson(COMPACT_JSON_SETTINGS, encoder);
+    @Override
+    public boolean isHistorized() {
+        return false;
     }
 }

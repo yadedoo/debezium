@@ -24,13 +24,14 @@ import io.debezium.data.Enum;
  */
 public abstract class AbstractSourceInfoStructMaker<T extends AbstractSourceInfo> implements SourceInfoStructMaker<T> {
 
-    public static final Schema SNAPSHOT_RECORD_SCHEMA = Enum.builder("true,last,false").defaultValue("false").optional().build();
+    public static final Schema SNAPSHOT_RECORD_SCHEMA = Enum.builder("true,last,false,incremental").defaultValue("false").optional().build();
 
-    private final String version;
-    private final String connector;
-    private final String serverName;
+    private String version;
+    private String connector;
+    private String serverName;
 
-    public AbstractSourceInfoStructMaker(String connector, String version, CommonConnectorConfig connectorConfig) {
+    @Override
+    public void init(String connector, String version, CommonConnectorConfig connectorConfig) {
         this.connector = Objects.requireNonNull(connector);
         this.version = Objects.requireNonNull(version);
         this.serverName = connectorConfig.getLogicalName();
@@ -43,7 +44,10 @@ public abstract class AbstractSourceInfoStructMaker<T extends AbstractSourceInfo
                 .field(AbstractSourceInfo.SERVER_NAME_KEY, Schema.STRING_SCHEMA)
                 .field(AbstractSourceInfo.TIMESTAMP_KEY, Schema.INT64_SCHEMA)
                 .field(AbstractSourceInfo.SNAPSHOT_KEY, SNAPSHOT_RECORD_SCHEMA)
-                .field(AbstractSourceInfo.DATABASE_NAME_KEY, Schema.STRING_SCHEMA);
+                .field(AbstractSourceInfo.DATABASE_NAME_KEY, Schema.STRING_SCHEMA)
+                .field(AbstractSourceInfo.SEQUENCE_KEY, Schema.OPTIONAL_STRING_SCHEMA)
+                .field(AbstractSourceInfo.TIMESTAMP_US_KEY, Schema.OPTIONAL_INT64_SCHEMA)
+                .field(AbstractSourceInfo.TIMESTAMP_NS_KEY, Schema.OPTIONAL_INT64_SCHEMA);
     }
 
     protected Struct commonStruct(T sourceInfo) {
@@ -54,7 +58,13 @@ public abstract class AbstractSourceInfoStructMaker<T extends AbstractSourceInfo
                 .put(AbstractSourceInfo.DEBEZIUM_CONNECTOR_KEY, connector)
                 .put(AbstractSourceInfo.SERVER_NAME_KEY, serverName)
                 .put(AbstractSourceInfo.TIMESTAMP_KEY, timestamp.toEpochMilli())
-                .put(AbstractSourceInfo.DATABASE_NAME_KEY, database);
+                .put(AbstractSourceInfo.DATABASE_NAME_KEY, database)
+                .put(AbstractSourceInfo.TIMESTAMP_US_KEY, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000))
+                .put(AbstractSourceInfo.TIMESTAMP_NS_KEY, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
+        final String sequence = sourceInfo.sequence();
+        if (sequence != null) {
+            ret.put(AbstractSourceInfo.SEQUENCE_KEY, sequence);
+        }
         final SnapshotRecord snapshot = sourceInfo.snapshot();
         if (snapshot != null) {
             snapshot.toSource(ret);

@@ -5,7 +5,7 @@
  */
 package io.debezium.testing.testcontainers;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
 import java.sql.Connection;
@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -25,8 +26,9 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.awaitility.Awaitility;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.rnorth.ducttape.unreliables.Unreliables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,7 +37,6 @@ import org.testcontainers.containers.Network;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.lifecycle.Startables;
-import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 import com.jayway.jsonpath.JsonPath;
 
@@ -47,22 +48,21 @@ public class DebeziumContainerTest {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DebeziumContainerTest.class);
 
-    private static Network network = Network.newNetwork();
+    private static final Network network = Network.newNetwork();
 
-    private static KafkaContainer kafkaContainer = new KafkaContainer()
-            .withNetwork(network);
+    private static final KafkaContainer kafkaContainer = DebeziumKafkaContainer.defaultKRaftContainer(network);
 
-    public static PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>("debezium/postgres:11")
+    public static PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>(ImageNames.POSTGRES_DOCKER_IMAGE_NAME)
             .withNetwork(network)
             .withNetworkAliases("postgres");
 
-    public static DebeziumContainer debeziumContainer = new DebeziumContainer("debezium/connect:1.1.1.Final")
+    public static DebeziumContainer debeziumContainer = DebeziumContainer.nightly()
             .withNetwork(network)
             .withKafka(kafkaContainer)
             .withLogConsumer(new Slf4jLogConsumer(LOGGER))
             .dependsOn(kafkaContainer);
 
-    @BeforeClass
+    @BeforeAll
     public static void startContainers() {
         Startables.deepStart(Stream.of(
                 kafkaContainer, postgresContainer, debeziumContainer)).join();
@@ -78,7 +78,7 @@ public class DebeziumContainerTest {
                 .atMost(Duration.ofSeconds(30))
                 .untilAsserted(
                         () -> {
-                            String status = executeHttpRequest(debeziumContainer.getConnectorStatus("my-connector-1"));
+                            String status = executeHttpRequest(debeziumContainer.getConnectorStatusUri("my-connector-1"));
 
                             assertThat(JsonPath.<String> read(status, "$.name")).isEqualTo("my-connector-1");
                             assertThat(JsonPath.<String> read(status, "$.connector.state")).isEqualTo("RUNNING");
@@ -132,7 +132,7 @@ public class DebeziumContainerTest {
 
     private KafkaConsumer<String, String> getConsumer(KafkaContainer kafkaContainer) {
         return new KafkaConsumer<>(
-                ImmutableMap.of(
+                Map.of(
                         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaContainer.getBootstrapServers(),
                         ConsumerConfig.GROUP_ID_CONFIG, "tc-" + UUID.randomUUID(),
                         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
@@ -144,7 +144,7 @@ public class DebeziumContainerTest {
         List<ConsumerRecord<String, String>> allRecords = new ArrayList<>();
 
         Unreliables.retryUntilTrue(10, TimeUnit.SECONDS, () -> {
-            consumer.poll(Duration.ofMillis(50).toMillis())
+            consumer.poll(Duration.ofMillis(50))
                     .iterator()
                     .forEachRemaining(allRecords::add);
 
@@ -157,7 +157,7 @@ public class DebeziumContainerTest {
     private ConnectorConfiguration getConfiguration(int id) {
         // host, database, user etc. are obtained from the container
         return ConnectorConfiguration.forJdbcContainer(postgresContainer)
-                .with("database.server.name", "dbserver" + id)
+                .with("topic.prefix", "dbserver" + id)
                 .with("slot.name", "debezium_" + id);
     }
 
@@ -167,6 +167,24 @@ public class DebeziumContainerTest {
 
         try (Response response = client.newCall(request).execute()) {
             return response.body().string();
+        }
+    }
+
+    @AfterAll
+    public static void stopContainers() {
+        try {
+            if (postgresContainer != null) {
+                postgresContainer.stop();
+            }
+            if (kafkaContainer != null) {
+                kafkaContainer.stop();
+            }
+            if (debeziumContainer != null) {
+                debeziumContainer.stop();
+            }
+        }
+        catch (Exception e) {
+            // ignored
         }
     }
 }

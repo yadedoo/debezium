@@ -48,14 +48,14 @@ public final class Tables {
         /**
          * Creates a {@link TableFilter} from the given predicate.
          */
-        public static TableFilter fromPredicate(Predicate<TableId> predicate) {
+        static TableFilter fromPredicate(Predicate<TableId> predicate) {
             return t -> predicate.test(t);
         }
 
         /**
          * Creates a {@link TableFilter} that includes all tables.
          */
-        public static TableFilter includeAll() {
+        static TableFilter includeAll() {
             return t -> true;
         }
     }
@@ -72,9 +72,10 @@ public final class Tables {
          * @param fullyQualifiedColumnNames the comma-separated list of fully-qualified column names to exclude; may be null or
          * @return a column name filter; never null
          */
-        public static ColumnNameFilter createExcludeListFilter(String fullyQualifiedColumnNames) {
+        public static ColumnNameFilter createExcludeListFilter(String fullyQualifiedColumnNames, ColumnFilterMode columnFilterMode) {
             Predicate<ColumnId> delegate = Predicates.excludes(fullyQualifiedColumnNames, ColumnId::toString);
-            return (catalogName, schemaName, tableName, columnName) -> delegate.test(new ColumnId(new TableId(catalogName, schemaName, tableName), columnName));
+            return (catalogName, schemaName, tableName, columnName) -> delegate
+                    .test(new ColumnId(columnFilterMode.getTableIdForFilter(catalogName, schemaName, tableName), columnName));
         }
 
         /**
@@ -87,9 +88,10 @@ public final class Tables {
          * @param fullyQualifiedColumnNames the comma-separated list of fully-qualified column names to  include; may be null or
          * @return a column name filter; never null
          */
-        public static ColumnNameFilter createIncludeListFilter(String fullyQualifiedColumnNames) {
+        public static ColumnNameFilter createIncludeListFilter(String fullyQualifiedColumnNames, ColumnFilterMode columnFilterMode) {
             Predicate<ColumnId> delegate = Predicates.includes(fullyQualifiedColumnNames, ColumnId::toString);
-            return (catalogName, schemaName, tableName, columnName) -> delegate.test(new ColumnId(new TableId(catalogName, schemaName, tableName), columnName));
+            return (catalogName, schemaName, tableName, columnName) -> delegate
+                    .test(new ColumnId(columnFilterMode.getTableIdForFilter(catalogName, schemaName, tableName), columnName));
         }
     }
 
@@ -177,13 +179,21 @@ public final class Tables {
      * @param columnDefs the list of column definitions; may not be null or empty
      * @param primaryKeyColumnNames the list of the column names that make up the primary key; may be null or empty
      * @param defaultCharsetName the name of the character set that should be used by default
+     * @param attributes the list of attribute definitions; may not be null or empty
      * @return the previous table definition, or null if there was no prior table definition
      */
     public Table overwriteTable(TableId tableId, List<Column> columnDefs, List<String> primaryKeyColumnNames,
-                                String defaultCharsetName) {
+                                String defaultCharsetName, List<Attribute> attributes) {
         return lock.write(() -> {
-            TableImpl updated = new TableImpl(tableId, columnDefs, primaryKeyColumnNames, defaultCharsetName);
-            TableImpl existing = tablesByTableId.get(tableId);
+            Table updated = Table.editor()
+                    .tableId(tableId)
+                    .addColumns(columnDefs)
+                    .setPrimaryKeyNames(primaryKeyColumnNames)
+                    .setDefaultCharsetName(defaultCharsetName)
+                    .addAttributes(attributes)
+                    .create();
+
+            Table existing = tablesByTableId.get(tableId);
             if (existing == null || !existing.equals(updated)) {
                 // Our understanding of the table has changed ...
                 changes.add(tableId);
@@ -243,7 +253,7 @@ public final class Tables {
             }
             tablesByTableId.remove(existing.id());
             TableImpl updated = new TableImpl(newTableId, existing.columns(),
-                    existing.primaryKeyColumnNames(), existing.defaultCharsetName());
+                    existing.primaryKeyColumnNames(), existing.defaultCharsetName(), existing.comment(), existing.attributes());
             try {
                 return tablesByTableId.put(updated.id(), updated);
             }
@@ -264,11 +274,11 @@ public final class Tables {
      */
     public Table updateTable(TableId tableId, Function<Table, Table> changer) {
         return lock.write(() -> {
-            TableImpl existing = tablesByTableId.get(tableId);
+            Table existing = tablesByTableId.get(tableId);
             Table updated = changer.apply(existing);
             if (updated != existing) {
                 tablesByTableId.put(tableId, new TableImpl(tableId, updated.columns(),
-                        updated.primaryKeyColumnNames(), updated.defaultCharsetName()));
+                        updated.primaryKeyColumnNames(), updated.defaultCharsetName(), updated.comment(), updated.attributes()));
             }
             changes.add(tableId);
             return existing;
@@ -388,7 +398,12 @@ public final class Tables {
                 sb.append(System.lineSeparator());
                 tablesByTableId.forEach((tableId, table) -> {
                     sb.append("  ").append(tableId).append(": {").append(System.lineSeparator());
-                    table.toString(sb, "    ");
+                    if (table instanceof TableImpl) {
+                        ((TableImpl) table).toString(sb, "    ");
+                    }
+                    else {
+                        sb.append(table.toString());
+                    }
                     sb.append("  }").append(System.lineSeparator());
                 });
             }
@@ -403,9 +418,9 @@ public final class Tables {
     private static class TablesById {
 
         private final boolean tableIdCaseInsensitive;
-        private final ConcurrentMap<TableId, TableImpl> values;
+        private final ConcurrentMap<TableId, Table> values;
 
-        public TablesById(boolean tableIdCaseInsensitive) {
+        TablesById(boolean tableIdCaseInsensitive) {
             this.tableIdCaseInsensitive = tableIdCaseInsensitive;
             this.values = new ConcurrentHashMap<>();
         }
@@ -428,15 +443,15 @@ public final class Tables {
             }
         }
 
-        public TableImpl remove(TableId tableId) {
+        public Table remove(TableId tableId) {
             return values.remove(toLowerCaseIfNeeded(tableId));
         }
 
-        public TableImpl get(TableId tableId) {
+        public Table get(TableId tableId) {
             return values.get(toLowerCaseIfNeeded(tableId));
         }
 
-        public Table put(TableId tableId, TableImpl updated) {
+        public Table put(TableId tableId, Table updated) {
             return values.put(toLowerCaseIfNeeded(tableId), updated);
         }
 
@@ -444,11 +459,11 @@ public final class Tables {
             return values.size();
         }
 
-        void forEach(BiConsumer<? super TableId, ? super TableImpl> action) {
+        void forEach(BiConsumer<? super TableId, ? super Table> action) {
             values.forEach(action);
         }
 
-        Set<Map.Entry<TableId, TableImpl>> entrySet() {
+        Set<Map.Entry<TableId, Table>> entrySet() {
             return values.entrySet();
         }
 
@@ -490,7 +505,7 @@ public final class Tables {
         private final boolean tableIdCaseInsensitive;
         private final Set<TableId> values;
 
-        public TableIds(boolean tableIdCaseInsensitive) {
+        TableIds(boolean tableIdCaseInsensitive) {
             this.tableIdCaseInsensitive = tableIdCaseInsensitive;
             this.values = new HashSet<>();
         }

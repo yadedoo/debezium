@@ -13,9 +13,11 @@ import java.io.Reader;
 import java.net.URL;
 import java.time.Duration;
 import java.time.temporal.TemporalUnit;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -62,7 +64,8 @@ public interface Configuration {
 
     Logger CONFIGURATION_LOGGER = LoggerFactory.getLogger(Configuration.class);
 
-    Pattern PASSWORD_PATTERN = Pattern.compile(".*password$|.*sasl\\.jaas\\.config$", Pattern.CASE_INSENSITIVE);
+    Pattern PASSWORD_PATTERN = Pattern.compile(".*secret$|.*password$|.*sasl\\.jaas\\.config$|.*basic\\.auth\\.user\\.info|.*registry\\.auth\\.client-secret",
+            Pattern.CASE_INSENSITIVE);
 
     /**
      * The basic interface for configuration builders.
@@ -70,7 +73,7 @@ public interface Configuration {
      * @param <C> the type of configuration
      * @param <B> the type of builder
      */
-    public static interface ConfigBuilder<C extends Configuration, B extends ConfigBuilder<C, B>> {
+    interface ConfigBuilder<C extends Configuration, B extends ConfigBuilder<C, B>> {
         /**
          * Associate the given value with the specified key.
          *
@@ -473,6 +476,14 @@ public interface Configuration {
         }
 
         /**
+         * Remove the value associated with the specified key.
+         *
+         * @param key the key
+         * @return this builder object so methods can be chained together; never null
+         */
+        B without(String key);
+
+        /**
          * Apply the function to this builder.
          *
          * @param function the predefined field for the key
@@ -664,7 +675,7 @@ public interface Configuration {
     /**
      * A builder of Configuration objects.
      */
-    public static class Builder implements ConfigBuilder<Configuration, Builder> {
+    class Builder implements ConfigBuilder<Configuration, Builder> {
         private final Properties props = new Properties();
 
         protected Builder() {
@@ -685,6 +696,12 @@ public interface Configuration {
             if (!props.containsKey(key)) {
                 props.setProperty(key, value);
             }
+            return this;
+        }
+
+        @Override
+        public Builder without(String key) {
+            props.remove(key);
             return this;
         }
 
@@ -724,7 +741,7 @@ public interface Configuration {
      *
      * @return the configuration builder
      */
-    public static Builder create() {
+    static Builder create() {
         return new Builder();
     }
 
@@ -734,7 +751,7 @@ public interface Configuration {
      * @param config the configuration to copy; may be null
      * @return the configuration builder
      */
-    public static Builder copy(Configuration config) {
+    static Builder copy(Configuration config) {
         return config != null ? new Builder(config.asProperties()) : new Builder();
     }
 
@@ -744,7 +761,7 @@ public interface Configuration {
      * @param prefix the required prefix for the system properties; may not be null but may be empty
      * @return the configuration
      */
-    public static Configuration fromSystemProperties(String prefix) {
+    static Configuration fromSystemProperties(String prefix) {
         return empty().withSystemProperties(prefix);
     }
 
@@ -753,7 +770,7 @@ public interface Configuration {
      *
      * @return an empty configuration; never null
      */
-    public static Configuration empty() {
+    static Configuration empty() {
         return new Configuration() {
             @Override
             public Set<String> keys() {
@@ -779,7 +796,7 @@ public interface Configuration {
      * @param properties the properties; may be null or empty
      * @return the configuration; never null
      */
-    public static Configuration from(Properties properties) {
+    static Configuration from(Properties properties) {
         Properties props = new Properties();
         if (properties != null) {
             props.putAll(properties);
@@ -787,12 +804,12 @@ public interface Configuration {
         return new Configuration() {
             @Override
             public String getString(String key) {
-                return properties.getProperty(key);
+                return props.getProperty(key);
             }
 
             @Override
             public Set<String> keys() {
-                return properties.stringPropertyNames();
+                return props.stringPropertyNames();
             }
 
             @Override
@@ -809,7 +826,7 @@ public interface Configuration {
      * @param properties the properties; may be null or empty
      * @return the configuration; never null
      */
-    public static Configuration from(Map<String, ?> properties) {
+    static Configuration from(Map<String, ?> properties) {
         return from(properties, value -> {
             if (value == null) {
                 return null;
@@ -830,20 +847,20 @@ public interface Configuration {
      *            is to be excluded
      * @return the configuration; never null
      */
-    public static <T> Configuration from(Map<String, T> properties, Function<T, String> conversion) {
-        Map<String, Object> props = new HashMap<>();
+    static <T> Configuration from(Map<String, T> properties, Function<T, String> conversion) {
+        Map<String, T> props = new HashMap<>();
         if (properties != null) {
             props.putAll(properties);
         }
         return new Configuration() {
             @Override
             public String getString(String key) {
-                return conversion.apply(properties.get(key));
+                return conversion.apply((T) props.get(key));
             }
 
             @Override
             public Set<String> keys() {
-                return properties.keySet();
+                return props.keySet();
             }
 
             @Override
@@ -860,7 +877,7 @@ public interface Configuration {
      * @return the configuration; never null
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(URL url) throws IOException {
+    static Configuration load(URL url) throws IOException {
         try (InputStream stream = url.openStream()) {
             return load(stream);
         }
@@ -873,7 +890,7 @@ public interface Configuration {
      * @return the configuration; never null
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(File file) throws IOException {
+    static Configuration load(File file) throws IOException {
         try (InputStream stream = new FileInputStream(file)) {
             return load(stream);
         }
@@ -886,7 +903,7 @@ public interface Configuration {
      * @return the configuration; never null
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(InputStream stream) throws IOException {
+    static Configuration load(InputStream stream) throws IOException {
         try {
             Properties properties = new Properties();
             properties.load(stream);
@@ -904,7 +921,7 @@ public interface Configuration {
      * @return the configuration; never null
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(Reader reader) throws IOException {
+    static Configuration load(Reader reader) throws IOException {
         try {
             Properties properties = new Properties();
             properties.load(reader);
@@ -924,7 +941,7 @@ public interface Configuration {
      * @return the configuration; never null but possibly empty
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(String path, Class<?> clazz) throws IOException {
+    static Configuration load(String path, Class<?> clazz) throws IOException {
         return load(path, clazz.getClassLoader());
     }
 
@@ -937,7 +954,7 @@ public interface Configuration {
      * @return the configuration; never null but possibly empty
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(String path, ClassLoader classLoader) throws IOException {
+    static Configuration load(String path, ClassLoader classLoader) throws IOException {
         Logger logger = LoggerFactory.getLogger(Configuration.class);
         return load(path, classLoader, logger::debug);
     }
@@ -952,7 +969,7 @@ public interface Configuration {
      * @return the configuration; never null but possibly empty
      * @throws IOException if there is an error reading the stream
      */
-    public static Configuration load(String path, ClassLoader classLoader, Consumer<String> logger) throws IOException {
+    static Configuration load(String path, ClassLoader classLoader, Consumer<String> logger) throws IOException {
         try (InputStream stream = IoUtil.getResourceAsStream(path, classLoader, null, null, logger)) {
             Properties props = new Properties();
             if (stream != null) {
@@ -982,11 +999,22 @@ public interface Configuration {
     }
 
     /**
+     * Determine whether this configuration contains a key-value pair associated with the given field and the value
+     * is non-null.
+     *
+     * @param field the field; may not be null
+     * @return true if the configuration contains the key, or false otherwise
+     */
+    default boolean hasKey(Field field) {
+        return hasKey(field.name());
+    }
+
+    /**
      * Get the set of keys in this configuration.
      *
      * @return the set of keys; never null but possibly empty
      */
-    public Set<String> keys();
+    Set<String> keys();
 
     /**
      * Get the string value associated with the given key.
@@ -994,7 +1022,28 @@ public interface Configuration {
      * @param key the key for the configuration property
      * @return the value, or null if the key is null or there is no such key-value pair in the configuration
      */
-    public String getString(String key);
+    String getString(String key);
+
+    default List<String> getList(Field field) {
+        return getList(field.name());
+    }
+
+    default List<String> getList(String key) {
+        return getList(key, ",", Function.identity());
+    }
+
+    default <T> List<T> getList(Field field, String separator, Function<String, T> converter) {
+        return getList(field.name(), separator, converter);
+    }
+
+    default <T> List<T> getList(String key, String separator, Function<String, T> converter) {
+        var value = getString(key);
+        return value == null ? List.of()
+                : Arrays.stream(value.split(Pattern.quote(separator)))
+                        .map(String::trim)
+                        .map(converter)
+                        .collect(Collectors.toList());
+    }
 
     /**
      * Get the string value associated with the given key, returning the default value if there is no such key-value pair.
@@ -1077,6 +1126,26 @@ public interface Configuration {
             return null;
         }
         return Collect.arrayListOf(value.split(regex));
+    }
+
+    /**
+     * Get the string value(s) associated with the given key, where the supplied regular expression is used to parse the single
+     * string value into multiple values. In addition, all values will be trimmed.
+     *
+     * @param field the field for the configuration property
+     * @param regex the delimiting regular expression
+     * @return the list of string values; null only if there is no such key-value pair in the configuration
+     * @see String#split(String)
+     */
+    default List<String> getTrimmedStrings(Field field, String regex) {
+        String value = getString(field);
+        if (value == null) {
+            return null;
+        }
+
+        return Arrays.stream(value.split(regex))
+                .map(String::trim)
+                .collect(Collectors.toList());
     }
 
     /**
@@ -1375,7 +1444,7 @@ public interface Configuration {
     }
 
     /**
-     * Get the boolean value associated with the given key, using the given supplier to obtain a default value if there is no such
+     * Get the string value associated with the given key, using the given supplier to obtain a default value if there is no such
      * key-value pair.
      *
      * @param field the field
@@ -1408,21 +1477,7 @@ public interface Configuration {
      *         configuration but the value could not be converted to an existing class with a zero-argument constructor
      */
     default <T> T getInstance(String key, Class<T> type) {
-        return getInstance(key, type, () -> getClass().getClassLoader());
-    }
-
-    /**
-     * Get an instance of the class given by the value in the configuration associated with the given key.
-     *
-     * @param key the key for the configuration property
-     * @param type the Class of which the resulting object is expected to be an instance of; may not be null
-     * @param classloaderSupplier the supplier of the ClassLoader to be used to load the resulting class; may be null if this
-     *            class' ClassLoader should be used
-     * @return the new instance, or null if there is no such key-value pair in the configuration or if there is a key-value
-     *         configuration but the value could not be converted to an existing class with a zero-argument constructor
-     */
-    default <T> T getInstance(String key, Class<T> type, Supplier<ClassLoader> classloaderSupplier) {
-        return Instantiator.getInstance(getString(key), classloaderSupplier, null);
+        return Instantiator.getInstance(getString(key));
     }
 
     /**
@@ -1436,19 +1491,7 @@ public interface Configuration {
      *         configuration but the value could not be converted to an existing class with a zero-argument constructor
      */
     default <T> T getInstance(String key, Class<T> clazz, Configuration configuration) {
-        return Instantiator.getInstance(getString(key), () -> getClass().getClassLoader(), configuration);
-    }
-
-    /**
-     * Get an instance of the class given by the value in the configuration associated with the given field.
-     *
-     * @param field the field for the configuration property
-     * @param clazz the Class of which the resulting object is expected to be an instance of; may not be null
-     * @return the new instance, or null if there is no such key-value pair in the configuration or if there is a key-value
-     *         configuration but the value could not be converted to an existing class with a zero-argument constructor
-     */
-    default <T> T getInstance(Field field, Class<T> clazz) {
-        return getInstance(field, clazz, () -> getClass().getClassLoader());
+        return Instantiator.getInstance(getString(key), configuration);
     }
 
     /**
@@ -1456,13 +1499,11 @@ public interface Configuration {
      *
      * @param field the field for the configuration property
      * @param type the Class of which the resulting object is expected to be an instance of; may not be null
-     * @param classloaderSupplier the supplier of the ClassLoader to be used to load the resulting class; may be null if this
-     *            class' ClassLoader should be used
      * @return the new instance, or null if there is no such key-value pair in the configuration or if there is a key-value
      *         configuration but the value could not be converted to an existing class with a zero-argument constructor
      */
-    default <T> T getInstance(Field field, Class<T> type, Supplier<ClassLoader> classloaderSupplier) {
-        return Instantiator.getInstance(getString(field), classloaderSupplier, null);
+    default <T> T getInstance(Field field, Class<T> type) {
+        return Instantiator.getInstance(getString(field));
     }
 
     /**
@@ -1476,7 +1517,21 @@ public interface Configuration {
      *         configuration but the value could not be converted to an existing class with a zero-argument constructor
      */
     default <T> T getInstance(Field field, Class<T> clazz, Configuration configuration) {
-        return Instantiator.getInstance(getString(field), () -> getClass().getClassLoader(), configuration);
+        return Instantiator.getInstance(getString(field), configuration);
+    }
+
+    /**
+     * Get an instance of the class given by the value in the configuration associated with the given field.
+     * The instance is created using {@code Instance(Configuration)} constructor.
+     *
+     * @param field the field for the configuration property
+     * @param clazz the Class of which the resulting object is expected to be an instance of; may not be null
+     * @param props the {@link Properties} object that is passed as a parameter to the constructor
+     * @return the new instance, or null if there is no such key-value pair in the configuration or if there is a key-value
+     *         configuration but the value could not be converted to an existing class with a zero-argument constructor
+     */
+    default <T> T getInstance(Field field, Class<T> clazz, Properties props) {
+        return Instantiator.getInstanceWithProperties(getString(field), props);
     }
 
     /**
@@ -1504,6 +1559,49 @@ public interface Configuration {
         int minLength = prefixWithSeparator.length();
         Function<String, String> prefixRemover = removePrefix ? key -> key.substring(minLength) : key -> key;
         return filter(key -> key != null && key.startsWith(prefixWithSeparator)).map(prefixRemover);
+    }
+
+    /**
+     * Return a new {@link Configuration} that merges several {@link Configuration}s into one.
+     * <p>
+     * This method returns this Configuration instance if the supplied {@code configs} is null or empty.
+     *
+     * @param configs Configurations to be merged
+     * @return the subset of this Configuration; never null
+     */
+    default Configuration merge(Configuration... configs) {
+        if (configs == null || configs.length == 0) {
+            return this;
+        }
+
+        Set<String> keys = new HashSet<>(keys());
+        for (Configuration config : configs) {
+            keys.addAll(config.keys());
+        }
+
+        return new Configuration() {
+            @Override
+            public Set<String> keys() {
+                return Collect.unmodifiableSet(keys.stream().filter(k -> k != null).collect(Collectors.toSet()));
+            }
+
+            @Override
+            public String getString(String key) {
+                String value = null;
+                for (Configuration config : Collect.arrayListOf(Configuration.this, configs)) {
+                    value = config.getString(key);
+                    if (value != null) {
+                        break;
+                    }
+                }
+                return value;
+            }
+
+            @Override
+            public String toString() {
+                return withMaskedPasswords().asProperties().toString();
+            }
+        };
     }
 
     /**
@@ -1873,22 +1971,18 @@ public interface Configuration {
     default Map<String, ConfigValue> validate(Field.Set fields) {
         // Create a map of configuration values for each field ...
         Map<String, ConfigValue> configValuesByFieldName = new HashMap<>();
-        fields.forEach(field -> {
-            configValuesByFieldName.put(field.name(), new ConfigValue(field.name()));
-        });
+        fields.forEach(field -> configValuesByFieldName.put(field.name(), new ConfigValue(field.name())));
 
         // If any dependents don't exist ...
-        fields.forEachMissingDependent(missingDepedent -> {
-            ConfigValue undefinedConfigValue = new ConfigValue(missingDepedent);
-            undefinedConfigValue.addErrorMessage(missingDepedent + " is referred in the dependents, but not defined.");
+        fields.forEachMissingDependent(missingDependent -> {
+            ConfigValue undefinedConfigValue = new ConfigValue(missingDependent);
+            undefinedConfigValue.addErrorMessage(missingDependent + " is referred in the dependents, but not defined.");
             undefinedConfigValue.visible(false);
-            configValuesByFieldName.put(missingDepedent, undefinedConfigValue);
+            configValuesByFieldName.put(missingDependent, undefinedConfigValue);
         });
 
         // Now validate each top-level field ...
-        fields.forEachTopLevelField(field -> {
-            field.validate(this, fields::fieldWithName, configValuesByFieldName);
-        });
+        fields.forEachTopLevelField(field -> field.validate(this, fields::fieldWithName, configValuesByFieldName));
 
         return configValuesByFieldName;
     }
@@ -2099,44 +2193,4 @@ public interface Configuration {
     default <T> void forEach(BiConsumer<String, String> function) {
         this.asMap().forEach(function);
     }
-
-    /**
-     * Returns the string config value from newProperty config field if it's set or its default value when it's not
-     * set/null.If both are null it returns the value of the oldProperty config field, or its default value when it's
-     * null.
-     * This fallback only works for newProperty fields that have a null / not-set default value!
-     *
-     * @param newProperty the new property config field
-     * @param oldProperty the old / fallback property config field
-     * @return the evaluated value
-     */
-    default String getFallbackStringProperty(Field newProperty, Field oldProperty) {
-        return Configuration.getFallbackStringProperty(this, newProperty, oldProperty);
-    }
-
-    /**
-     * Returns the string config value of the provided Configuration from newProperty config field if it's set or its
-     * default value when it's not set/null.If both are null it returns the value of the oldProperty config field, or
-     * its default value when it's null.
-     * This fallback only works for newProperty fields that have a null / not-set default value!
-     *
-     * @param newProperty the new property config field
-     * @param oldProperty the old / fallback property config field
-     * @return the evaluated value
-     */
-    static String getFallbackStringProperty(Configuration config, Field newProperty, Field oldProperty) {
-        if (null != config.getString(oldProperty.name()) && null != config.getString(newProperty.name())) { // both are set
-            CONFIGURATION_LOGGER.warn("Provided configuration has deprecated property \"" + oldProperty.name()
-                    + "\" and new property \"" + newProperty.name() + "\" set. Using value from \"" + newProperty.name() + "\"!");
-        }
-        return config.getString(
-                newProperty,
-                () -> {
-                    CONFIGURATION_LOGGER.warn("Using configuration property \"" + oldProperty.name()
-                            + "\" is deprecated and will be removed in future versions. Please use \"" + newProperty.name()
-                            + "\" instead.");
-                    return config.getString(oldProperty);
-                });
-    }
-
 }

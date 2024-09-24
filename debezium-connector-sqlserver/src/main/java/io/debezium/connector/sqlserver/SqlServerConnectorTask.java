@@ -7,29 +7,36 @@ package io.debezium.connector.sqlserver;
 
 import java.sql.SQLException;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
+import io.debezium.bean.StandardBeanNames;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.common.BaseSourceTask;
+import io.debezium.connector.sqlserver.metrics.SqlServerMetricsFactory;
+import io.debezium.document.DocumentReader;
+import io.debezium.jdbc.DefaultMainConnectionProvidingConnectionFactory;
+import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
 import io.debezium.pipeline.DataChangeEvent;
-import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
-import io.debezium.pipeline.metrics.DefaultChangeEventSourceMetricsFactory;
-import io.debezium.pipeline.spi.OffsetContext;
-import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
+import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.signal.SignalProcessor;
+import io.debezium.pipeline.spi.Offsets;
 import io.debezium.relational.TableId;
-import io.debezium.relational.history.DatabaseHistory;
-import io.debezium.schema.TopicSelector;
+import io.debezium.schema.SchemaFactory;
+import io.debezium.schema.SchemaNameAdjuster;
+import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
-import io.debezium.util.SchemaNameAdjuster;
 
 /**
  * The main task executing streaming from SQL Server.
@@ -38,7 +45,7 @@ import io.debezium.util.SchemaNameAdjuster;
  * @author Jiri Pechanec
  *
  */
-public class SqlServerConnectorTask extends BaseSourceTask {
+public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, SqlServerOffsetContext> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SqlServerConnectorTask.class);
     private static final String CONTEXT_NAME = "sql-server-connector-task";
@@ -47,7 +54,7 @@ public class SqlServerConnectorTask extends BaseSourceTask {
     private volatile ChangeEventQueue<DataChangeEvent> queue;
     private volatile SqlServerConnection dataConnection;
     private volatile SqlServerConnection metadataConnection;
-    private volatile ErrorHandler errorHandler;
+    private volatile SqlServerErrorHandler errorHandler;
     private volatile SqlServerDatabaseSchema schema;
 
     @Override
@@ -56,37 +63,51 @@ public class SqlServerConnectorTask extends BaseSourceTask {
     }
 
     @Override
-    public ChangeEventSourceCoordinator start(Configuration config) {
+    public ChangeEventSourceCoordinator<SqlServerPartition, SqlServerOffsetContext> start(Configuration config) {
         final Clock clock = Clock.system();
-        final SqlServerConnectorConfig connectorConfig = new SqlServerConnectorConfig(config);
-        final TopicSelector<TableId> topicSelector = SqlServerTopicSelector.defaultSelector(connectorConfig);
-        final SchemaNameAdjuster schemaNameAdjuster = SchemaNameAdjuster.create(LOGGER);
-        final SqlServerValueConverters valueConverters = new SqlServerValueConverters(connectorConfig.getDecimalMode(), connectorConfig.getTemporalPrecisionMode());
 
         // By default do not load whole result sets into memory
         config = config.edit()
-                .withDefault("database.responseBuffering", "adaptive")
-                .withDefault("database.fetchSize", 10_000)
+                .withDefault(CommonConnectorConfig.DRIVER_CONFIG_PREFIX + "responseBuffering", "adaptive")
+                .withDefault(CommonConnectorConfig.DRIVER_CONFIG_PREFIX + "fetchSize", 10_000)
                 .build();
 
-        final Configuration jdbcConfig = config.filter(
-                x -> !(x.startsWith(DatabaseHistory.CONFIGURATION_FIELD_PREFIX_STRING) || x.equals(HistorizedRelationalDatabaseConnectorConfig.DATABASE_HISTORY.name())))
-                .subset("database.", true);
-        dataConnection = new SqlServerConnection(jdbcConfig, clock, connectorConfig.getSourceTimestampMode(), valueConverters, () -> getClass().getClassLoader());
-        metadataConnection = new SqlServerConnection(jdbcConfig, clock, connectorConfig.getSourceTimestampMode(), valueConverters, () -> getClass().getClassLoader());
-        try {
-            dataConnection.setAutoCommit(false);
-        }
-        catch (SQLException e) {
-            throw new ConnectException(e);
-        }
-        this.schema = new SqlServerDatabaseSchema(connectorConfig, valueConverters, topicSelector, schemaNameAdjuster);
+        final SqlServerConnectorConfig connectorConfig = new SqlServerConnectorConfig(config);
+        final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY, true);
+        final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
+        final SqlServerValueConverters valueConverters = new SqlServerValueConverters(connectorConfig.getDecimalMode(),
+                connectorConfig.getTemporalPrecisionMode(), connectorConfig.binaryHandlingMode());
+
+        MainConnectionProvidingConnectionFactory<SqlServerConnection> connectionFactory = new DefaultMainConnectionProvidingConnectionFactory<>(
+                () -> new SqlServerConnection(connectorConfig,
+                        valueConverters, connectorConfig.getSkippedOperations(), connectorConfig.useSingleDatabase(), connectorConfig.getOptionRecompile()));
+        dataConnection = connectionFactory.mainConnection();
+        metadataConnection = new SqlServerConnection(connectorConfig, valueConverters,
+                connectorConfig.getSkippedOperations(), connectorConfig.useSingleDatabase());
+
+        this.schema = new SqlServerDatabaseSchema(connectorConfig, metadataConnection.getDefaultValueConverter(), valueConverters, topicNamingStrategy,
+                schemaNameAdjuster);
         this.schema.initializeStorage();
 
-        final OffsetContext previousOffset = getPreviousOffset(new SqlServerOffsetContext.Loader(connectorConfig));
-        if (previousOffset != null) {
-            schema.recover(previousOffset);
-        }
+        Offsets<SqlServerPartition, SqlServerOffsetContext> offsets = getPreviousOffsets(
+                new SqlServerPartition.Provider(connectorConfig),
+                new SqlServerOffsetContext.Loader(connectorConfig));
+
+        // Manual Bean Registration
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CONFIGURATION, config);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.JDBC_CONNECTION, metadataConnection);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.VALUE_CONVERTER, valueConverters);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, offsets);
+
+        // Service providers
+        registerServiceProviders(connectorConfig.getServiceRegistry());
+
+        final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry().tryGetService(SnapshotterService.class);
+
+        validateAndLoadSchemaHistory(connectorConfig, dataConnection::validateLogPosition, offsets, schema,
+                snapshotterService.getSnapshotter());
 
         taskContext = new SqlServerTaskContext(connectorConfig, schema);
 
@@ -95,32 +116,56 @@ public class SqlServerConnectorTask extends BaseSourceTask {
                 .pollInterval(connectorConfig.getPollInterval())
                 .maxBatchSize(connectorConfig.getMaxBatchSize())
                 .maxQueueSize(connectorConfig.getMaxQueueSize())
+                .maxQueueSizeInBytes(connectorConfig.getMaxQueueSizeInBytes())
                 .loggingContextSupplier(() -> taskContext.configureLoggingContext(CONTEXT_NAME))
                 .build();
 
-        errorHandler = new SqlServerErrorHandler(connectorConfig.getLogicalName(), queue);
+        errorHandler = new SqlServerErrorHandler(connectorConfig, queue, errorHandler);
 
         final SqlServerEventMetadataProvider metadataProvider = new SqlServerEventMetadataProvider();
 
-        final EventDispatcher<TableId> dispatcher = new EventDispatcher<>(
+        SignalProcessor<SqlServerPartition, SqlServerOffsetContext> signalProcessor = new SignalProcessor<>(
+                SqlServerConnector.class, connectorConfig, Map.of(),
+                getAvailableSignalChannels(),
+                DocumentReader.defaultReader(),
+                offsets);
+
+        final EventDispatcher<SqlServerPartition, TableId> dispatcher = new EventDispatcher<>(
                 connectorConfig,
-                topicSelector,
+                topicNamingStrategy,
                 schema,
                 queue,
                 connectorConfig.getTableFilters().dataCollectionFilter(),
                 DataChangeEvent::new,
                 metadataProvider,
-                schemaNameAdjuster);
+                connectorConfig.createHeartbeat(
+                        topicNamingStrategy,
+                        schemaNameAdjuster,
+                        connectionFactory::newConnection,
+                        exception -> {
+                            final String sqlErrorId = exception.getMessage();
+                            throw new DebeziumException("Could not execute heartbeat action query (Error: " + sqlErrorId + ")", exception);
+                        }),
+                schemaNameAdjuster,
+                signalProcessor);
 
-        ChangeEventSourceCoordinator coordinator = new ChangeEventSourceCoordinator(
-                previousOffset,
+        NotificationService<SqlServerPartition, SqlServerOffsetContext> notificationService = new NotificationService<>(getNotificationChannels(),
+                connectorConfig, SchemaFactory.get(), dispatcher::enqueueNotification);
+
+        ChangeEventSourceCoordinator<SqlServerPartition, SqlServerOffsetContext> coordinator = new SqlServerChangeEventSourceCoordinator(
+                offsets,
                 errorHandler,
                 SqlServerConnector.class,
                 connectorConfig,
-                new SqlServerChangeEventSourceFactory(connectorConfig, dataConnection, metadataConnection, errorHandler, dispatcher, clock, schema),
-                new DefaultChangeEventSourceMetricsFactory(),
+                new SqlServerChangeEventSourceFactory(connectorConfig, connectionFactory, metadataConnection, errorHandler, dispatcher, clock, schema,
+                        notificationService, snapshotterService),
+                new SqlServerMetricsFactory(offsets.getPartitions()),
                 dispatcher,
-                schema);
+                schema,
+                clock,
+                signalProcessor,
+                notificationService,
+                snapshotterService);
 
         coordinator.start(taskContext, this.queue, metadataProvider);
 
@@ -131,11 +176,17 @@ public class SqlServerConnectorTask extends BaseSourceTask {
     public List<SourceRecord> doPoll() throws InterruptedException {
         final List<DataChangeEvent> records = queue.poll();
 
-        final List<SourceRecord> sourceRecords = records.stream()
+        return records.stream()
                 .map(DataChangeEvent::getRecord)
                 .collect(Collectors.toList());
+    }
 
-        return sourceRecords;
+    @Override
+    protected void resetErrorHandlerRetriesIfNeeded(List<SourceRecord> records) {
+        // Reset the retries if all partitions have streamed without exceptions at least once after a restart
+        if (coordinator.getErrorHandler().getRetries() > 0 && ((SqlServerChangeEventSourceCoordinator) coordinator).firstStreamingIterationCompletedSuccessfully()) {
+            coordinator.getErrorHandler().resetRetries();
+        }
     }
 
     @Override
@@ -167,4 +218,5 @@ public class SqlServerConnectorTask extends BaseSourceTask {
     protected Iterable<Field> getAllConfigurationFields() {
         return SqlServerConnectorConfig.ALL_FIELDS;
     }
+
 }

@@ -8,15 +8,17 @@ package io.debezium.data;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 
-import io.debezium.pipeline.txmetadata.TransactionMonitor;
+import io.debezium.schema.SchemaFactory;
 
 /**
  * An immutable descriptor for the structure of Debezium message envelopes. An {@link Envelope} can be created for each message
@@ -27,10 +29,13 @@ import io.debezium.pipeline.txmetadata.TransactionMonitor;
  */
 public final class Envelope {
 
+    public static final int SCHEMA_VERSION = 2;
+
     /**
      * The constants for the values for the {@link FieldName#OPERATION operation} field in the message envelope.
      */
-    public static enum Operation {
+    public enum Operation {
+
         /**
          * The operation that read the current state of a record, most typically during snapshots.
          */
@@ -46,21 +51,32 @@ public final class Envelope {
         /**
          * An operation that resulted in an existing record being removed from or deleted in the source.
          */
-        DELETE("d");
+        DELETE("d"),
+        /**
+         * An operation that resulted in an existing table being truncated in the source.
+         */
+        TRUNCATE("t"),
+        /**
+         * An operation that resulted in a generic message
+         */
+        MESSAGE("m");
+
+        // Enum .values() returns a new array upon each invocation
+        // Reference: https://www.gamlor.info/wordpress/2017/08/javas-enum-values-hidden-allocations/
+        private static final Map<String, Operation> CODE_LOOKUP = Stream.of(Operation.values()).collect(
+                Collectors.toMap(Operation::code, op -> op));
 
         private final String code;
 
-        private Operation(String code) {
+        Operation(String code) {
             this.code = code;
         }
 
         public static Operation forCode(String code) {
-            for (Operation op : Operation.values()) {
-                if (op.code().equalsIgnoreCase(code)) {
-                    return op;
-                }
+            if (code == null) {
+                return null;
             }
-            return null;
+            return CODE_LOOKUP.get(code.toLowerCase());
         }
 
         public String code() {
@@ -101,6 +117,14 @@ public final class Envelope {
          * variations.
          */
         public static final String TIMESTAMP = "ts_ms";
+        /**
+         * The {@code ts_us} field represents the {@link #TIMESTAMP} but in microseconds.
+         */
+        public static final String TIMESTAMP_US = "ts_us";
+        /**
+         * The {@code ts_ns} field represents the {@link #TIMESTAMP} but in nanoseconds.
+         */
+        public static final String TIMESTAMP_NS = "ts_ns";
     }
 
     /**
@@ -117,6 +141,8 @@ public final class Envelope {
         Set<String> fields = new HashSet<>();
         fields.add(FieldName.OPERATION);
         fields.add(FieldName.TIMESTAMP);
+        fields.add(FieldName.TIMESTAMP_US);
+        fields.add(FieldName.TIMESTAMP_NS);
         fields.add(FieldName.BEFORE);
         fields.add(FieldName.AFTER);
         fields.add(FieldName.SOURCE);
@@ -132,7 +158,7 @@ public final class Envelope {
     /**
      * A builder of an envelope schema.
      */
-    public static interface Builder {
+    public interface Builder {
         /**
          * Define the {@link Schema} used in the {@link FieldName#BEFORE} and {@link FieldName#AFTER} fields.
          *
@@ -152,6 +178,16 @@ public final class Envelope {
          */
         default Builder withSource(Schema sourceSchema) {
             return withSchema(sourceSchema, FieldName.SOURCE);
+        }
+
+        /**
+         * Define the {@link Schema} used in the {@link FieldName#TRANSACTION} field.
+         *
+         * @param transactionSchema the schema of the {@link FieldName#TRANSACTION} field; may not be null
+         * @return this builder so methods can be chained; never null
+         */
+        default Builder withTransaction(Schema transactionSchema) {
+            return withSchema(transactionSchema, FieldName.TRANSACTION);
         }
 
         /**
@@ -188,52 +224,7 @@ public final class Envelope {
     }
 
     public static Builder defineSchema() {
-        return new Builder() {
-            private final SchemaBuilder builder = SchemaBuilder.struct();
-            private final Set<String> missingFields = new HashSet<>();
-
-            @Override
-            public Builder withSchema(Schema fieldSchema, String... fieldNames) {
-                for (String fieldName : fieldNames) {
-                    builder.field(fieldName, fieldSchema);
-                }
-                return this;
-            }
-
-            @Override
-            public Builder withName(String name) {
-                builder.name(name);
-                return this;
-            }
-
-            @Override
-            public Builder withDoc(String doc) {
-                builder.doc(doc);
-                return this;
-            }
-
-            @Override
-            public Envelope build() {
-                builder.field(FieldName.OPERATION, OPERATION_REQUIRED ? Schema.STRING_SCHEMA : Schema.OPTIONAL_STRING_SCHEMA);
-                builder.field(FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA);
-                builder.field(FieldName.TRANSACTION, TransactionMonitor.TRANSACTION_BLOCK_SCHEMA);
-                checkFieldIsDefined(FieldName.OPERATION);
-                checkFieldIsDefined(FieldName.BEFORE);
-                checkFieldIsDefined(FieldName.AFTER);
-                checkFieldIsDefined(FieldName.SOURCE);
-                checkFieldIsDefined(FieldName.TRANSACTION);
-                if (!missingFields.isEmpty()) {
-                    throw new IllegalStateException("The envelope schema is missing field(s) " + String.join(", ", missingFields));
-                }
-                return new Envelope(builder.build());
-            }
-
-            private void checkFieldIsDefined(String fieldName) {
-                if (builder.field(fieldName) == null) {
-                    missingFields.add(fieldName);
-                }
-            }
-        };
+        return SchemaFactory.get().datatypeEnvelopeSchema();
     }
 
     public static Envelope fromSchema(Schema schema) {
@@ -242,7 +233,7 @@ public final class Envelope {
 
     private final Schema schema;
 
-    private Envelope(Schema schema) {
+    public Envelope(Schema schema) {
         this.schema = schema;
     }
 
@@ -272,6 +263,8 @@ public final class Envelope {
         }
         if (timestamp != null) {
             struct.put(FieldName.TIMESTAMP, timestamp.toEpochMilli());
+            struct.put(FieldName.TIMESTAMP_US, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000));
+            struct.put(FieldName.TIMESTAMP_NS, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
         }
         return struct;
     }
@@ -293,6 +286,8 @@ public final class Envelope {
         }
         if (timestamp != null) {
             struct.put(FieldName.TIMESTAMP, timestamp.toEpochMilli());
+            struct.put(FieldName.TIMESTAMP_US, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000));
+            struct.put(FieldName.TIMESTAMP_NS, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
         }
         return struct;
     }
@@ -318,6 +313,8 @@ public final class Envelope {
         }
         if (timestamp != null) {
             struct.put(FieldName.TIMESTAMP, timestamp.toEpochMilli());
+            struct.put(FieldName.TIMESTAMP_US, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000));
+            struct.put(FieldName.TIMESTAMP_NS, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
         }
         return struct;
     }
@@ -341,7 +338,26 @@ public final class Envelope {
         }
         if (timestamp != null) {
             struct.put(FieldName.TIMESTAMP, timestamp.toEpochMilli());
+            struct.put(FieldName.TIMESTAMP_US, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000));
+            struct.put(FieldName.TIMESTAMP_NS, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
         }
+        return struct;
+    }
+
+    /**
+     * Generate an {@link Operation#TRUNCATE truncate} message with the given information.
+     *
+     * @param source the information about the source where the truncate occurred; never null
+     * @param timestamp the timestamp for this message; never null
+     * @return the truncate message; never null
+     */
+    public Struct truncate(Struct source, Instant timestamp) {
+        Struct struct = new Struct(schema);
+        struct.put(FieldName.OPERATION, Operation.TRUNCATE.code());
+        struct.put(FieldName.SOURCE, source);
+        struct.put(FieldName.TIMESTAMP, timestamp.toEpochMilli());
+        struct.put(FieldName.TIMESTAMP_US, (timestamp.getEpochSecond() * 1_000_000) + (timestamp.getNano() / 1_000));
+        struct.put(FieldName.TIMESTAMP_NS, (timestamp.getEpochSecond() * 1_000_000_000L) + timestamp.getNano());
         return struct;
     }
 

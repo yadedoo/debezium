@@ -9,13 +9,13 @@ import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
-import org.apache.kafka.connect.source.SourceConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,7 +32,7 @@ public class Threads {
     /**
      * Measures the amount time that has elapsed since the last {@link #reset() reset}.
      */
-    public static interface TimeSince {
+    public interface TimeSince {
         /**
          * Reset the elapsed time to 0.
          */
@@ -50,7 +50,7 @@ public class Threads {
      * Expires after defined time period.
      *
      */
-    public static interface Timer {
+    public interface Timer {
 
         /**
          * @return true if current time is greater than start time plus requested time period
@@ -78,7 +78,7 @@ public class Threads {
             @Override
             public long elapsedTime() {
                 long elapsed = clock.currentTimeInMillis() - lastTimeInMillis;
-                return elapsed <= 0L ? 0L : elapsed;
+                return Math.max(elapsed, 0L);
             }
         };
     }
@@ -239,35 +239,35 @@ public class Threads {
 
     /**
      * Returns a thread factory that creates threads conforming to Debezium thread naming
-     * pattern {@code debezium-<connector class>-<connector-id>-<thread-name>}.
+     * pattern {@code debezium-<component class>-<component-id>-<thread-name>}.
      *
-     * @param connector - the source connector class
-     * @param connectorId - the identifier to differentiate between connector instances
+     * @param component - the source connector or sink change consumer class
+     * @param componentId - the identifier to differentiate between component instances
      * @param name - the name of the thread
      * @param indexed - true if the thread name should be appended with an index
      * @param daemon - true if the thread should be a daemon thread
      * @return the thread factory setting the correct name
      */
-    public static ThreadFactory threadFactory(Class<? extends SourceConnector> connector, String connectorId, String name, boolean indexed, boolean daemon) {
-        return threadFactory(connector, connectorId, name, indexed, daemon, null);
+    public static ThreadFactory threadFactory(Class<?> component, String componentId, String name, boolean indexed, boolean daemon) {
+        return threadFactory(component, componentId, name, indexed, daemon, null);
     }
 
     /**
      * Returns a thread factory that creates threads conforming to Debezium thread naming
-     * pattern {@code debezium-<connector class>-<connector-id>-<thread-name>}.
+     * pattern {@code debezium-<component class>-<component-id>-<thread-name>}.
      *
-     * @param connector - the source connector class
-     * @param connectorId - the identifier to differentiate between connector instances
+     * @param component - the source or sink component class
+     * @param componentId - the identifier to differentiate between componentId instances
      * @param name - the name of the thread
      * @param indexed - true if the thread name should be appended with an index
      * @param daemon - true if the thread should be a daemon thread
      * @param callback - a callback called on every thread created
      * @return the thread factory setting the correct name
      */
-    public static ThreadFactory threadFactory(Class<? extends SourceConnector> connector, String connectorId, String name, boolean indexed, boolean daemon,
+    public static ThreadFactory threadFactory(Class<?> component, String componentId, String name, boolean indexed, boolean daemon,
                                               Consumer<Thread> callback) {
         if (LOGGER.isInfoEnabled()) {
-            LOGGER.info("Requested thread factory for connector {}, id = {} named = {}", connector.getSimpleName(), connectorId, name);
+            LOGGER.info("Requested thread factory for component {}, id = {} named = {}", component.getSimpleName(), componentId, name);
         }
 
         return new ThreadFactory() {
@@ -276,9 +276,9 @@ public class Threads {
             @Override
             public Thread newThread(Runnable r) {
                 StringBuilder threadName = new StringBuilder(DEBEZIUM_THREAD_NAME_PREFIX)
-                        .append(connector.getSimpleName().toLowerCase())
+                        .append(component.getSimpleName().toLowerCase())
                         .append('-')
-                        .append(connectorId)
+                        .append(componentId)
                         .append('-')
                         .append(name);
                 if (indexed) {
@@ -295,15 +295,19 @@ public class Threads {
         };
     }
 
-    public static ExecutorService newSingleThreadExecutor(Class<? extends SourceConnector> connector, String connectorId, String name, boolean daemon) {
-        return Executors.newSingleThreadExecutor(threadFactory(connector, connectorId, name, false, daemon));
+    public static ExecutorService newSingleThreadExecutor(Class<?> component, String componentId, String name, boolean daemon) {
+        return Executors.newSingleThreadExecutor(threadFactory(component, componentId, name, false, daemon));
     }
 
-    public static ExecutorService newFixedThreadPool(Class<? extends SourceConnector> connector, String connectorId, String name, int threadCount) {
-        return Executors.newFixedThreadPool(threadCount, threadFactory(connector, connectorId, name, true, false));
+    public static ExecutorService newFixedThreadPool(Class<?> component, String componentId, String name, int threadCount) {
+        return Executors.newFixedThreadPool(threadCount, threadFactory(component, componentId, name, true, false));
     }
 
-    public static ExecutorService newSingleThreadExecutor(Class<? extends SourceConnector> connector, String connectorId, String name) {
-        return newSingleThreadExecutor(connector, connectorId, name, false);
+    public static ExecutorService newSingleThreadExecutor(Class<?> component, String componentId, String name) {
+        return newSingleThreadExecutor(component, componentId, name, false);
+    }
+
+    public static ScheduledExecutorService newSingleThreadScheduledExecutor(Class<?> component, String componentId, String name, boolean daemon) {
+        return Executors.newSingleThreadScheduledExecutor(threadFactory(component, componentId, name, false, daemon));
     }
 }

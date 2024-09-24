@@ -14,10 +14,12 @@ activemq-data/
 .gradle/
 .vscode/
 build/
+debezium-ddl-parser/gen
 deploy/
 target/
 mods/
 *.swp
+.tags
 epom
 log
 npm-debug.log
@@ -28,3 +30,8 @@ generated-sources/
 
 /state/
 bin/
+gen/
+*.tokens
+
+jenkins-jobs/docker/rhel_kafka/plugins
+jenkins-jobs/docker/artifact-server/plugins

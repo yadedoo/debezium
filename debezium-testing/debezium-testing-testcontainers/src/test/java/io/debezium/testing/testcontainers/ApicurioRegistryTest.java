@@ -5,7 +5,7 @@
  */
 package io.debezium.testing.testcontainers;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -15,9 +15,12 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -25,22 +28,23 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.rnorth.ducttape.unreliables.Unreliables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.output.OutputFrame;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.containers.wait.strategy.LogMessageWaitStrategy;
-import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.lifecycle.Startables;
-import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 import com.jayway.jsonpath.JsonPath;
+
+import io.debezium.doc.FixFor;
 
 /**
  * An integration test verifying the Apicurio registry is interoperable with Debezium
@@ -49,43 +53,42 @@ import com.jayway.jsonpath.JsonPath;
  */
 public class ApicurioRegistryTest {
 
-    private static final String DEBEZIUM_VERSION = "1.2.3.Final";
-    private static final String APICURIO_VERSION = "1.3.0.Final";
-
     private static final Logger LOGGER = LoggerFactory.getLogger(ApicurioRegistryTest.class);
 
-    private static Network network = Network.newNetwork();
+    private static final List<String> capturedLogs = Collections.synchronizedList(new ArrayList<>());
 
-    private static GenericContainer<?> apicurioContainer = new GenericContainer<>("apicurio/apicurio-registry-mem:" + APICURIO_VERSION)
-            .withNetwork(network)
-            .withExposedPorts(8080)
-            .waitingFor(new LogMessageWaitStrategy().withRegEx(".*apicurio-registry-app.*started in.*"));
+    private static final List<Pattern> logMatchers = Collections.synchronizedList(new ArrayList<>());
 
-    private static KafkaContainer kafkaContainer = new KafkaContainer()
-            .withNetwork(network);
+    private static final Network network = Network.newNetwork();
 
-    public static PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>("debezium/postgres:11")
+    private static final ApicurioRegistryContainer apicurioContainer = new ApicurioRegistryContainer().withNetwork(network);
+
+    private static final KafkaContainer kafkaContainer = DebeziumKafkaContainer.defaultKRaftContainer(network);
+
+    public static final PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>(ImageNames.POSTGRES_DOCKER_IMAGE_NAME)
             .withNetwork(network)
             .withNetworkAliases("postgres");
 
-    public static ImageFromDockerfile apicurioDebeziumImage = new ImageFromDockerfile()
-            .withDockerfileFromBuilder(builder -> builder
-                    .from("debezium/connect:" + DEBEZIUM_VERSION)
-                    .env("KAFKA_CONNECT_DEBEZIUM_DIR", "$KAFKA_CONNECT_PLUGINS_DIR/debezium-connector-postgres")
-                    .env("APICURIO_VERSION", APICURIO_VERSION)
-                    .run("cd $KAFKA_CONNECT_DEBEZIUM_DIR && curl https://repo1.maven.org/maven2/io/apicurio/apicurio-registry-distro-connect-converter/$APICURIO_VERSION/apicurio-registry-distro-connect-converter-$APICURIO_VERSION-converter.tar.gz | tar xzv")
-                    .build());
-
-    public static DebeziumContainer debeziumContainer = new DebeziumContainer(apicurioDebeziumImage)
+    private static final String TROUBLE_MAKER_LOG = "Caused by: java.io.FileNotFoundException: TroubleMaker";
+    private static final String INVALID_HEADER_NAME_LOG = "Caused by: java.lang.IllegalArgumentException: invalid header name: \"\"";
+    public static final DebeziumContainer debeziumContainer = DebeziumContainer.nightly()
             .withNetwork(network)
             .withKafka(kafkaContainer)
             .withLogConsumer(new Slf4jLogConsumer(LOGGER))
+            .withLogConsumer(ApicurioRegistryTest::captureMatchingLog)
+            .enableApicurioConverters()
             .dependsOn(kafkaContainer);
 
-    @BeforeClass
+    @BeforeAll
     public static void startContainers() {
         Startables.deepStart(Stream.of(
                 apicurioContainer, kafkaContainer, postgresContainer, debeziumContainer)).join();
+    }
+
+    @BeforeEach
+    public void clearState() {
+        logMatchers.clear();
+        capturedLogs.clear();
     }
 
     @Test
@@ -142,7 +145,9 @@ public class ApicurioRegistryTest {
             statement.execute("insert into todo.Todo values (1, 'Be Awesome')");
 
             debeziumContainer.registerConnector("my-connector-avro", getConfiguration(
-                    2, "io.apicurio.registry.utils.converter.AvroConverter"));
+                    2, "io.apicurio.registry.utils.converter.AvroConverter",
+                    "schema.name.adjustment.mode", "avro",
+                    "key.converter.apicurio.registry.headers.enabled", "false"));
 
             consumer.subscribe(Arrays.asList("dbserver2.todo.todo"));
 
@@ -168,20 +173,19 @@ public class ApicurioRegistryTest {
             statement.execute("alter table todo.Todo replica identity full");
             statement.execute("insert into todo.Todo values (3, 'Be Awesome')");
 
-            final String host = apicurioContainer.getContainerInfo().getConfig().getHostName();
-            final int port = apicurioContainer.getExposedPorts().get(0);
-            final String apicurioUrl = "http://" + host + ":" + port + "/api";
+            final String apicurioUrl = getApicurioUrl();
             String id = "3";
 
             // host, database, user etc. are obtained from the container
             final ConnectorConfiguration config = ConnectorConfiguration.forJdbcContainer(postgresContainer)
-                    .with("database.server.name", "dbserver" + id)
+                    .with("topic.prefix", "dbserver" + id)
                     .with("slot.name", "debezium_" + id)
                     .with("key.converter", "org.apache.kafka.connect.json.JsonConverter")
                     .with("value.converter", "io.debezium.converters.CloudEventsConverter")
                     .with("value.converter.data.serializer.type", "avro")
                     .with("value.converter.avro.apicurio.registry.url", apicurioUrl)
-                    .with("value.converter.avro.apicurio.registry.global-id", "io.apicurio.registry.utils.serde.strategy.AutoRegisterIdStrategy");
+                    .with("value.converter.avro.apicurio.registry.auto-register", "true")
+                    .with("value.converter.avro.apicurio.registry.find-latest", "true");
 
             debeziumContainer.registerConnector("my-connector-cloudevents-avro", config);
 
@@ -203,6 +207,37 @@ public class ApicurioRegistryTest {
         }
     }
 
+    @FixFor("DBZ-5282")
+    @Test
+    public void shouldNotErrorWithBadHeader() {
+
+        logMatchers.add(Pattern.compile(".*" + INVALID_HEADER_NAME_LOG + ".*", Pattern.DOTALL));
+        logMatchers.add(Pattern.compile(".*" + TROUBLE_MAKER_LOG + ".*", Pattern.DOTALL));
+
+        final String apicurioUrl = getApicurioUrl();
+        String id = "4";
+
+        // host, database, user etc. are obtained from the container
+        final ConnectorConfiguration config = ConnectorConfiguration.forJdbcContainer(postgresContainer)
+                .with("topic.prefix", "dbserver" + id)
+                .with("slot.name", "debezium_" + id)
+                .with("key.converter", "org.apache.kafka.connect.json.JsonConverter")
+                .with("value.converter", "io.debezium.converters.CloudEventsConverter")
+                .with("value.converter.data.serializer.type", "avro")
+                .with("value.converter.avro.apicurio.registry.url", apicurioUrl)
+                .with("value.converter.avro.apicurio.registry.auto-register", "true")
+                .with("value.converter.avro.apicurio.registry.artifact.group-id", "dummy")
+                .with("value.converter.avro.apicurio.registry.request.ssl.truststore.location", "TroubleMaker");
+
+        debeziumContainer.registerConnector("my-connector-test-apicurio-header", config);
+        debeziumContainer.ensureConnectorTaskState("my-connector-test-apicurio-header", 0, Connector.State.FAILED);
+
+        // in debezium 1.9, the invalid header log would be found due the use of the older apicurio jar
+        assertThat(capturedLogs).hasSize(1);
+        assertThat(capturedLogs).allMatch(log -> log.contains(TROUBLE_MAKER_LOG));
+        assertThat(capturedLogs).noneMatch(log -> log.contains(INVALID_HEADER_NAME_LOG));
+    }
+
     private Connection getConnection(PostgreSQLContainer<?> postgresContainer) throws SQLException {
         return DriverManager.getConnection(postgresContainer.getJdbcUrl(), postgresContainer.getUsername(),
                 postgresContainer.getPassword());
@@ -210,7 +245,7 @@ public class ApicurioRegistryTest {
 
     private KafkaConsumer<String, String> getConsumerString(KafkaContainer kafkaContainer) {
         return new KafkaConsumer<>(
-                ImmutableMap.of(
+                Map.of(
                         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaContainer.getBootstrapServers(),
                         ConsumerConfig.GROUP_ID_CONFIG, "tc-" + UUID.randomUUID(),
                         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
@@ -220,7 +255,7 @@ public class ApicurioRegistryTest {
 
     private KafkaConsumer<byte[], byte[]> getConsumerBytes(KafkaContainer kafkaContainer) {
         return new KafkaConsumer<>(
-                ImmutableMap.of(
+                Map.of(
                         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaContainer.getBootstrapServers(),
                         ConsumerConfig.GROUP_ID_CONFIG, "tc-" + UUID.randomUUID(),
                         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
@@ -232,7 +267,7 @@ public class ApicurioRegistryTest {
         List<ConsumerRecord<T, T>> allRecords = new ArrayList<>();
 
         Unreliables.retryUntilTrue(10, TimeUnit.SECONDS, () -> {
-            consumer.poll(Duration.ofMillis(50).toMillis())
+            consumer.poll(Duration.ofMillis(50))
                     .iterator()
                     .forEachRemaining(allRecords::add);
 
@@ -243,20 +278,20 @@ public class ApicurioRegistryTest {
     }
 
     private ConnectorConfiguration getConfiguration(int id, String converter, String... options) {
-        final String host = apicurioContainer.getContainerInfo().getConfig().getHostName();
-        final int port = apicurioContainer.getExposedPorts().get(0);
-        final String apicurioUrl = "http://" + host + ":" + port + "/api";
+        final String apicurioUrl = getApicurioUrl();
 
         // host, database, user etc. are obtained from the container
         final ConnectorConfiguration config = ConnectorConfiguration.forJdbcContainer(postgresContainer)
-                .with("database.server.name", "dbserver" + id)
+                .with("topic.prefix", "dbserver" + id)
                 .with("slot.name", "debezium_" + id)
                 .with("key.converter", converter)
                 .with("key.converter.apicurio.registry.url", apicurioUrl)
-                .with("key.converter.apicurio.registry.global-id", "io.apicurio.registry.utils.serde.strategy.AutoRegisterIdStrategy")
+                .with("key.converter.apicurio.registry.auto-register", "true")
+                .with("key.converter.apicurio.registry.find-latest", "true")
                 .with("value.converter.apicurio.registry.url", apicurioUrl)
                 .with("value.converter", converter)
-                .with("value.converter.apicurio.registry.global-id", "io.apicurio.registry.utils.serde.strategy.AutoRegisterIdStrategy");
+                .with("value.converter.apicurio.registry.auto-register", "true")
+                .with("value.converter.apicurio.registry.find-latest", "true");
 
         if (options != null && options.length > 0) {
             for (int i = 0; i < options.length; i += 2) {
@@ -264,5 +299,42 @@ public class ApicurioRegistryTest {
             }
         }
         return config;
+    }
+
+    private String getApicurioUrl() {
+        final String host = apicurioContainer.getContainerInfo().getConfig().getHostName();
+        final int port = apicurioContainer.getExposedPorts().get(0);
+        final String apicurioUrl = "http://" + host + ":" + port + "/apis/registry/v2";
+        return apicurioUrl;
+    }
+
+    private static void captureMatchingLog(OutputFrame outputFrame) {
+        String frameString = outputFrame.getUtf8String();
+        for (Pattern logMatcher : logMatchers) {
+            if (logMatcher.matcher(frameString).matches()) {
+                capturedLogs.add(frameString);
+            }
+        }
+    }
+
+    @AfterAll
+    public static void stopContainers() {
+        try {
+            if (postgresContainer != null) {
+                postgresContainer.stop();
+            }
+            if (apicurioContainer != null) {
+                apicurioContainer.stop();
+            }
+            if (kafkaContainer != null) {
+                kafkaContainer.stop();
+            }
+            if (debeziumContainer != null) {
+                debeziumContainer.stop();
+            }
+        }
+        catch (Exception e) {
+            // ignored
+        }
     }
 }

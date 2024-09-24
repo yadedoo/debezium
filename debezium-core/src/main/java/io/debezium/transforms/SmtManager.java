@@ -5,12 +5,22 @@
  */
 package io.debezium.transforms;
 
+import static io.debezium.data.Envelope.Operation.MESSAGE;
+import static io.debezium.data.Envelope.Operation.TRUNCATE;
+
+import java.util.Map;
+
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.config.Field;
 import io.debezium.data.Envelope;
+import io.debezium.schema.SchemaFactory;
 
 /**
  * A class used by all Debezium supplied SMTs to centralize common logic.
@@ -27,11 +37,26 @@ public class SmtManager<R extends ConnectRecord<R>> {
     public SmtManager(Configuration config) {
     }
 
+    public static boolean isGenericOrTruncateMessage(SourceRecord originalRecord) {
+        return TRUNCATE.equals(Envelope.operationFor(originalRecord)) ||
+                MESSAGE.equals(Envelope.operationFor(originalRecord));
+    }
+
     public boolean isValidEnvelope(final R record) {
         if (record.valueSchema() == null ||
                 record.valueSchema().name() == null ||
                 !Envelope.isEnvelopeSchema(record.valueSchema())) {
             LOGGER.debug("Expected Envelope for transformation, passing it unchanged");
+            return false;
+        }
+        return true;
+    }
+
+    public boolean isValidSchemaChange(final R record) {
+        if (record.valueSchema() == null ||
+                record.valueSchema().name() == null ||
+                !SchemaFactory.get().isSchemaChangeSchema(record.valueSchema())) {
+            LOGGER.debug("Expected schema change schema for transformation, passing it unchanged");
             return false;
         }
         return true;
@@ -45,5 +70,24 @@ public class SmtManager<R extends ConnectRecord<R>> {
             return false;
         }
         return true;
+    }
+
+    /**
+     * Validates the supplied {@link Configuration} based on the given fields and throws an exception
+     * in the event that there are any validation errors.  The exception thrown will bubble up to the
+     * Kafka Connect framework like as if it were a connector field validation error.
+     *
+     * @param configuration the configuration, must not be {@code null}
+     * @param fields the fields to validate in the configuration
+     * @throws ConfigException if any configuration field validation failed
+     */
+    public void validate(Configuration configuration, Field.Set fields) {
+        Map<String, ConfigValue> validations = configuration.validate(fields);
+        for (Map.Entry<String, ConfigValue> entry : validations.entrySet()) {
+            if (!entry.getValue().errorMessages().isEmpty()) {
+                final ConfigValue value = entry.getValue();
+                throw new ConfigException(value.name(), configuration.getString(value.name()), value.errorMessages().get(0));
+            }
+        }
     }
 }

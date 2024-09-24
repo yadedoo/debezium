@@ -7,11 +7,14 @@ package io.debezium.connector.common;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Map;
 import java.util.function.Supplier;
 
 import org.apache.kafka.connect.source.SourceTask;
 
-import io.debezium.schema.DataCollectionId;
+import io.debezium.config.CommonConnectorConfig;
+import io.debezium.pipeline.spi.Partition;
+import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 import io.debezium.util.LoggingContext;
 
@@ -24,19 +27,33 @@ public class CdcSourceTaskContext {
 
     private final String connectorType;
     private final String connectorName;
+    private final String taskId;
+    private final Map<String, String> customMetricTags;
     private final Clock clock;
+    private final CommonConnectorConfig config;
 
     /**
      * Obtains the data collections captured at the point of invocation.
      */
     private final Supplier<Collection<? extends DataCollectionId>> collectionsSupplier;
 
-    public CdcSourceTaskContext(String connectorType, String connectorName, Supplier<Collection<? extends DataCollectionId>> collectionsSupplier) {
-        this.connectorType = connectorType;
-        this.connectorName = connectorName;
+    public CdcSourceTaskContext(CommonConnectorConfig config,
+                                String taskId,
+                                Map<String, String> customMetricTags,
+                                Supplier<Collection<? extends DataCollectionId>> collectionsSupplier) {
+        this.connectorType = config.getContextName();
+        this.connectorName = config.getLogicalName();
+        this.taskId = taskId;
+        this.customMetricTags = customMetricTags;
         this.collectionsSupplier = collectionsSupplier != null ? collectionsSupplier : Collections::emptyList;
-
+        this.config = config;
         this.clock = Clock.system();
+    }
+
+    public CdcSourceTaskContext(CommonConnectorConfig config,
+                                Map<String, String> customMetricTags,
+                                Supplier<Collection<? extends DataCollectionId>> collectionsSupplier) {
+        this(config, "0", customMetricTags, collectionsSupplier);
     }
 
     /**
@@ -48,6 +65,23 @@ public class CdcSourceTaskContext {
      */
     public LoggingContext.PreviousContext configureLoggingContext(String contextName) {
         return LoggingContext.forConnector(connectorType, connectorName, contextName);
+    }
+
+    public LoggingContext.PreviousContext configureLoggingContext(String contextName, Partition partition) {
+        return LoggingContext.forConnector(connectorType, connectorName, taskId, contextName, partition);
+    }
+
+    /**
+     * Run the supplied function in the temporary connector MDC context, and when complete always return the MDC context to its
+     * state before this method was called.
+     *
+     * @param connectorConfig the configuration of the connector; may not be null
+     * @param contextName the name of the context; may not be null
+     * @param operation the function to run in the new MDC context; may not be null
+     * @throws IllegalArgumentException if any of the parameters are null
+     */
+    public void temporaryLoggingContext(CommonConnectorConfig connectorConfig, String contextName, Runnable operation) {
+        LoggingContext.temporarilyForConnector("MySQL", connectorConfig.getLogicalName(), contextName, operation);
     }
 
     /**
@@ -70,5 +104,17 @@ public class CdcSourceTaskContext {
 
     public String getConnectorName() {
         return connectorName;
+    }
+
+    public String getTaskId() {
+        return taskId;
+    }
+
+    public Map<String, String> getCustomMetricTags() {
+        return customMetricTags;
+    }
+
+    public CommonConnectorConfig getConfig() {
+        return config;
     }
 }

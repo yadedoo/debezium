@@ -8,34 +8,54 @@ package io.debezium.connector.postgresql.connection;
 
 import java.nio.charset.Charset;
 import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
+import org.postgresql.jdbc.PgConnection;
+import org.postgresql.jdbc.TimestampUtils;
 import org.postgresql.replication.LogSequenceNumber;
+import org.postgresql.util.PGmoney;
 import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
 import io.debezium.annotation.VisibleForTesting;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PgOid;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.PostgresType;
+import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.spi.SlotState;
+import io.debezium.data.SpecialValueDecimal;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.pipeline.source.snapshot.incremental.ChunkQueryBuilder;
+import io.debezium.pipeline.source.snapshot.incremental.RowValueConstructorChunkQueryBuilder;
+import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.pipeline.spi.Partition;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
+import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 
@@ -46,6 +66,15 @@ import io.debezium.util.Metronome;
  */
 public class PostgresConnection extends JdbcConnection {
 
+    public static final String CONNECTION_STREAMING = "Debezium Streaming";
+    public static final String CONNECTION_SLOT_INFO = "Debezium Slot Info";
+    public static final String CONNECTION_DROP_SLOT = "Debezium Drop Slot";
+    public static final String CONNECTION_VALIDATE_CONNECTION = "Debezium Validate Connection";
+    public static final String CONNECTION_HEARTBEAT = "Debezium Heartbeat";
+    public static final String CONNECTION_GENERAL = "Debezium General";
+
+    private static final Pattern FUNCTION_DEFAULT_PATTERN = Pattern.compile("^[(]?[A-Za-z0-9_.]+\\((?:.+(?:, ?.+)*)?\\)");
+    private static final Pattern EXPRESSION_DEFAULT_PATTERN = Pattern.compile("\\(+(?:.+(?:[+ - * / < > = ~ ! @ # % ^ & | ` ?] ?.+)+)+\\)");
     private static Logger LOGGER = LoggerFactory.getLogger(PostgresConnection.class);
 
     private static final String URL_PATTERN = "jdbc:postgresql://${" + JdbcConfiguration.HOSTNAME + "}:${"
@@ -62,18 +91,54 @@ public class PostgresConnection extends JdbcConnection {
     private static final Duration PAUSE_BETWEEN_REPLICATION_SLOT_RETRIEVAL_ATTEMPTS = Duration.ofSeconds(2);
 
     private final TypeRegistry typeRegistry;
+    private final PostgresDefaultValueConverter defaultValueConverter;
 
     /**
      * Creates a Postgres connection using the supplied configuration.
      * If necessary this connection is able to resolve data type mappings.
+     * Such a connection requires a {@link PostgresValueConverter}, and will provide its own {@link TypeRegistry}.
      * Usually only one such connection per connector is needed.
      *
      * @param config {@link Configuration} instance, may not be null.
-     * @param provideTypeRegistry {@code true} if type registry should be created
+     * @param valueConverterBuilder supplies a configured {@link PostgresValueConverter} for a given {@link TypeRegistry}
+     * @param connectionUsage a symbolic name of the connection to be tracked in monitoring tools
      */
-    public PostgresConnection(Configuration config, boolean provideTypeRegistry) {
-        super(config, FACTORY, PostgresConnection::validateServerVersion, PostgresConnection::defaultSettings);
-        this.typeRegistry = provideTypeRegistry ? new TypeRegistry(this) : null;
+    public PostgresConnection(JdbcConfiguration config, PostgresValueConverterBuilder valueConverterBuilder, String connectionUsage) {
+        super(addDefaultSettings(config, connectionUsage), FACTORY, PostgresConnection::validateServerVersion, "\"", "\"");
+
+        if (Objects.isNull(valueConverterBuilder)) {
+            this.typeRegistry = null;
+            this.defaultValueConverter = null;
+        }
+        else {
+            this.typeRegistry = new TypeRegistry(this);
+
+            final PostgresValueConverter valueConverter = valueConverterBuilder.build(this.typeRegistry);
+            this.defaultValueConverter = new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+        }
+    }
+
+    /**
+     * Create a Postgres connection using the supplied configuration and {@link TypeRegistry}
+     * @param config {@link Configuration} instance, may not be null.
+     * @param typeRegistry an existing/already-primed {@link TypeRegistry} instance
+     * @param connectionUsage a symbolic name of the connection to be tracked in monitoring tools
+     */
+    public PostgresConnection(PostgresConnectorConfig config, TypeRegistry typeRegistry, String connectionUsage) {
+        super(addDefaultSettings(config.getJdbcConfig(), connectionUsage),
+                FACTORY,
+                PostgresConnection::validateServerVersion,
+                "\"", "\"");
+
+        if (Objects.isNull(typeRegistry)) {
+            this.typeRegistry = null;
+            this.defaultValueConverter = null;
+        }
+        else {
+            this.typeRegistry = typeRegistry;
+            final PostgresValueConverter valueConverter = PostgresValueConverter.of(config, this.getDatabaseCharset(), typeRegistry);
+            this.defaultValueConverter = new PostgresDefaultValueConverter(valueConverter, this.getTimestampUtils(), typeRegistry);
+        }
     }
 
     /**
@@ -81,9 +146,18 @@ public class PostgresConnection extends JdbcConnection {
      * The connector is the regular one without datatype resolution capabilities.
      *
      * @param config {@link Configuration} instance, may not be null.
+     * @param connectionUsage a symbolic name of the connection to be tracked in monitoring tools
      */
-    public PostgresConnection(Configuration config) {
-        this(config, false);
+    public PostgresConnection(JdbcConfiguration config, String connectionUsage) {
+        this(config, null, connectionUsage);
+    }
+
+    static JdbcConfiguration addDefaultSettings(JdbcConfiguration configuration, String connectionUsage) {
+        // we require Postgres 9.4 as the minimum server version since that's where logical replication was first introduced
+        return JdbcConfiguration.adapt(configuration.edit()
+                .with("assumeMinServerVersion", "9.4")
+                .with("ApplicationName", connectionUsage)
+                .build());
     }
 
     /**
@@ -103,7 +177,8 @@ public class PostgresConnection extends JdbcConnection {
      * @return the replica identity information; never null
      * @throws SQLException if there is a problem obtaining the replica identity information for the given table
      */
-    public ServerInfo.ReplicaIdentity readReplicaIdentityInfo(TableId tableId) throws SQLException {
+    @VisibleForTesting
+    public ReplicaIdentityInfo readReplicaIdentityInfo(TableId tableId) throws SQLException {
         String statement = "SELECT relreplident FROM pg_catalog.pg_class c " +
                 "LEFT JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid " +
                 "WHERE n.nspname=? and c.relname=?";
@@ -120,7 +195,65 @@ public class PostgresConnection extends JdbcConnection {
                 LOGGER.warn("Cannot determine REPLICA IDENTITY information for table '{}'", tableId);
             }
         });
-        return ServerInfo.ReplicaIdentity.parseFromDB(replIdentity.toString());
+        return new ReplicaIdentityInfo(ReplicaIdentityInfo.ReplicaIdentity.parseFromDB(replIdentity.toString()));
+    }
+
+    /**
+     * This query retrieves information about the INDEX as long as replica identity is configure USING INDEX
+     *
+     * @param tableId the identifier of the table
+     * @return Index name linked to replica identity; never null
+     * @throws SQLException if there is a problem obtaining the replica identity and index information for the given table
+     */
+    @VisibleForTesting
+    public String readIndexOfReplicaIdentity(TableId tableId) throws SQLException {
+        String statement = "with rel_index as (" +
+                "select split_part(indexrelid::regclass::text, '.', 1) as index_schema, split_part(indexrelid::regclass::text, '.', 2) as index_name " +
+                "from pg_catalog.pg_index " +
+                "where indisreplident " +
+                ") " +
+                "SELECT i.index_name " +
+                "FROM pg_catalog.pg_class c " +
+                "    LEFT JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid " +
+                "    LEFT join rel_index i on n.nspname = i.index_schema " +
+                "WHERE n.nspname=? and c.relname=?";
+        String schema = tableId.schema() != null && tableId.schema().length() > 0 ? tableId.schema() : "public";
+        StringBuilder indexName = new StringBuilder();
+        prepareQuery(statement, stmt -> {
+            stmt.setString(1, schema);
+            stmt.setString(2, tableId.table());
+        }, rs -> {
+            if (rs.next()) {
+                indexName.append(rs.getString(1));
+            }
+            else {
+                LOGGER.warn("Cannot determine index linked to REPLICA IDENTITY for table '{}'", tableId);
+            }
+        });
+        return indexName.toString();
+    }
+
+    /**
+     * Update REPLICA IDENTITY status of a table.
+     * This in turn determines how much information is available for UPDATE and DELETE operations for logical replication.
+     *
+     * @param tableId the identifier of the table
+     * @param replicaIdentityValue Replica Identity value
+     */
+    public void setReplicaIdentityForTable(TableId tableId, ReplicaIdentityInfo replicaIdentityValue) {
+        try {
+            LOGGER.debug("Updating Replica Identity '{}'", tableId.table());
+            execute(String.format("ALTER TABLE %s REPLICA IDENTITY %s;", tableId, replicaIdentityValue));
+        }
+        catch (SQLException e) {
+
+            if (e.getSQLState().equals("42501")) {
+                LOGGER.error("Replica identity could not be updated because of lack of privileges", e);
+            }
+            else {
+                LOGGER.error("Unexpected error while attempting to alter Replica Identity", e);
+            }
+        }
     }
 
     /**
@@ -233,17 +366,43 @@ public class PostgresConnection extends JdbcConnection {
 
         try {
             confirmedFlushedLsn = tryParseLsn(slotName, pluginName, database, rs, "confirmed_flush_lsn");
+            if (confirmedFlushedLsn == null) {
+                LOGGER.info("Failed to obtain valid replication slot, confirmed flush lsn is null");
+                if (!hasIdleTransactions()) {
+                    confirmedFlushedLsn = tryFallbackToRestartLsn(slotName, pluginName, database, rs);
+                }
+            }
         }
         catch (SQLException e) {
-            LOGGER.info("unable to find confirmed_flushed_lsn, falling back to restart_lsn");
-            try {
-                confirmedFlushedLsn = tryParseLsn(slotName, pluginName, database, rs, "restart_lsn");
-            }
-            catch (SQLException e2) {
-                throw new ConnectException("Neither confirmed_flush_lsn nor restart_lsn could be found");
-            }
+            confirmedFlushedLsn = tryFallbackToRestartLsn(slotName, pluginName, database, rs);
         }
 
+        return confirmedFlushedLsn;
+    }
+
+    private boolean hasIdleTransactions() throws SQLException {
+        return queryAndMap(
+                "select * from pg_stat_activity where state like 'idle in transaction' AND application_name != '" + CONNECTION_GENERAL + "' AND pid <> pg_backend_pid()",
+                rs -> {
+                    if (rs.next()) {
+                        LOGGER.debug("Found at least one idle transaction with pid " + rs.getInt("pid") + " for application" + rs.getString("application_name"));
+                        return true;
+                    }
+                    else {
+                        return false;
+                    }
+                });
+    }
+
+    private Lsn tryFallbackToRestartLsn(String slotName, String pluginName, String database, ResultSet rs) {
+        Lsn confirmedFlushedLsn;
+        LOGGER.info("Unable to find confirmed_flushed_lsn, falling back to restart_lsn");
+        try {
+            confirmedFlushedLsn = tryParseLsn(slotName, pluginName, database, rs, "restart_lsn");
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Neither confirmed_flush_lsn nor restart_lsn could be found", e);
+        }
         return confirmedFlushedLsn;
     }
 
@@ -253,7 +412,7 @@ public class PostgresConnection extends JdbcConnection {
             restartLsn = tryParseLsn(slotName, pluginName, database, rs, "restart_lsn");
         }
         catch (SQLException e) {
-            throw new ConnectException("restart_lsn could be found");
+            throw new DebeziumException("restart_lsn could be found");
         }
 
         return restartLsn;
@@ -270,13 +429,13 @@ public class PostgresConnection extends JdbcConnection {
             lsn = Lsn.valueOf(lsnStr);
         }
         catch (Exception e) {
-            throw new ConnectException("Value " + column + " in the pg_replication_slots table for slot = '"
+            throw new DebeziumException("Value " + column + " in the pg_replication_slots table for slot = '"
                     + slotName + "', plugin = '"
                     + pluginName + "', database = '"
                     + database + "' is not valid. This is an abnormal situation and the database status should be checked.");
         }
         if (!lsn.isValid()) {
-            throw new ConnectException("Invalid LSN returned from database");
+            throw new DebeziumException("Invalid LSN returned from database");
         }
         return lsn;
     }
@@ -364,7 +523,7 @@ public class PostgresConnection extends JdbcConnection {
      */
     public Long currentTransactionId() throws SQLException {
         AtomicLong txId = new AtomicLong(0);
-        query("select * from txid_current()", rs -> {
+        query("select (case pg_is_in_recovery() when 't' then 0 else txid_current() end) AS pg_current_txid", rs -> {
             if (rs.next()) {
                 txId.compareAndSet(0, rs.getLong(1));
             }
@@ -382,12 +541,13 @@ public class PostgresConnection extends JdbcConnection {
     public long currentXLogLocation() throws SQLException {
         AtomicLong result = new AtomicLong(0);
         int majorVersion = connection().getMetaData().getDatabaseMajorVersion();
-        query(majorVersion >= 10 ? "select * from pg_current_wal_lsn()" : "select * from pg_current_xlog_location()", rs -> {
-            if (!rs.next()) {
-                throw new IllegalStateException("there should always be a valid xlog position");
-            }
-            result.compareAndSet(0, LogSequenceNumber.valueOf(rs.getString(1)).asLong());
-        });
+        query(majorVersion >= 10 ? "select (case pg_is_in_recovery() when 't' then pg_last_wal_receive_lsn() else pg_current_wal_lsn() end) AS pg_current_wal_lsn"
+                : "select * from pg_current_xlog_location()", rs -> {
+                    if (!rs.next()) {
+                        throw new IllegalStateException("there should always be a valid xlog position");
+                    }
+                    result.compareAndSet(0, LogSequenceNumber.valueOf(rs.getString(1)).asLong());
+                });
         return result.get();
     }
 
@@ -401,7 +561,10 @@ public class PostgresConnection extends JdbcConnection {
         ServerInfo serverInfo = new ServerInfo();
         query("SELECT version(), current_user, current_database()", rs -> {
             if (rs.next()) {
-                serverInfo.withServer(rs.getString(1)).withUsername(rs.getString(2)).withDatabase(rs.getString(3));
+                serverInfo
+                        .withServer(rs.getString(1))
+                        .withUsername(rs.getString(2))
+                        .withDatabase(rs.getString(3));
             }
         });
         String username = serverInfo.username();
@@ -418,6 +581,9 @@ public class PostgresConnection extends JdbcConnection {
                         }
                     });
         }
+
+        serverInfo.withMajorVersion(connection().getMetaData().getDatabaseMajorVersion());
+
         return serverInfo;
     }
 
@@ -430,9 +596,13 @@ public class PostgresConnection extends JdbcConnection {
         }
     }
 
-    protected static void defaultSettings(Configuration.Builder builder) {
-        // we require Postgres 9.4 as the minimum server version since that's where logical replication was first introduced
-        builder.with("assumeMinServerVersion", "9.4");
+    public TimestampUtils getTimestampUtils() {
+        try {
+            return ((PgConnection) this.connection()).getTimestampUtils();
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Couldn't get timestamp utils from underlying connection", e);
+        }
     }
 
     private static void validateServerVersion(Statement statement) throws SQLException {
@@ -442,6 +612,15 @@ public class PostgresConnection extends JdbcConnection {
         if (majorVersion < 9 || (majorVersion == 9 && minorVersion < 4)) {
             throw new SQLException("Cannot connect to a version of Postgres lower than 9.4");
         }
+    }
+
+    @Override
+    public String quotedColumnIdString(String columnName) {
+        if (columnName.contains("\"")) {
+            columnName = columnName.replace("\"", "\"\"");
+        }
+
+        return super.quotedColumnIdString(columnName);
     }
 
     @Override
@@ -459,6 +638,16 @@ public class PostgresConnection extends JdbcConnection {
 
     @Override
     protected Optional<ColumnEditor> readTableColumn(ResultSet columnMetadata, TableId tableId, Tables.ColumnNameFilter columnFilter) throws SQLException {
+        return doReadTableColumn(columnMetadata, tableId, columnFilter);
+    }
+
+    public Optional<Column> readColumnForDecoder(ResultSet columnMetadata, TableId tableId, Tables.ColumnNameFilter columnNameFilter)
+            throws SQLException {
+        return doReadTableColumn(columnMetadata, tableId, columnNameFilter).map(ColumnEditor::create);
+    }
+
+    private Optional<ColumnEditor> doReadTableColumn(ResultSet columnMetadata, TableId tableId, Tables.ColumnNameFilter columnFilter)
+            throws SQLException {
         final String columnName = columnMetadata.getString(4);
         if (columnFilter == null || columnFilter.matches(tableId.catalog(), tableId.schema(), tableId.table(), columnName)) {
             final ColumnEditor column = Column.editor().name(columnName);
@@ -499,14 +688,171 @@ public class PostgresConnection extends JdbcConnection {
                 column.scale(nativeType.getDefaultScale());
             }
 
+            final String defaultValueExpression = columnMetadata.getString(13);
+            if (defaultValueExpression != null && getDefaultValueConverter().supportConversion(column.typeName())) {
+                column.defaultValueExpression(defaultValueExpression);
+            }
+
             return Optional.of(column);
         }
 
         return Optional.empty();
     }
 
+    public PostgresDefaultValueConverter getDefaultValueConverter() {
+        Objects.requireNonNull(defaultValueConverter, "Connection does not provide default value converter");
+        return defaultValueConverter;
+    }
+
     public TypeRegistry getTypeRegistry() {
         Objects.requireNonNull(typeRegistry, "Connection does not provide type registry");
         return typeRegistry;
+    }
+
+    @Override
+    public Object getColumnValue(ResultSet rs, int columnIndex, Column column, Table table) throws SQLException {
+        try {
+            final ResultSetMetaData metaData = rs.getMetaData();
+            final String columnTypeName = metaData.getColumnTypeName(columnIndex);
+            final PostgresType type = getTypeRegistry().get(columnTypeName);
+
+            LOGGER.trace("Type of incoming data is: {}", type.getOid());
+            LOGGER.trace("ColumnTypeName is: {}", columnTypeName);
+            LOGGER.trace("Type is: {}", type);
+
+            if (type.isArrayType()) {
+                return rs.getArray(columnIndex);
+            }
+
+            switch (type.getOid()) {
+                case PgOid.MONEY:
+                    // TODO author=Horia Chiorean date=14/11/2016 description=workaround for https://github.com/pgjdbc/pgjdbc/issues/100
+                    final String sMoney = rs.getString(columnIndex);
+                    if (sMoney == null) {
+                        return sMoney;
+                    }
+                    if (sMoney.startsWith("-")) {
+                        // PGmoney expects negative values to be provided in the format of "($XXXXX.YY)"
+                        final String negativeMoney = "(" + sMoney.substring(1) + ")";
+                        return new PGmoney(negativeMoney).val;
+                    }
+                    return new PGmoney(sMoney).val;
+                case PgOid.BIT:
+                    return rs.getString(columnIndex);
+                case PgOid.NUMERIC:
+                    final String s = rs.getString(columnIndex);
+                    if (s == null) {
+                        return s;
+                    }
+
+                    Optional<SpecialValueDecimal> value = PostgresValueConverter.toSpecialValue(s);
+                    return value.isPresent() ? value.get() : new SpecialValueDecimal(rs.getBigDecimal(columnIndex));
+                case PgOid.TIME:
+                    // To handle time 24:00:00 supported by TIME columns, read the column as a string.
+                case PgOid.TIMETZ:
+                    // In order to guarantee that we resolve TIMETZ columns with proper microsecond precision,
+                    // read the column as a string instead and then re-parse inside the converter.
+                    return rs.getString(columnIndex);
+                default:
+                    Object x = rs.getObject(columnIndex);
+                    if (x != null) {
+                        LOGGER.trace("rs getobject returns class: {}; rs getObject value is: {}", x.getClass(), x);
+                    }
+                    return x;
+            }
+        }
+        catch (SQLException e) {
+            // not a known type
+            return super.getColumnValue(rs, columnIndex, column, table);
+        }
+    }
+
+    @Override
+    protected String[] supportedTableTypes() {
+        return new String[]{ "VIEW", "MATERIALIZED VIEW", "TABLE", "PARTITIONED TABLE" };
+    }
+
+    @Override
+    protected boolean isTableType(String tableType) {
+        return "TABLE".equals(tableType) || "PARTITIONED TABLE".equals(tableType);
+    }
+
+    @Override
+    protected boolean isTableUniqueIndexIncluded(String indexName, String columnName) {
+        if (columnName != null) {
+            return !FUNCTION_DEFAULT_PATTERN.matcher(columnName).matches()
+                    && !EXPRESSION_DEFAULT_PATTERN.matcher(columnName).matches();
+        }
+        return false;
+    }
+
+    /**
+     * Retrieves all {@code TableId}s in a given database catalog, including partitioned tables.
+     *
+     * @param catalogName the catalog/database name
+     * @return set of all table ids for existing table objects
+     * @throws SQLException if a database exception occurred
+     */
+    public Set<TableId> getAllTableIds(String catalogName) throws SQLException {
+        return readTableNames(
+                catalogName,
+                null,
+                null,
+                new String[]{ "TABLE", "PARTITIONED TABLE" });
+    }
+
+    @Override
+    public <T extends DataCollectionId> ChunkQueryBuilder<T> chunkQueryBuilder(RelationalDatabaseConnectorConfig connectorConfig) {
+        // PostgreSQL definitely must use row value constructors in order to yield optimal results. See DBZ-5071.
+        return new RowValueConstructorChunkQueryBuilder<>(connectorConfig, this);
+    }
+
+    @Override
+    public Optional<Boolean> nullsSortLast() {
+        // "By default, null values sort as if larger than any non-null value"
+        // https://www.postgresql.org/docs/16/queries-order.html
+        return Optional.of(true);
+    }
+
+    @Override
+    public void setQueryColumnValue(PreparedStatement statement, Column column, int pos, Object value)
+            throws SQLException {
+        final PostgresType resolvedType = typeRegistry.get(column.nativeType());
+
+        if (resolvedType != null && resolvedType.isEnumType()) {
+            // ENUMs require explicit casting so the comparison operators can correctly work
+            statement.setObject(pos, value, Types.OTHER);
+        }
+        else {
+            super.setQueryColumnValue(statement, column, pos, value);
+        }
+    }
+
+    @Override
+    public TableId createTableId(String databaseName, String schemaName, String tableName) {
+        return new TableId(null, schemaName, tableName);
+    }
+
+    public boolean validateLogPosition(Partition partition, OffsetContext offset, CommonConnectorConfig config) {
+
+        final Lsn storedLsn = ((PostgresOffsetContext) offset).lastCommitLsn();
+        final String slotName = ((PostgresConnectorConfig) config).slotName();
+        final String postgresPluginName = ((PostgresConnectorConfig) config).plugin().getPostgresPluginName();
+
+        try {
+            SlotState slotState = getReplicationSlotState(slotName, postgresPluginName);
+            if (slotState == null) {
+                return false;
+            }
+            return storedLsn == null || slotState.slotRestartLsn().compareTo(storedLsn) < 0;
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Unable to get last available log position", e);
+        }
+    }
+
+    @FunctionalInterface
+    public interface PostgresValueConverterBuilder {
+        PostgresValueConverter build(TypeRegistry registry);
     }
 }

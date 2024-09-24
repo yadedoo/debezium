@@ -5,7 +5,7 @@
  */
 package io.debezium.data;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.fail;
 
 import java.math.BigDecimal;
@@ -28,12 +28,14 @@ import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Schema.Type;
 import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.json.JsonDeserializer;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.fest.assertions.Delta;
+import org.apache.kafka.connect.storage.Converter;
+import org.assertj.core.api.Assertions;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -44,8 +46,8 @@ import io.confluent.connect.avro.AvroConverter;
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.data.Envelope.Operation;
+import io.debezium.schema.SchemaNameAdjuster;
 import io.debezium.time.ZonedTimestamp;
-import io.debezium.util.SchemaNameAdjuster;
 import io.debezium.util.Testing;
 
 /**
@@ -56,7 +58,7 @@ import io.debezium.util.Testing;
 public class VerifyRecord {
 
     @FunctionalInterface
-    public static interface RecordValueComparator {
+    public interface RecordValueComparator {
         /**
          * Assert that the actual and expected values are equal. By the time this method is called, the actual value
          * and expected values are both determined to be non-null.
@@ -68,16 +70,28 @@ public class VerifyRecord {
         void assertEquals(String pathToField, Object actualValue, Object expectedValue);
     }
 
+    private static final String APICURIO_URL = "http://localhost:8080/apis/registry/v2";
+
     private static final JsonConverter keyJsonConverter = new JsonConverter();
     private static final JsonConverter valueJsonConverter = new JsonConverter();
     private static final JsonDeserializer keyJsonDeserializer = new JsonDeserializer();
     private static final JsonDeserializer valueJsonDeserializer = new JsonDeserializer();
 
-    private static final MockSchemaRegistryClient schemaRegistry = new MockSchemaRegistryClient();
-    private static final AvroConverter avroKeyConverter = new AvroConverter(schemaRegistry);
-    private static final AvroConverter avroValueConverter = new AvroConverter(schemaRegistry);
+    private static final boolean useApicurio = isApucurioAvailable();
+    private static Converter avroKeyConverter;
+    private static Converter avroValueConverter;
 
     static {
+        if (useApicurio) {
+            avroKeyConverter = new io.apicurio.registry.utils.converter.AvroConverter();
+            avroValueConverter = new io.apicurio.registry.utils.converter.AvroConverter();
+        }
+        else {
+            MockSchemaRegistryClient schemaRegistry = new MockSchemaRegistryClient();
+            avroKeyConverter = new AvroConverter(schemaRegistry);
+            avroValueConverter = new AvroConverter(schemaRegistry);
+        }
+
         Map<String, Object> config = new HashMap<>();
         config.put("schemas.enable", Boolean.TRUE.toString());
         config.put("schemas.cache.size", String.valueOf(100));
@@ -87,7 +101,16 @@ public class VerifyRecord {
         valueJsonDeserializer.configure(config, false);
 
         config = new HashMap<>();
-        config.put("schema.registry.url", "http://fake-url");
+        if (useApicurio) {
+            config.put("apicurio.registry.url", APICURIO_URL);
+            config.put("apicurio.registry.auto-register", true);
+            config.put("apicurio.registry.find-latest", true);
+            config.put("apicurio.registry.check-period-ms", 1000);
+        }
+        else {
+            config.put("schema.registry.url", "http://fake-url");
+        }
+
         avroKeyConverter.configure(config, false);
         avroValueConverter.configure(config, false);
     }
@@ -245,8 +268,6 @@ public class VerifyRecord {
      * Verify that the given {@link SourceRecord} is a {@link Operation#UPDATE UPDATE} record without PK.
      *
      * @param record the source record; may not be null
-     * @param pkField the single field defining the primary key of the struct; may not be null
-     * @param pk the expected integer value of the primary key in the struct
      */
     public static void isValidUpdate(SourceRecord record) {
         isValidUpdate(record, false);
@@ -270,8 +291,6 @@ public class VerifyRecord {
      * matches the expected value.
      *
      * @param record the source record; may not be null
-     * @param pkField the single field defining the primary key of the struct; may not be null
-     * @param pk the expected integer value of the primary key in the struct
      */
     public static void isValidDelete(SourceRecord record) {
         isValidDelete(record, false);
@@ -288,6 +307,22 @@ public class VerifyRecord {
     public static void isValidDelete(SourceRecord record, String pkField, int pk) {
         hasValidKey(record, pkField, pk);
         isValidDelete(record, true);
+    }
+
+    /**
+     * Verify that the given {@link SourceRecord} is a {@link Operation#TRUNCATE TRUNCATE} record.
+     *
+     * @param record the source record; may not be null
+     */
+    public static void isValidTruncate(SourceRecord record) {
+        assertThat(record.key()).isNull();
+
+        assertThat(record.keySchema()).isNull();
+        Struct value = (Struct) record.value();
+        assertThat(value).isNotNull();
+        assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.TRUNCATE.code());
+        assertThat(value.get(FieldName.BEFORE)).isNull();
+        assertThat(value.get(FieldName.AFTER)).isNull();
     }
 
     /**
@@ -361,7 +396,7 @@ public class VerifyRecord {
             // Value should be within 1%
             double expectedNumericValue = ((Number) expected).doubleValue();
             double actualNumericValue = ((Number) actual).doubleValue();
-            assertThat(actualNumericValue).isEqualTo(expectedNumericValue, Delta.delta(0.01d * expectedNumericValue));
+            assertThat(actualNumericValue).isEqualTo(expectedNumericValue, Assertions.offset(0.01d * expectedNumericValue));
         }
         else if (expected instanceof Integer || expected instanceof Long || expected instanceof Short) {
             long expectedNumericValue = ((Number) expected).longValue();
@@ -656,7 +691,7 @@ public class VerifyRecord {
             double expectedNumericValue = ((Number) o2).doubleValue();
             double actualNumericValue = ((Number) o1).doubleValue();
             String desc = "found " + nameOf(keyOrValue, field) + " is " + o1 + " but expected " + o2;
-            assertThat(actualNumericValue).as(desc).isEqualTo(expectedNumericValue, Delta.delta(0.01d * expectedNumericValue));
+            assertThat(actualNumericValue).as(desc).isEqualTo(expectedNumericValue, Assertions.offset(0.01d * expectedNumericValue));
         }
         else if (o2 instanceof Integer || o2 instanceof Long || o2 instanceof Short) {
             long expectedNumericValue = ((Number) o2).longValue();
@@ -700,6 +735,17 @@ public class VerifyRecord {
      * @param record the record to validate; may not be null
      */
     public static void isValid(SourceRecord record) {
+        isValid(record, false);
+    }
+
+    /**
+     * Validate that a {@link SourceRecord}'s key and value can each be converted to a byte[] and then back to an equivalent
+     * {@link SourceRecord}.
+     *
+     * @param record the record to validate; may not be null
+     * @param ignoreAvro true when Avro check should not be executed
+     */
+    public static void isValid(SourceRecord record, boolean ignoreAvro) {
         // print(record);
 
         JsonNode keyJson = null;
@@ -762,6 +808,12 @@ public class VerifyRecord {
             msg = "comparing value to its schema";
             schemaMatchesStruct(valueWithSchema);
 
+            // Introduced due to https://github.com/confluentinc/schema-registry/issues/1693
+            // and https://issues.redhat.com/browse/DBZ-3535
+            if (ignoreAvro) {
+                return;
+            }
+
             // Make sure the schema names are valid Avro schema names ...
             validateSchemaNames(record.keySchema());
             validateSchemaNames(record.valueSchema());
@@ -772,11 +824,11 @@ public class VerifyRecord {
             msg = "deserializing key using Avro converter";
             avroKeyWithSchema = avroValueConverter.toConnectData(record.topic(), avroKeyBytes);
             msg = "comparing key schema to that serialized/deserialized with Avro converter";
-            assertEquals(keyWithSchema.schema(), record.keySchema());
+            assertEquals(setVersion(avroKeyWithSchema.schema(), null), setVersion(record.keySchema(), null));
             msg = "comparing key to that serialized/deserialized with Avro converter";
-            assertEquals(keyWithSchema.value(), record.key());
+            assertEquals(setVersion(avroKeyWithSchema, null).value(), setVersion(record.key(), null));
             msg = "comparing key to its schema";
-            schemaMatchesStruct(keyWithSchema);
+            schemaMatchesStruct(avroKeyWithSchema);
 
             // Serialize and deserialize the value using the Avro converter, and check that we got the same result ...
             msg = "serializing value using Avro converter";
@@ -784,12 +836,11 @@ public class VerifyRecord {
             msg = "deserializing value using Avro converter";
             avroValueWithSchema = avroValueConverter.toConnectData(record.topic(), avroValueBytes);
             msg = "comparing value schema to that serialized/deserialized with Avro converter";
-            assertEquals(valueWithSchema.schema(), record.valueSchema());
+            assertEquals(setVersion(avroValueWithSchema.schema(), null), setVersion(record.valueSchema(), null));
             msg = "comparing value to that serialized/deserialized with Avro converter";
-            assertEquals(valueWithSchema.value(), record.value());
+            assertEquals(setVersion(avroValueWithSchema, null).value(), setVersion(record.value(), null));
             msg = "comparing value to its schema";
-            schemaMatchesStruct(valueWithSchema);
-
+            schemaMatchesStruct(avroValueWithSchema);
         }
         catch (Throwable t) {
             Testing.Print.enable();
@@ -1101,11 +1152,24 @@ public class VerifyRecord {
                 Objects.equals(schema1.name(), schema2.name()) &&
                 Objects.equals(schema1.doc(), schema2.doc()) &&
                 Objects.equals(schema1.type(), schema2.type()) &&
-                Objects.deepEquals(schema1.defaultValue(), schema2.defaultValue()) &&
                 fieldsEqual &&
                 keySchemasEqual &&
                 valueSchemasEqual &&
                 Objects.equals(schema1.parameters(), schema2.parameters());
+
+        // The default value after de-serialization can be of byte[] even if the value
+        // before serialization is ByteBuffer. This must be taken into account for comparison.
+        if (equal) {
+            Object default1 = schema1.defaultValue();
+            Object default2 = schema2.defaultValue();
+            if (default1 instanceof ByteBuffer && default2 instanceof byte[]) {
+                default1 = ((ByteBuffer) default1).array();
+            }
+            if (default1 instanceof byte[] && default2 instanceof ByteBuffer) {
+                default2 = ((ByteBuffer) default2).array();
+            }
+            equal = Objects.deepEquals(default1, default2);
+        }
 
         return equal;
     }
@@ -1134,4 +1198,92 @@ public class VerifyRecord {
 
         return true;
     }
+
+    /**
+     * Sets the version of a passed schema to a new value.
+     *
+     * @param schema the schema to be updated
+     * @param version the target version value
+     * @return the new schema with the same structure but updated version
+     */
+    private static Schema setVersion(Schema schema, Integer version) {
+        if (schema == null) {
+            return null;
+        }
+        final SchemaBuilder builder = new SchemaBuilder(schema.type())
+                .name(schema.name())
+                .version(version)
+                .doc(schema.doc());
+        if (schema.defaultValue() != null) {
+            builder.defaultValue(schema.defaultValue());
+        }
+        if (schema.isOptional()) {
+            builder.optional();
+        }
+        if (schema.parameters() != null) {
+            builder.parameters(schema.parameters());
+        }
+        if (schema.fields() != null) {
+            for (Field f : schema.fields()) {
+                builder.field(f.name(), f.schema());
+            }
+        }
+        return builder.build();
+    }
+
+    /**
+     * Sets the version of a passed schema to a new value.
+     *
+     * @param value the value with schema to be updated
+     * @param version the target version value
+     * @return the new value with the same schema but updated version
+     */
+    private static SchemaAndValue setVersion(SchemaAndValue value, Integer version) {
+        final Schema schema = setVersion(value.schema(), version);
+        if (schema == null) {
+            return value;
+        }
+        if (schema.type() != Type.STRUCT) {
+            return new SchemaAndValue(schema, value);
+        }
+        final Struct struct = new Struct(schema);
+        final Struct old = (Struct) value.value();
+        for (Field f : schema.fields()) {
+            struct.put(f, old.getWithoutDefault(f.name()));
+        }
+        return new SchemaAndValue(schema, struct);
+    }
+
+    /**
+     * Sets the version of a passed schema to a new value.
+     *
+     * @param obj the value with schema to be updated
+     * @param version the target version value
+     * @return the new value with the same schema but updated version
+     */
+    private static Object setVersion(Object obj, Integer version) {
+        if (!(obj instanceof Struct)) {
+            return obj;
+        }
+        final Struct value = (Struct) obj;
+        final Schema schema = setVersion(value.schema(), version);
+        if (schema == null) {
+            return value;
+        }
+        if (schema.type() != Type.STRUCT) {
+            return value;
+        }
+        final Struct struct = new Struct(schema);
+        final Struct old = value;
+        for (Field f : schema.fields()) {
+            struct.put(f, old.getWithoutDefault(f.name()));
+        }
+        return struct;
+    }
+
+    public static boolean isApucurioAvailable() {
+        String useApicurio = System.getProperty("use.apicurio");
+        return useApicurio != null && useApicurio.equalsIgnoreCase("true");
+    }
+
 }

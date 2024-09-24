@@ -13,12 +13,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.ThreadSafe;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.connector.postgresql.spi.SlotState;
 import io.debezium.relational.TableId;
-import io.debezium.schema.TopicSelector;
+import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
 import io.debezium.util.ElapsedTimeStrategy;
 
@@ -33,27 +34,27 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
 
     protected final static Logger LOGGER = LoggerFactory.getLogger(PostgresTaskContext.class);
 
-    private final PostgresConnectorConfig config;
-    private final TopicSelector<TableId> topicSelector;
+    private final CommonConnectorConfig config;
+    private final TopicNamingStrategy<TableId> topicNamingStrategy;
     private final PostgresSchema schema;
 
     private ElapsedTimeStrategy refreshXmin;
     private Long lastXmin;
 
-    protected PostgresTaskContext(PostgresConnectorConfig config, PostgresSchema schema, TopicSelector<TableId> topicSelector) {
-        super(config.getContextName(), config.getLogicalName(), Collections::emptySet);
+    protected PostgresTaskContext(PostgresConnectorConfig config, PostgresSchema schema, TopicNamingStrategy<TableId> topicNamingStrategy) {
+        super(config, config.getCustomMetricTags(), Collections::emptySet);
 
         this.config = config;
         if (config.xminFetchInterval().toMillis() > 0) {
             this.refreshXmin = ElapsedTimeStrategy.constant(Clock.SYSTEM, config.xminFetchInterval().toMillis());
         }
-        this.topicSelector = topicSelector;
+        this.topicNamingStrategy = topicNamingStrategy;
         assert schema != null;
         this.schema = schema;
     }
 
-    protected TopicSelector<TableId> topicSelector() {
-        return topicSelector;
+    protected TopicNamingStrategy<TableId> topicNamingStrategy() {
+        return topicNamingStrategy;
     }
 
     protected PostgresSchema schema() {
@@ -61,7 +62,7 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
     }
 
     protected PostgresConnectorConfig config() {
-        return config;
+        return (PostgresConnectorConfig) config;
     }
 
     protected void refreshSchema(PostgresConnection connection, boolean printReplicaIdentityInfo) throws SQLException {
@@ -71,12 +72,12 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
     Long getSlotXmin(PostgresConnection connection) throws SQLException {
         // when xmin fetch is set to 0, we don't track it to ignore any performance of querying the
         // slot periodically
-        if (config.xminFetchInterval().toMillis() <= 0) {
+        if (config().xminFetchInterval().toMillis() <= 0) {
             return null;
         }
         assert (this.refreshXmin != null);
 
-        if (this.refreshXmin.hasElapsed()) {
+        if (this.refreshXmin.hasElapsed() || lastXmin == null) {
             lastXmin = getCurrentSlotState(connection).slotCatalogXmin();
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("Fetched new xmin from slot of {}", lastXmin);
@@ -92,11 +93,11 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
     }
 
     private SlotState getCurrentSlotState(PostgresConnection connection) throws SQLException {
-        return connection.getReplicationSlotState(config.slotName(), config.plugin().getPostgresPluginName());
+        return connection.getReplicationSlotState(config().slotName(), config().plugin().getPostgresPluginName());
     }
 
-    protected ReplicationConnection createReplicationConnection(boolean exportSnapshot, boolean doSnapshot) throws SQLException {
-        final boolean dropSlotOnStop = config.dropSlotOnStop();
+    protected ReplicationConnection createReplicationConnection(PostgresConnection jdbcConnection) throws SQLException {
+        final boolean dropSlotOnStop = config().dropSlotOnStop();
         if (dropSlotOnStop) {
             LOGGER.warn(
                     "Connector has enabled automated replication slot removal upon restart ({} = true). " +
@@ -104,23 +105,18 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
                             "will be created after a connector restart, resulting in missed data change events.",
                     PostgresConnectorConfig.DROP_SLOT_ON_STOP.name());
         }
-        return ReplicationConnection.builder(config.jdbcConfig())
-                .withSlot(config.slotName())
-                .withPublication(config.publicationName())
-                .withTableFilter(config.getTableFilters())
-                .withPublicationAutocreateMode(config.publicationAutocreateMode())
-                .withPlugin(config.plugin())
+        return ReplicationConnection.builder(config())
+                .withSlot(config().slotName())
+                .withPublication(config().publicationName())
+                .withTableFilter(config().getTableFilters())
+                .withPublicationAutocreateMode(config().publicationAutocreateMode())
+                .withPlugin(config().plugin())
                 .dropSlotOnClose(dropSlotOnStop)
-                .streamParams(config.streamParams())
-                .statusUpdateInterval(config.statusUpdateInterval())
-                .withTypeRegistry(schema.getTypeRegistry())
-                .exportSnapshotOnCreate(exportSnapshot)
-                .doSnapshot(doSnapshot)
+                .streamParams(config().streamParams())
+                .statusUpdateInterval(config().statusUpdateInterval())
+                .withTypeRegistry(jdbcConnection.getTypeRegistry())
                 .withSchema(schema)
+                .jdbcMetadataConnection(jdbcConnection)
                 .build();
-    }
-
-    PostgresConnectorConfig getConfig() {
-        return config;
     }
 }

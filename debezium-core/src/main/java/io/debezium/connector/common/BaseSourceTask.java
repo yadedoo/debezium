@@ -6,12 +6,22 @@
 package io.debezium.connector.common;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.ServiceLoader;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -20,14 +30,32 @@ import org.apache.kafka.connect.source.SourceTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.DebeziumException;
+import io.debezium.annotation.SingleThreadAccess;
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
+import io.debezium.function.LogPositionValidator;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
+import io.debezium.pipeline.notification.channels.NotificationChannel;
+import io.debezium.pipeline.signal.channels.SignalChannelReader;
+import io.debezium.pipeline.signal.channels.process.SignalChannelWriter;
 import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.pipeline.spi.Offsets;
+import io.debezium.pipeline.spi.Partition;
+import io.debezium.processors.PostProcessorRegistryServiceProvider;
+import io.debezium.schema.DatabaseSchema;
+import io.debezium.schema.HistorizedDatabaseSchema;
+import io.debezium.service.spi.ServiceRegistry;
+import io.debezium.snapshot.SnapshotLockProvider;
+import io.debezium.snapshot.SnapshotQueryProvider;
+import io.debezium.snapshot.SnapshotterServiceProvider;
+import io.debezium.spi.snapshot.Snapshotter;
 import io.debezium.util.Clock;
 import io.debezium.util.ElapsedTimeStrategy;
 import io.debezium.util.Metronome;
+import io.debezium.util.Strings;
 
 /**
  * Base class for Debezium's CDC {@link SourceTask} implementations. Provides functionality common to all connectors,
@@ -35,16 +63,114 @@ import io.debezium.util.Metronome;
  *
  * @author Gunnar Morling
  */
-public abstract class BaseSourceTask extends SourceTask {
+public abstract class BaseSourceTask<P extends Partition, O extends OffsetContext> extends SourceTask {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(BaseSourceTask.class);
+    private static final Duration INITIAL_POLL_PERIOD_IN_MILLIS = Duration.ofMillis(TimeUnit.SECONDS.toMillis(5));
+    private static final Duration MAX_POLL_PERIOD_IN_MILLIS = Duration.ofMillis(TimeUnit.HOURS.toMillis(1));
+    private Configuration config;
+    private List<SignalChannelReader> signalChannels;
 
-    protected static enum State {
-        RUNNING,
-        STOPPED;
+    protected void validateAndLoadSchemaHistory(CommonConnectorConfig config, LogPositionValidator logPositionValidator, Offsets<P, O> previousOffsets,
+                                                DatabaseSchema schema,
+                                                Snapshotter snapshotter) {
+
+        for (Map.Entry<P, O> previousOffset : previousOffsets) {
+
+            Partition partition = previousOffset.getKey();
+            OffsetContext offset = previousOffset.getValue();
+
+            if (offset == null) {
+                if (snapshotter.shouldSnapshotOnSchemaError()) {
+                    // We are in schema only recovery mode, use the existing redo log position
+                    // would like to also verify redo log position exists, but it defaults to 0 which is technically valid
+                    throw new DebeziumException("Could not find existing redo log information while attempting schema only recovery snapshot");
+                }
+                LOGGER.info("Connector started for the first time.");
+                if (schema.isHistorized()) {
+                    ((HistorizedDatabaseSchema) schema).initializeStorage();
+                }
+                return;
+            }
+
+            if (offset.isSnapshotRunning()) {
+                // The last offset was an incomplete snapshot and now the snapshot was disabled
+                if (!snapshotter.shouldSnapshotData(true, true) &&
+                        !snapshotter.shouldSnapshotSchema(true, true)) {
+                    // No snapshots are allowed
+                    throw new DebeziumException("The connector previously stopped while taking a snapshot, but now the connector is configured "
+                            + "to never allow snapshots. Reconfigure the connector to use snapshots initially or when needed.");
+                }
+            }
+            else {
+
+                if (schema.isHistorized() && !((HistorizedDatabaseSchema) schema).historyExists()) {
+
+                    LOGGER.warn("Database schema history was not found but was expected");
+
+                    if (snapshotter.shouldSnapshotOnSchemaError()) {
+
+                        LOGGER.info("The db-history topic is missing but we are in {} snapshot mode. " +
+                                "Attempting to snapshot the current schema and then begin reading the redo log from the last recorded offset.",
+                                snapshotter.name());
+                        if (schema.isHistorized()) {
+                            ((HistorizedDatabaseSchema) schema).initializeStorage();
+                        }
+                        return;
+                    }
+                    else {
+                        throw new DebeziumException("The db history topic is missing. You may attempt to recover it by reconfiguring the connector to recovery.");
+                    }
+                }
+
+                if (config.isLogPositionCheckEnabled()) {
+
+                    boolean logPositionAvailable = isLogPositionAvailable(logPositionValidator, partition, offset, config);
+
+                    if (!logPositionAvailable) {
+                        LOGGER.warn("Last recorded offset is no longer available on the server.");
+
+                        if (snapshotter.shouldSnapshotOnDataError()) {
+
+                            LOGGER.info("The last recorded offset is no longer available but we are in {} snapshot mode. " +
+                                    "Attempting to snapshot data to fill the gap.",
+                                    snapshotter.name());
+
+                            previousOffsets.resetOffset(previousOffsets.getTheOnlyPartition());
+
+                            return;
+                        }
+
+                        LOGGER.warn("The connector is trying to read redo log starting at " + offset + ", but this is no longer "
+                                + "available on the server. Reconfigure the connector to use a snapshot when needed if you want to recover. " +
+                                "If not the connector will streaming from the last available position in the log");
+                    }
+                }
+
+                if (schema.isHistorized()) {
+                    ((HistorizedDatabaseSchema) schema).recover(partition, offset);
+                }
+            }
+        }
     }
 
-    private final AtomicReference<State> state = new AtomicReference<State>(State.STOPPED);
+    public boolean isLogPositionAvailable(LogPositionValidator logPositionValidator, Partition partition, OffsetContext offsetContext, CommonConnectorConfig config) {
+
+        if (logPositionValidator == null) {
+            LOGGER.warn("Current JDBC connection implementation is not providing a log position validator implementation. The check will always be 'true'");
+            return true;
+        }
+        return logPositionValidator.validate(partition, offsetContext, config);
+    }
+
+    public enum State {
+        RESTARTING,
+        RUNNING,
+        INITIAL,
+        STOPPED
+    }
+
+    private final AtomicReference<State> state = new AtomicReference<>(State.INITIAL);
 
     /**
      * Used to ensure that start(), stop() and commitRecord() calls are serialized.
@@ -54,24 +180,48 @@ public abstract class BaseSourceTask extends SourceTask {
     private volatile ElapsedTimeStrategy restartDelay;
 
     /**
-     * Raw connector properties, kept here so they can be passed again in case of a restart.
-     */
-    private volatile Map<String, String> props;
-
-    /**
      * The change event source coordinator for those connectors adhering to the new
      * framework structure, {@code null} for legacy-style connectors.
      */
-    private ChangeEventSourceCoordinator coordinator;
+    protected ChangeEventSourceCoordinator<P, O> coordinator;
 
     /**
-     * The latest offset that has been acknowledged by the Kafka producer. Will be
+     * The latest offsets that have been acknowledged by the Kafka producer. Will be
      * acknowledged with the source database in {@link BaseSourceTask#commit()}
      * (which may be a no-op depending on the connector).
      */
-    private volatile Map<String, ?> lastOffset;
+    private final Map<Map<String, ?>, Map<String, ?>> lastOffsets = new HashMap<>();
 
     private Duration retriableRestartWait;
+
+    private final ElapsedTimeStrategy pollOutputDelay;
+
+    private final Clock clock = Clock.system();
+    @SingleThreadAccess("polling thread")
+    private Instant previousOutputInstant;
+
+    @SingleThreadAccess("polling thread")
+    private int previousOutputBatchSize;
+
+    private final ServiceLoader<SignalChannelReader> availableSignalChannels = ServiceLoader.load(SignalChannelReader.class);
+
+    private final List<NotificationChannel> notificationChannels;
+
+    /**
+     * A flag to record whether the offsets stored in the offset store are loaded for the first time.
+     * This is typically used to reduce logging in case a connector like PostgreSQL reads offsets
+     * not only on connector startup but repeatedly during execution time too.
+     */
+    private boolean offsetLoadedInPast = false;
+
+    protected BaseSourceTask() {
+        // Use exponential delay to log the progress frequently at first, but the quickly tapering off to once an hour...
+        pollOutputDelay = ElapsedTimeStrategy.exponential(clock, INITIAL_POLL_PERIOD_IN_MILLIS, MAX_POLL_PERIOD_IN_MILLIS);
+        previousOutputInstant = clock.currentTimeAsInstant();
+
+        this.notificationChannels = StreamSupport.stream(ServiceLoader.load(NotificationChannel.class).spliterator(), false)
+                .collect(Collectors.toList());
+    }
 
     @Override
     public final void start(Map<String, String> props) {
@@ -82,13 +232,8 @@ public abstract class BaseSourceTask extends SourceTask {
         stateLock.lock();
 
         try {
-            if (!state.compareAndSet(State.STOPPED, State.RUNNING)) {
-                LOGGER.info("Connector has already been started");
-                return;
-            }
-
-            this.props = props;
-            Configuration config = Configuration.from(props);
+            setTaskState(State.INITIAL);
+            config = Configuration.from(props);
             retriableRestartWait = config.getDuration(CommonConnectorConfig.RETRIABLE_RESTART_WAIT, ChronoUnit.MILLIS);
             // need to reset the delay or you only get one delayed restart
             restartDelay = null;
@@ -98,12 +243,19 @@ public abstract class BaseSourceTask extends SourceTask {
 
             if (LOGGER.isInfoEnabled()) {
                 LOGGER.info("Starting {} with configuration:", getClass().getSimpleName());
-                config.withMaskedPasswords().forEach((propName, propValue) -> {
+                withMaskedSensitiveOptions(config).forEach((propName, propValue) -> {
                     LOGGER.info("   {} = {}", propName, propValue);
                 });
             }
-
-            this.coordinator = start(config);
+            try {
+                this.coordinator = start(config);
+                setTaskState(State.RUNNING);
+            }
+            catch (RetriableException e) {
+                LOGGER.warn("Failed to start connector, will re-attempt during polling.", e);
+                restartDelay = ElapsedTimeStrategy.constant(Clock.system(), retriableRestartWait);
+                setTaskState(State.RESTARTING);
+            }
         }
         finally {
             stateLock.unlock();
@@ -111,33 +263,116 @@ public abstract class BaseSourceTask extends SourceTask {
     }
 
     /**
-     * Called once when starting this source task.
+     * Returns the available signal channels.
+     * <p>
+     *     The signal channels are loaded using the {@link ServiceLoader} mechanism and cached for the lifetime of the task.
+     * </p>
+     *
+     * @return list of loaded signal channels
+     */
+    public List<SignalChannelReader> getAvailableSignalChannels() {
+        if (signalChannels == null) {
+            signalChannels = availableSignalChannels.stream().map(ServiceLoader.Provider::get).collect(Collectors.toList());
+        }
+        return signalChannels;
+    }
+
+    /**
+     * Returns the first available signal channel writer
+     *
+     * @return the first available signal channel writer empty optional if not available
+     */
+    public Optional<? extends SignalChannelWriter> getAvailableSignalChannelWriter() {
+        return getAvailableSignalChannels().stream()
+                .filter(SignalChannelWriter.class::isInstance)
+                .map(SignalChannelWriter.class::cast)
+                .findFirst();
+    }
+
+    protected Configuration withMaskedSensitiveOptions(Configuration config) {
+        return config.withMaskedPasswords();
+    }
+
+    /**
+     * Called when starting this source task.  This method can throw a {@link RetriableException} to indicate
+     * that the task should attempt to retry the start later.
      *
      * @param config
      *            the task configuration; implementations should wrap it in a dedicated implementation of
      *            {@link CommonConnectorConfig} and work with typed access to configuration properties that way
      */
-    protected abstract ChangeEventSourceCoordinator start(Configuration config);
+    protected abstract ChangeEventSourceCoordinator<P, O> start(Configuration config);
 
     @Override
     public final List<SourceRecord> poll() throws InterruptedException {
-        boolean started = startIfNeededAndPossible();
-
-        // in backoff period after a retriable exception
-        if (!started) {
-            // WorkerSourceTask calls us immediately after we return the empty list.
-            // This turns into a throttling so we need to make a pause before we return
-            // the control back.
-            Metronome.parker(Duration.of(2, ChronoUnit.SECONDS), Clock.SYSTEM).pause();
-            return Collections.emptyList();
-        }
 
         try {
-            return doPoll();
+            // in we fail to start, return empty list and try to start next poll() method call
+            if (!startIfNeededAndPossible()) {
+                return Collections.emptyList();
+            }
+
+            final List<SourceRecord> records = doPoll();
+            logStatistics(records);
+
+            resetErrorHandlerRetriesIfNeeded(records);
+
+            return records;
         }
         catch (RetriableException e) {
             stop(true);
             throw e;
+        }
+    }
+
+    protected void logStatistics(final List<SourceRecord> records) {
+        if (records == null || !LOGGER.isInfoEnabled()) {
+            return;
+        }
+        int batchSize = records.size();
+
+        if (batchSize > 0) {
+            // We want to log the number of records per topic...
+            if (LOGGER.isDebugEnabled()) {
+                final Map<String, Integer> topicCounts = new LinkedHashMap<>();
+                records.forEach(r -> topicCounts.merge(r.topic(), 1, Integer::sum));
+                for (Map.Entry<String, Integer> topicCount : topicCounts.entrySet()) {
+                    LOGGER.debug("Sending {} records to topic {}", topicCount.getValue(), topicCount.getKey());
+                }
+            }
+
+            SourceRecord lastRecord = records.get(batchSize - 1);
+            previousOutputBatchSize += batchSize;
+            if (pollOutputDelay.hasElapsed()) {
+                // We want to record the status ...
+                final Instant currentTime = clock.currentTime();
+                LOGGER.info("{} records sent during previous {}, last recorded offset of {} partition is {}", previousOutputBatchSize,
+                        Strings.duration(Duration.between(previousOutputInstant, currentTime).toMillis()),
+                        lastRecord.sourcePartition(), lastRecord.sourceOffset());
+
+                previousOutputInstant = currentTime;
+                previousOutputBatchSize = 0;
+            }
+        }
+    }
+
+    private void updateLastOffset(Map<String, ?> partition, Map<String, ?> lastOffset) {
+        stateLock.lock();
+        lastOffsets.put(partition, lastOffset);
+        stateLock.unlock();
+    }
+
+    /**
+     * Should be called to reset the error handler's retry counter upon a successful poll or when known
+     * that the connector task has recovered from a previous failure state.
+     */
+    protected void resetErrorHandlerRetriesIfNeeded(List<SourceRecord> records) {
+        // When a connector throws a retriable error, the task is not re-created and instead the previous
+        // error handler is passed into the new error handler, propagating the retry count. This method
+        // allows resetting that counter when a successful poll iteration step contains new records so that when a
+        // future failure is thrown, the maximum retry count can be utilized.
+        if (!records.isEmpty() && coordinator != null && coordinator.getErrorHandler().getRetries() > 0) {
+            coordinator.getErrorHandler().resetRetries();
         }
     }
 
@@ -150,25 +385,35 @@ public abstract class BaseSourceTask extends SourceTask {
      * Starts this connector in case it has been stopped after a retriable error,
      * and the backoff period has passed.
      */
-    private boolean startIfNeededAndPossible() {
+    private boolean startIfNeededAndPossible() throws InterruptedException {
         stateLock.lock();
 
+        boolean result = false;
         try {
-            if (state.get() == State.RUNNING) {
-                return true;
+            State currentState = getTaskState();
+            if (currentState == State.RUNNING) {
+                result = true;
             }
-            else if (restartDelay != null && restartDelay.hasElapsed()) {
-                start(props);
-                return true;
-            }
-            else {
-                LOGGER.info("Awaiting end of restart backoff period after a retriable error");
-                return false;
+            else if (currentState == State.RESTARTING) {
+                // we're in restart mode... check if it's time to restart
+                if (restartDelay.hasElapsed()) {
+                    LOGGER.info("Attempting to restart task.");
+                    this.coordinator = start(config);
+                    LOGGER.info("Successfully restarted task");
+                    restartDelay = null;
+                    setTaskState(State.RUNNING);
+                    result = true;
+                }
+                else {
+                    LOGGER.info("Awaiting end of restart backoff period after a retriable error");
+                    Metronome.parker(retriableRestartWait, Clock.SYSTEM).pause();
+                }
             }
         }
         finally {
             stateLock.unlock();
         }
+        return result;
     }
 
     @Override
@@ -180,11 +425,6 @@ public abstract class BaseSourceTask extends SourceTask {
         stateLock.lock();
 
         try {
-            if (!state.compareAndSet(State.RUNNING, State.STOPPED)) {
-                LOGGER.info("Connector has already been stopped");
-                return;
-            }
-
             if (restart) {
                 LOGGER.warn("Going to restart connector after {} sec. after a retriable exception", retriableRestartWait.getSeconds());
             }
@@ -195,6 +435,7 @@ public abstract class BaseSourceTask extends SourceTask {
             try {
                 if (coordinator != null) {
                     coordinator.stop();
+                    coordinator = null;
                 }
             }
             catch (InterruptedException e) {
@@ -205,9 +446,14 @@ public abstract class BaseSourceTask extends SourceTask {
 
             doStop();
 
-            if (restart && restartDelay == null) {
-                restartDelay = ElapsedTimeStrategy.constant(Clock.system(), retriableRestartWait.toMillis());
-                restartDelay.hasElapsed();
+            if (restart) {
+                setTaskState(State.RESTARTING);
+                if (restartDelay == null) {
+                    restartDelay = ElapsedTimeStrategy.constant(Clock.system(), retriableRestartWait);
+                }
+            }
+            else {
+                setTaskState(State.STOPPED);
             }
         }
         finally {
@@ -219,9 +465,11 @@ public abstract class BaseSourceTask extends SourceTask {
 
     @Override
     public void commitRecord(SourceRecord record) throws InterruptedException {
+        LOGGER.trace("Committing record {}", record);
+
         Map<String, ?> currentOffset = record.sourceOffset();
         if (currentOffset != null) {
-            this.lastOffset = currentOffset;
+            updateLastOffset(record.sourcePartition(), currentOffset);
         }
     }
 
@@ -231,8 +479,16 @@ public abstract class BaseSourceTask extends SourceTask {
 
         if (locked) {
             try {
-                if (coordinator != null && lastOffset != null) {
-                    coordinator.commitOffset(lastOffset);
+                if (coordinator != null) {
+                    Iterator<Map<String, ?>> iterator = lastOffsets.keySet().iterator();
+                    while (iterator.hasNext()) {
+                        Map<String, ?> partition = iterator.next();
+                        Map<String, ?> lastOffset = lastOffsets.get(partition);
+
+                        LOGGER.debug("Committing offset '{}' for partition '{}'", partition, lastOffset);
+                        coordinator.commitOffset(partition, lastOffset);
+                        iterator.remove();
+                    }
                 }
             }
             finally {
@@ -240,7 +496,7 @@ public abstract class BaseSourceTask extends SourceTask {
             }
         }
         else {
-            LOGGER.warn("Couldn't commit processed log positions with the source database due to a concurrent connector shutdown or restart");
+            LOGGER.info("Couldn't commit processed log positions with the source database due to a concurrent connector shutdown or restart");
         }
     }
 
@@ -250,28 +506,66 @@ public abstract class BaseSourceTask extends SourceTask {
     protected abstract Iterable<Field> getAllConfigurationFields();
 
     /**
-     * Loads the connector's persistent offset (if present) via the given loader.
+     * Loads the connector's persistent offsets (if present) via the given loader.
      */
-    protected OffsetContext getPreviousOffset(OffsetContext.Loader loader) {
-        Map<String, ?> partition = loader.getPartition();
+    protected Offsets<P, O> getPreviousOffsets(Partition.Provider<P> provider, OffsetContext.Loader<O> loader) {
+        Set<P> partitions = provider.getPartitions();
+        OffsetReader<P, O, OffsetContext.Loader<O>> reader = new OffsetReader<>(
+                context.offsetStorageReader(), loader);
+        Map<P, O> offsets = reader.offsets(partitions);
 
-        if (lastOffset != null) {
-            OffsetContext offsetContext = loader.load(lastOffset);
-            LOGGER.info("Found previous offset after restart {}", offsetContext);
-            return offsetContext;
+        boolean found = false;
+        for (P partition : partitions) {
+            O offset = offsets.get(partition);
+
+            if (offset != null) {
+                found = true;
+                if (offsetLoadedInPast) {
+                    LOGGER.debug("Found previous partition offset {}: {}", partition, offset.getOffset());
+                }
+                else {
+                    LOGGER.info("Found previous partition offset {}: {}", partition, offset.getOffset());
+                    offsetLoadedInPast = true;
+                }
+            }
         }
 
-        Map<String, Object> previousOffset = context.offsetStorageReader()
-                .offsets(Collections.singleton(partition))
-                .get(partition);
+        if (!found) {
+            LOGGER.info("No previous offsets found");
+        }
 
-        if (previousOffset != null) {
-            OffsetContext offsetContext = loader.load(previousOffset);
-            LOGGER.info("Found previous offset {}", offsetContext);
-            return offsetContext;
+        return Offsets.of(offsets);
+    }
+
+    /**
+     * Sets the new state for the task. The caller must be holding {@link #stateLock} lock.
+     *
+     * @param newState
+     */
+    private void setTaskState(State newState) {
+        State oldState = state.getAndSet(newState);
+        LOGGER.debug("Setting task state to '{}', previous state was '{}'", newState, oldState);
+    }
+
+    @VisibleForTesting
+    public State getTaskState() {
+        stateLock.lock();
+        try {
+            return state.get();
         }
-        else {
-            return null;
+        finally {
+            stateLock.unlock();
         }
+    }
+
+    public List<NotificationChannel> getNotificationChannels() {
+        return notificationChannels;
+    }
+
+    protected void registerServiceProviders(ServiceRegistry serviceRegistry) {
+        serviceRegistry.registerServiceProvider(new PostProcessorRegistryServiceProvider());
+        serviceRegistry.registerServiceProvider(new SnapshotLockProvider());
+        serviceRegistry.registerServiceProvider(new SnapshotQueryProvider());
+        serviceRegistry.registerServiceProvider(new SnapshotterServiceProvider());
     }
 }

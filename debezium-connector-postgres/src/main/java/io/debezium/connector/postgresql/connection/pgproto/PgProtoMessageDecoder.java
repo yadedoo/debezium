@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.Set;
+import java.util.function.Function;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
@@ -19,7 +20,6 @@ import com.google.protobuf.InvalidProtocolBufferException;
 
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.AbstractMessageDecoder;
-import io.debezium.connector.postgresql.connection.MessageDecoderConfig;
 import io.debezium.connector.postgresql.connection.ReplicationStream.ReplicationMessageProcessor;
 import io.debezium.connector.postgresql.proto.PgProto;
 import io.debezium.connector.postgresql.proto.PgProto.Op;
@@ -39,10 +39,6 @@ public class PgProtoMessageDecoder extends AbstractMessageDecoder {
     private static final Set<Op> SUPPORTED_OPS = Collect.unmodifiableSet(Op.INSERT, Op.UPDATE, Op.DELETE, Op.BEGIN, Op.COMMIT);
 
     private boolean warnedOnUnkownOp = false;
-
-    public PgProtoMessageDecoder(MessageDecoderConfig config) {
-        super(config);
-    }
 
     @Override
     public void processNotEmptyMessage(final ByteBuffer buffer, ReplicationMessageProcessor processor, TypeRegistry typeRegistry)
@@ -77,12 +73,7 @@ public class PgProtoMessageDecoder extends AbstractMessageDecoder {
     }
 
     @Override
-    public ChainedLogicalStreamBuilder optionsWithMetadata(ChainedLogicalStreamBuilder builder) {
-        return builder;
-    }
-
-    @Override
-    public ChainedLogicalStreamBuilder optionsWithoutMetadata(ChainedLogicalStreamBuilder builder) {
+    public ChainedLogicalStreamBuilder defaultOptions(ChainedLogicalStreamBuilder builder, Function<Integer, Boolean> hasMinimumServerVersion) {
         return builder;
     }
 }

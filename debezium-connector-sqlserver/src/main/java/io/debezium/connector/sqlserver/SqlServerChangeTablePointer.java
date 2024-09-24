@@ -6,18 +6,22 @@
 package io.debezium.connector.sqlserver;
 
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.jdbc.JdbcConnection.ResultSetMapper;
 import io.debezium.pipeline.source.spi.ChangeTableResultSet;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
+import io.debezium.util.ColumnUtils;
 
 /**
  * The logical representation of a position for the change in the transaction log.
@@ -32,6 +36,10 @@ import io.debezium.relational.Table;
  */
 public class SqlServerChangeTablePointer extends ChangeTableResultSet<SqlServerChangeTable, TxLogPosition> {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(SqlServerChangeTablePointer.class);
+
+    private static final int INVALID_COLUMN_INDEX = -1;
+
     private static final int COL_COMMIT_LSN = 1;
     private static final int COL_ROW_LSN = 2;
     private static final int COL_OPERATION = 3;
@@ -42,15 +50,14 @@ public class SqlServerChangeTablePointer extends ChangeTableResultSet<SqlServerC
     private final int columnDataOffset;
 
     public SqlServerChangeTablePointer(SqlServerChangeTable changeTable, ResultSet resultSet) {
-        this(changeTable, resultSet, COL_DATA);
+        super(changeTable, resultSet, COL_DATA);
+        // Store references to these because we can't get them from our superclass
+        this.resultSet = resultSet;
+        this.columnDataOffset = COL_DATA;
     }
 
-    public SqlServerChangeTablePointer(SqlServerChangeTable changeTable, ResultSet resultSet, int columnDataOffset) {
-        super(changeTable, resultSet, columnDataOffset);
-        // Store references to these because we can't get them from our superclass
-        // this.changeTable = changeTable;
-        this.resultSet = resultSet;
-        this.columnDataOffset = columnDataOffset;
+    protected ResultSet getResultSet() {
+        return resultSet;
     }
 
     @Override
@@ -61,7 +68,7 @@ public class SqlServerChangeTablePointer extends ChangeTableResultSet<SqlServerC
     @Override
     protected Object getColumnData(ResultSet resultSet, int columnIndex) throws SQLException {
         if (resultSet.getMetaData().getColumnType(columnIndex) == Types.TIME) {
-            return resultSet.getTime(columnIndex);
+            return resultSet.getTimestamp(columnIndex);
         }
         return super.getColumnData(resultSet, columnIndex);
     }
@@ -102,54 +109,47 @@ public class SqlServerChangeTablePointer extends ChangeTableResultSet<SqlServerC
      * a subset of columns
      */
     private ResultSetMapper<Object[]> createResultSetMapper(Table table) throws SQLException {
-        final List<String> sourceTableColumns = table.columns()
-                .stream()
-                .map(Column::name)
-                .collect(Collectors.toList());
-        final List<String> resultColumns = getResultColumnNames();
-        final int sourceColumnCount = sourceTableColumns.size();
+        ColumnUtils.MappedColumns columnMap = ColumnUtils.toMap(table);
+        final ResultSetMetaData rsmd = resultSet.getMetaData();
+        final int columnCount = rsmd.getColumnCount() - columnDataOffset;
+        final List<String> resultColumns = new ArrayList<>(columnCount);
+        for (int i = 0; i < columnCount; ++i) {
+            resultColumns.add(rsmd.getColumnName(columnDataOffset + i));
+        }
         final int resultColumnCount = resultColumns.size();
 
-        if (sourceTableColumns.equals(resultColumns)) {
-            return resultSet -> {
-                final Object[] data = new Object[sourceColumnCount];
-                for (int i = 0; i < sourceColumnCount; i++) {
-                    data[i] = getColumnData(resultSet, columnDataOffset + i);
+        final IndicesMapping indicesMapping = new IndicesMapping(columnMap.getSourceTableColumns(), resultColumns);
+        return resultSet -> {
+            final Object[] data = new Object[columnMap.getGreatestColumnPosition()];
+            for (int i = 0; i < resultColumnCount; i++) {
+                int index = indicesMapping.getSourceTableColumnIndex(i);
+                if (index == INVALID_COLUMN_INDEX) {
+                    LOGGER.trace("Data for table '{}' contains a column without position mapping", table.id());
+                    continue;
                 }
-                return data;
-            };
-        }
-        else {
-            final IndicesMapping indicesMapping = new IndicesMapping(sourceTableColumns, resultColumns);
-            return resultSet -> {
-                final Object[] data = new Object[sourceColumnCount];
-                for (int i = 0; i < resultColumnCount; i++) {
-                    int index = indicesMapping.getSourceTableColumnIndex(i);
-                    data[index] = getColumnData(resultSet, columnDataOffset + i);
-                }
-                return data;
-            };
-        }
-    }
-
-    private List<String> getResultColumnNames() throws SQLException {
-        final int columnCount = resultSet.getMetaData().getColumnCount() - (columnDataOffset - 1);
-        final List<String> columns = new ArrayList<>(columnCount);
-        for (int i = 0; i < columnCount; ++i) {
-            columns.add(resultSet.getMetaData().getColumnName(columnDataOffset + i));
-        }
-        return columns;
+                data[index] = getColumnData(resultSet, columnDataOffset + i);
+            }
+            return data;
+        };
     }
 
     private class IndicesMapping {
 
         private final Map<Integer, Integer> mapping;
 
-        IndicesMapping(List<String> sourceTableColumns, List<String> captureInstanceColumns) {
+        IndicesMapping(Map<String, Column> sourceTableColumns, List<String> captureInstanceColumns) {
             this.mapping = new HashMap<>(sourceTableColumns.size(), 1.0F);
 
             for (int i = 0; i < captureInstanceColumns.size(); ++i) {
-                mapping.put(i, sourceTableColumns.indexOf(captureInstanceColumns.get(i)));
+                final String columnName = captureInstanceColumns.get(i);
+                final Column column = sourceTableColumns.get(columnName);
+                if (column == null) {
+                    LOGGER.warn("Column '{}' available in capture table not found among source table columns", columnName);
+                    mapping.put(i, INVALID_COLUMN_INDEX);
+                }
+                else {
+                    mapping.put(i, column.position() - 1);
+                }
             }
 
         }

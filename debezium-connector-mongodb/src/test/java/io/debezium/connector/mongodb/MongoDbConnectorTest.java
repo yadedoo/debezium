@@ -5,10 +5,13 @@
  */
 package io.debezium.connector.mongodb;
 
-import static org.fest.assertions.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.Arrays;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.ConfigKey;
+import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.connect.connector.Connector;
 import org.junit.Test;
 
@@ -35,7 +38,15 @@ public class MongoDbConnectorTest {
             assertThat(key.importance).isEqualTo(expected.importance());
             assertThat(key.documentation).isEqualTo(expected.description());
             assertThat(key.type).isEqualTo(expected.type());
-            assertThat(key.defaultValue).isEqualTo(expected.defaultValue());
+            if (expected.type() == Type.CLASS) {
+                assertThat(((Class<?>) key.defaultValue).getName()).isEqualTo((String) expected.defaultValue());
+            }
+            else if (expected.type() == ConfigDef.Type.LIST && key.defaultValue != null) {
+                assertThat(key.defaultValue).isEqualTo(Arrays.asList(expected.defaultValue()));
+            }
+            else {
+                assertThat(key.defaultValue).isEqualTo(expected.defaultValue());
+            }
             assertThat(key.dependents).isEqualTo(expected.dependents());
             assertThat(key.width).isNotNull();
             assertThat(key.group).isNotNull();

@@ -7,58 +7,103 @@ package io.debezium.junit.logging;
 
 import static org.slf4j.Logger.ROOT_LOGGER_NAME;
 
-import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
 
-import org.apache.log4j.AppenderSkeleton;
-import org.apache.log4j.Level;
-import org.apache.log4j.Logger;
-import org.apache.log4j.spi.LoggingEvent;
 import org.slf4j.LoggerFactory;
-import org.slf4j.impl.Log4jLoggerAdapter;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.IThrowableProxy;
+import ch.qos.logback.core.AppenderBase;
 
 /**
- * @author Chris Cranford
+ * @author Chris Cranford, Jiri Pechanec
  */
-public class LogInterceptor extends AppenderSkeleton {
-    private List<LoggingEvent> events = new CopyOnWriteArrayList<>();
+public class LogInterceptor extends AppenderBase<ILoggingEvent> {
+    private List<ILoggingEvent> events = new CopyOnWriteArrayList<>();
 
-    public LogInterceptor() {
+    /**
+     * Constructor using root logger.
+     * This is usually not desirable as disabled additivity can prevent message to get here.
+     */
+    protected LogInterceptor() {
         try {
-            final Field field = Log4jLoggerAdapter.class.getDeclaredField("logger");
-            field.setAccessible(true);
+            final Logger rootLogger = (Logger) LoggerFactory.getLogger(ROOT_LOGGER_NAME);
+            this.start();
+            rootLogger.addAppender(this);
+        }
+        catch (Exception e) {
+            throw new RuntimeException("Failed to obtain logback logger for log interceptor.", e);
+        }
+    }
 
-            Logger logger = (Logger) field.get(LoggerFactory.getLogger(ROOT_LOGGER_NAME));
+    /**
+     * Provides a log interceptor based on the logger that emits the message.
+     *
+     * @param loggerName logger that emits the log message
+     */
+    public LogInterceptor(String loggerName) {
+        try {
+            final Logger logger = (Logger) LoggerFactory.getLogger(loggerName);
+            this.start();
             logger.addAppender(this);
         }
         catch (Exception e) {
-            throw new RuntimeException("Failed to obtain Log4j logger for log interceptor.");
+            throw new RuntimeException("Failed to obtain logback logger for log interceptor.", e);
         }
     }
 
+    /**
+     * Provides a log interceptor based on the logger that emits the message.
+     *
+     * @param clazz class that emits the log message
+     */
+    public LogInterceptor(Class<?> clazz) {
+        this(clazz.getName());
+    }
+
     @Override
-    protected void append(LoggingEvent loggingEvent) {
+    protected void append(ILoggingEvent loggingEvent) {
         this.events.add(loggingEvent);
     }
 
-    @Override
-    public void close() {
-        // do nothing
+    public void setLoggerLevel(Class<?> loggerClass, Level level) {
+        Logger logger = (Logger) org.slf4j.LoggerFactory.getLogger(loggerClass.getName());
+        logger.setLevel(level);
     }
 
-    @Override
-    public boolean requiresLayout() {
-        return false;
+    public List<String> getLogEntriesThatContainsMessage(String text) {
+        return events.stream()
+                .filter(e -> e.getFormattedMessage().toString().contains(text))
+                .map(e -> e.getFormattedMessage().toString())
+                .collect(Collectors.toList());
+    }
+
+    public long countOccurrences(String text) {
+        return events.stream().filter(e -> e.getMessage().toString().contains(text)).count();
     }
 
     public boolean containsMessage(String text) {
-        for (LoggingEvent event : events) {
-            if (event.getMessage().toString().contains(text)) {
+        for (ILoggingEvent event : events) {
+            if (event.getFormattedMessage().toString().contains(text)) {
                 return true;
             }
         }
         return false;
+    }
+
+    public List<ILoggingEvent> getLoggingEvents(String text) {
+        List<ILoggingEvent> matchEvents = new ArrayList<>();
+        for (ILoggingEvent event : events) {
+            if (event.getFormattedMessage().toString().contains(text)) {
+                matchEvents.add(event);
+            }
+        }
+        return matchEvents;
     }
 
     public boolean containsWarnMessage(String text) {
@@ -70,23 +115,28 @@ public class LogInterceptor extends AppenderSkeleton {
     }
 
     public boolean containsStacktraceElement(String text) {
-        for (LoggingEvent event : events) {
-            final String[] stackTrace = event.getThrowableStrRep();
-            if (stackTrace == null) {
-                continue;
-            }
-            for (String element : stackTrace) {
-                if (element.contains(text)) {
+        for (ILoggingEvent event : events) {
+            IThrowableProxy stackTrace = event.getThrowableProxy();
+            for (;;) {
+                if (stackTrace == null) {
+                    break;
+                }
+                if ((stackTrace.getClassName() + ": " + stackTrace.getMessage()).contains(text)) {
                     return true;
                 }
+                stackTrace = stackTrace.getCause();
             }
         }
         return false;
     }
 
+    public void clear() {
+        events.clear();
+    }
+
     private boolean containsMessage(Level level, String text) {
-        for (LoggingEvent event : events) {
-            if (event.getLevel().equals(level) && event.getMessage().toString().contains(text)) {
+        for (ILoggingEvent event : events) {
+            if (event.getLevel().equals(level) && event.getFormattedMessage().toString().contains(text)) {
                 return true;
             }
         }

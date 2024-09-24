@@ -6,20 +6,22 @@
 package io.debezium.relational;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-final class TableEditorImpl implements TableEditor {
+class TableEditorImpl implements TableEditor {
 
     private TableId id;
     private LinkedHashMap<String, Column> sortedColumns = new LinkedHashMap<>();
     private final List<String> pkColumnNames = new ArrayList<>();
     private boolean uniqueValues = false;
     private String defaultCharsetName;
+    private String comment;
+    private LinkedHashMap<String, Attribute> attributes = new LinkedHashMap<>();
 
     protected TableEditorImpl() {
     }
@@ -83,7 +85,6 @@ final class TableEditorImpl implements TableEditor {
     public TableEditor setColumns(Column... columns) {
         sortedColumns.clear();
         addColumns(columns);
-        updatePrimaryKeys();
         assert positionsAreValid();
         return this;
     }
@@ -92,47 +93,31 @@ final class TableEditorImpl implements TableEditor {
     public TableEditor setColumns(Iterable<Column> columns) {
         sortedColumns.clear();
         addColumns(columns);
-        updatePrimaryKeys();
         assert positionsAreValid();
         return this;
     }
 
     protected void updatePrimaryKeys() {
-        // table does not have any primary key, no need to update
-        if (uniqueValues) {
-            return;
-        }
-        Iterator<String> nameIter = this.pkColumnNames.iterator();
-        while (nameIter.hasNext()) {
-            String pkColumnName = nameIter.next();
-            if (!hasColumnWithName(pkColumnName)) {
-                nameIter.remove();
-            }
+        if (!uniqueValues) {
+            // table does have any primary key --> we need to remove it
+            this.pkColumnNames.removeIf(pkColumnName -> {
+                final boolean pkColumnDoesNotExists = !hasColumnWithName(pkColumnName);
+                if (pkColumnDoesNotExists) {
+                    throw new IllegalArgumentException(
+                            "The column \"" + pkColumnName + "\" is referenced as PRIMARY KEY, but a matching column is not defined in table \"" + tableId() + "\"!");
+                }
+                return pkColumnDoesNotExists;
+            });
         }
     }
 
     @Override
     public TableEditor setPrimaryKeyNames(String... pkColumnNames) {
-        for (String pkColumnName : pkColumnNames) {
-            if (!hasColumnWithName(pkColumnName)) {
-                throw new IllegalArgumentException("The primary key cannot reference a non-existant column'" + pkColumnName + "'");
-            }
-        }
-        uniqueValues = false;
-        this.pkColumnNames.clear();
-        for (String pkColumnName : pkColumnNames) {
-            this.pkColumnNames.add(pkColumnName);
-        }
-        return this;
+        return setPrimaryKeyNames(Arrays.asList(pkColumnNames));
     }
 
     @Override
     public TableEditor setPrimaryKeyNames(List<String> pkColumnNames) {
-        for (String pkColumnName : pkColumnNames) {
-            if (!hasColumnWithName(pkColumnName)) {
-                throw new IllegalArgumentException("The primary key cannot reference a non-existant column'" + pkColumnName + "' in table '" + tableId() + "'");
-            }
-        }
         this.pkColumnNames.clear();
         this.pkColumnNames.addAll(pkColumnNames);
         uniqueValues = false;
@@ -158,8 +143,19 @@ final class TableEditorImpl implements TableEditor {
     }
 
     @Override
+    public TableEditor setComment(String comment) {
+        this.comment = comment;
+        return this;
+    }
+
+    @Override
     public boolean hasDefaultCharsetName() {
         return this.defaultCharsetName != null && !this.defaultCharsetName.trim().isEmpty();
+    }
+
+    @Override
+    public boolean hasComment() {
+        return this.comment != null && !this.comment.trim().isEmpty();
     }
 
     @Override
@@ -167,6 +163,7 @@ final class TableEditorImpl implements TableEditor {
         Column existing = sortedColumns.remove(columnName.toLowerCase());
         if (existing != null) {
             updatePositions();
+            columnName = existing.name();
         }
         assert positionsAreValid();
         pkColumnNames.remove(columnName);
@@ -188,12 +185,6 @@ final class TableEditorImpl implements TableEditor {
             throw new IllegalArgumentException("No column with name '" + columnName + "'");
         }
         Column afterColumn = afterColumnName == null ? null : columnWithName(afterColumnName);
-        if (afterColumn != null && (afterColumn.position() + 1) == columnToMove.position()) {
-            // nothing to do ...
-        }
-        else if (afterColumn == null && columnToMove.position() == 1) {
-            // nothing to do ...
-        }
         if (afterColumn != null && afterColumn.position() == sortedColumns.size()) {
             // Just append ...
             sortedColumns.remove(columnName);
@@ -233,11 +224,50 @@ final class TableEditorImpl implements TableEditor {
             newPkNames.replaceAll(name -> existing.name().equals(name) ? newName : name);
         }
         // Add the new column, move it before the existing column, and remove the old column ...
-        addColumn(newColumn);
-        reorderColumn(newColumn.name(), existing.name());
-        removeColumn(existing.name());
+        if (!existingName.equalsIgnoreCase(newName)) {
+            addColumn(newColumn);
+            reorderColumn(newColumn.name(), existing.name());
+            removeColumn(existing.name());
+        }
+        else {
+            sortedColumns.replace(existingName.toLowerCase(), existing, newColumn);
+        }
         if (newPkNames != null) {
             setPrimaryKeyNames(newPkNames);
+        }
+        return this;
+    }
+
+    @Override
+    public List<Attribute> attributes() {
+        return Collections.unmodifiableList(new ArrayList<>(attributes.values()));
+    }
+
+    @Override
+    public Attribute attributeWithName(String attributeName) {
+        return attributes.get(attributeName.toLowerCase());
+    }
+
+    @Override
+    public TableEditor addAttribute(Attribute attribute) {
+        if (attribute != null) {
+            attributes.put(attribute.name().toLowerCase(), attribute);
+        }
+        return this;
+    }
+
+    @Override
+    public TableEditor addAttributes(List<Attribute> attributes) {
+        for (Attribute attribute : attributes) {
+            addAttribute(attribute);
+        }
+        return this;
+    }
+
+    @Override
+    public TableEditor removeAttribute(String attributeName) {
+        if (attributeName != null) {
+            attributes.remove(attributeName.toLowerCase());
         }
         return this;
     }
@@ -256,7 +286,7 @@ final class TableEditorImpl implements TableEditor {
 
     protected boolean positionsAreValid() {
         AtomicInteger position = new AtomicInteger(1);
-        return sortedColumns.values().stream().allMatch(defn -> defn.position() == position.getAndIncrement());
+        return sortedColumns.values().stream().allMatch(defn -> defn.position() >= position.getAndSet(defn.position() + 1));
     }
 
     @Override
@@ -274,6 +304,8 @@ final class TableEditorImpl implements TableEditor {
             column = column.edit().charsetNameOfTable(defaultCharsetName).create();
             columns.add(column);
         });
-        return new TableImpl(id, columns, primaryKeyColumnNames(), defaultCharsetName);
+        updatePrimaryKeys();
+        List<Attribute> attributes = new ArrayList<>(this.attributes.values());
+        return new TableImpl(id, columns, primaryKeyColumnNames(), defaultCharsetName, comment, attributes);
     }
 }

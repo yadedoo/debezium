@@ -7,9 +7,14 @@ package io.debezium.connector.mongodb;
 
 import java.util.Collections;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.CdcSourceTaskContext;
-import io.debezium.schema.TopicSelector;
+import io.debezium.connector.mongodb.MongoDbConnectorConfig.CaptureMode;
+import io.debezium.connector.mongodb.connection.MongoDbConnection;
+import io.debezium.connector.mongodb.connection.MongoDbConnections;
+import io.debezium.pipeline.EventDispatcher;
+import io.debezium.spi.topic.TopicNamingStrategy;
 
 /**
  * @author Randall Hauch
@@ -17,48 +22,62 @@ import io.debezium.schema.TopicSelector;
 public class MongoDbTaskContext extends CdcSourceTaskContext {
 
     private final Filters filters;
-    private final SourceInfo source;
-    private final TopicSelector<CollectionId> topicSelector;
+    private final TopicNamingStrategy topicNamingStrategy;
     private final String serverName;
-    private final ConnectionContext connectionContext;
     private final MongoDbConnectorConfig connectorConfig;
+    private final Configuration config;
 
     /**
      * @param config the configuration
      */
     public MongoDbTaskContext(Configuration config) {
-        super(Module.contextName(), config.getString(MongoDbConnectorConfig.LOGICAL_NAME), Collections::emptySet);
+        super(new MongoDbConnectorConfig(config),
+                config.getString(MongoDbConnectorConfig.TASK_ID),
+                new MongoDbConnectorConfig(config).getCustomMetricTags(),
+                Collections::emptySet);
 
-        final String serverName = config.getString(MongoDbConnectorConfig.LOGICAL_NAME);
         this.filters = new Filters(config);
+        this.config = config;
         this.connectorConfig = new MongoDbConnectorConfig(config);
-        this.source = new SourceInfo(connectorConfig);
-        this.topicSelector = MongoDbTopicSelector.defaultSelector(serverName, connectorConfig.getHeartbeatTopicsPrefix());
-        this.serverName = config.getString(MongoDbConnectorConfig.LOGICAL_NAME);
-        this.connectionContext = new ConnectionContext(config);
+        this.topicNamingStrategy = connectorConfig.getTopicNamingStrategy(MongoDbConnectorConfig.TOPIC_NAMING_STRATEGY);
+        this.serverName = config.getString(CommonConnectorConfig.TOPIC_PREFIX);
     }
 
-    public TopicSelector<CollectionId> topicSelector() {
-        return topicSelector;
+    public TopicNamingStrategy<CollectionId> getTopicNamingStrategy() {
+        return topicNamingStrategy;
     }
 
-    public Filters filters() {
+    public Filters getFilters() {
         return filters;
     }
 
-    public SourceInfo source() {
-        return source;
-    }
-
-    public String serverName() {
+    public String getServerName() {
         return serverName;
-    }
-
-    public ConnectionContext getConnectionContext() {
-        return connectionContext;
     }
 
     public MongoDbConnectorConfig getConnectorConfig() {
         return this.connectorConfig;
+    }
+
+    /**
+     * Provides the capture mode used by connector runtime. This value can differ from requested
+     * configured value as the offsets stored might be created by a different capture mode.
+     * In this case the configured value is overridden and the mode previously used is restored.
+     *
+     * @return effectively used capture mode
+     */
+    public CaptureMode getCaptureMode() {
+        return connectorConfig.getCaptureMode();
+    }
+
+    /**
+     * Obtains instances of {@link MongoDbConnection} which should be used in event sources
+     *
+     * @param dispatcher event dispatcher
+     * @param partition MongoDB partition
+     * @return instance of {@link MongoDbConnection}
+     */
+    public MongoDbConnection getConnection(EventDispatcher<MongoDbPartition, CollectionId> dispatcher, MongoDbPartition partition) {
+        return MongoDbConnections.create(config, dispatcher, partition);
     }
 }

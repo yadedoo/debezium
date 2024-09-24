@@ -23,6 +23,7 @@ public class ServerInfo {
     private String username;
     private String database;
     private Map<String, String> permissionsByRoleName;
+    private Integer majorVersion;
 
     protected ServerInfo() {
         this.permissionsByRoleName = new HashMap<>();
@@ -45,6 +46,11 @@ public class ServerInfo {
 
     protected ServerInfo addRole(String roleName, String permissions) {
         permissionsByRoleName.put(roleName, permissions);
+        return this;
+    }
+
+    public ServerInfo withMajorVersion(Integer majorVersion) {
+        this.majorVersion = majorVersion;
         return this;
     }
 
@@ -84,6 +90,15 @@ public class ServerInfo {
         return permissionsByRoleName;
     }
 
+    /**
+     * Returns the version num of a database for which a connection was established
+     *
+     * @return an Integer, possibly null if info was not available
+     */
+    public Integer version() {
+        return majorVersion;
+    }
+
     @Override
     public String toString() {
         String lineSeparator = System.lineSeparator();
@@ -93,48 +108,6 @@ public class ServerInfo {
                 .collect(Collectors.joining(lineSeparator));
 
         return "user '" + username + "' connected to database '" + database + "' on " + server + " with roles:" + lineSeparator + roles;
-    }
-
-    /**
-     * Table REPLICA IDENTITY information.
-     */
-    public enum ReplicaIdentity {
-        NOTHING("UPDATE and DELETE events will not contain any old values"),
-        FULL("UPDATE AND DELETE events will contain the previous values of all the columns"),
-        DEFAULT("UPDATE and DELETE events will contain previous values only for PK columns"),
-        INDEX("UPDATE and DELETE events will contain previous values only for columns present in the REPLICA IDENTITY index"),
-        UNKNOWN("Unknown REPLICA IDENTITY");
-
-        private String description;
-
-        /**
-         * Returns a textual description of the replica identity
-         *
-         * @return a description, never null
-         */
-        public String description() {
-            return this.description;
-        }
-
-        ReplicaIdentity(String description) {
-            this.description = description;
-        }
-
-        protected static ReplicaIdentity parseFromDB(String s) {
-            switch (s) {
-                case "n":
-                    return NOTHING;
-                case "d":
-                    return DEFAULT;
-                case "i":
-                    return INDEX;
-                case "f":
-                    return FULL;
-                default:
-                    return UNKNOWN;
-            }
-        }
-
     }
 
     /**

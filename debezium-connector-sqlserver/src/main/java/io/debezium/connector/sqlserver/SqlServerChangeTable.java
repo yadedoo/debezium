@@ -5,8 +5,11 @@
  */
 package io.debezium.connector.sqlserver;
 
+import java.util.Collections;
+import java.util.List;
+
+import io.debezium.annotation.Immutable;
 import io.debezium.relational.ChangeTable;
-import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 
 /**
@@ -29,21 +32,23 @@ public class SqlServerChangeTable extends ChangeTable {
     /**
      * A LSN to which the data in the change table are relevant
      */
-    private Lsn stopLsn;
+    private Lsn stopLsn = Lsn.NULL;
 
     /**
-     * The table from which the changes are captured
+     * List of columns captured by the CDC table.
      */
-    private Table sourceTable;
+    @Immutable
+    private final List<String> capturedColumns;
 
-    public SqlServerChangeTable(TableId sourceTableId, String captureInstance, int changeTableObjectId, Lsn startLsn, Lsn stopLsn) {
+    public SqlServerChangeTable(TableId sourceTableId, String captureInstance, int changeTableObjectId, Lsn startLsn,
+                                List<String> capturedColumns) {
         super(captureInstance, sourceTableId, resolveChangeTableId(sourceTableId, captureInstance), changeTableObjectId);
         this.startLsn = startLsn;
-        this.stopLsn = stopLsn;
+        this.capturedColumns = capturedColumns != null ? Collections.unmodifiableList(capturedColumns) : Collections.emptyList();
     }
 
-    public SqlServerChangeTable(String captureInstance, int changeTableObjectId, Lsn startLsn, Lsn stopLsn) {
-        this(null, captureInstance, changeTableObjectId, startLsn, stopLsn);
+    public SqlServerChangeTable(String captureInstance, int changeTableObjectId, Lsn startLsn) {
+        this(null, captureInstance, changeTableObjectId, startLsn, null);
     }
 
     public Lsn getStartLsn() {
@@ -58,12 +63,8 @@ public class SqlServerChangeTable extends ChangeTable {
         this.stopLsn = stopLsn;
     }
 
-    public Table getSourceTable() {
-        return sourceTable;
-    }
-
-    public void setSourceTable(Table sourceTable) {
-        this.sourceTable = sourceTable;
+    public List<String> getCapturedColumns() {
+        return capturedColumns;
     }
 
     @Override
