@@ -1519,6 +1519,7 @@ out_of_line_constraint
           )
        )
       constraint_state?
+      parallel_clause?
     ;
 
 constraint_state
@@ -1979,13 +1980,22 @@ relational_table
           physical_properties?
           column_properties?
           table_partitioning_clauses?
-          segment_attributes_clause? // LogMiner-specific
+          logminer_relational_table_attributes? // LogMiner-specific
           (CACHE | NOCACHE)? (RESULT_CACHE '(' MODE (DEFAULT | FORCE) ')')?
           parallel_clause?
           monitoring_nomonitoring?
           (ROWDEPENDENCIES | NOROWDEPENDENCIES)?
           (enable_disable_clause+)? row_movement_clause? logical_replication_clause? flashback_archive_clause? annotations_clause?
         ;
+
+logminer_relational_table_attributes
+    : logminer_relational_table_attribute logminer_relational_table_attribute*
+    ;
+
+logminer_relational_table_attribute
+    : segment_attributes_clause
+    | parallel_clause
+    ;
 
 relational_property
     : ( out_of_line_constraint
@@ -2168,6 +2178,7 @@ partitioning_storage_clause
       | OVERFLOW (TABLESPACE tablespace)?
       | table_compression
       | key_compression
+      | inmemory_table_clause
       | lob_partitioning_storage
       | VARRAY varray_item STORE AS (BASICFILE | SECUREFILE)? LOB lob_segname
       )+
@@ -2321,6 +2332,7 @@ et_oracle_datapump
       // Undocumented, internal DATAPUMP operations used by Oracle
       | DEBUG '=' '(' UNSIGNED_INTEGER ',' UNSIGNED_INTEGER ')'
       | DATAPUMP INTERNAL TABLE tableview_name
+      | TEMPLATE_TABLE tableview_name
       | JOB '(' schema_name ',' tableview_name ',' UNSIGNED_INTEGER ')'
       | WORKERID UNSIGNED_INTEGER
       | PARALLEL UNSIGNED_INTEGER
@@ -3279,7 +3291,7 @@ modify_column_clauses
     ;
 
 modify_col_properties
-    : column_name datatype? (DEFAULT column_default_value)? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause? //TODO alter_xmlschema_clause
+    : column_name datatype? (DEFAULT (ON NULL_)? column_default_value)? (ENCRYPT encryption_spec | DECRYPT)? inline_constraint* lob_storage_clause? annotations_clause? //TODO alter_xmlschema_clause
     ;
 
 modify_col_visibility
@@ -3445,6 +3457,9 @@ virtual_column_definition
         (GENERATED ALWAYS)?
         AS '(' expression ')'
         VIRTUAL? evaluation_edition_clause? unusable_editions_clause? inline_constraint*
+        // Oracle tools and DBMS_METADATA can return this in some use cases
+        // This is used internally by Oracle to mark the virtual column for statistics only
+        (BY USER FOR STATISTICS)?
     ;
 
 annotations_clause
@@ -3524,7 +3539,7 @@ object_type_col_properties
     ;
 
 constraint_clauses
-    : ADD '(' (out_of_line_constraint* | out_of_line_ref_constraint) ')'
+    : ADD '(' (out_of_line_constraint (',' out_of_line_constraint)* | out_of_line_ref_constraint) ')'
     | ADD  (out_of_line_constraint* | out_of_line_ref_constraint)
     | MODIFY (CONSTRAINT constraint_name | PRIMARY KEY | UNIQUE '(' column_name (',' column_name)* ')')  constraint_state CASCADE?
     | RENAME CONSTRAINT old_constraint_name TO new_constraint_name
@@ -6741,6 +6756,7 @@ non_reserved_keywords_pre12c
     | POWERMULTISET_BY_CARDINALITY
     | POWERMULTISET
     | POWER
+    | POSITION
     | PQ_DISTRIBUTE
     | PQ_MAP
     | PQ_NOMAP
@@ -7305,6 +7321,7 @@ non_reserved_keywords_pre12c
     | TBLORIDXPARTNUM
     | TEMPFILE
     | TEMPLATE
+    | TEMPLATE_TABLE
     | TEMPORARY
     | TEMP_TABLE
     | TEST

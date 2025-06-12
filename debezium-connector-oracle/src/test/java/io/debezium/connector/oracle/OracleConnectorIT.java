@@ -21,6 +21,7 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
@@ -67,6 +68,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.SnapshotType;
 import io.debezium.connector.oracle.OracleConnectorConfig.ConnectorAdapter;
 import io.debezium.connector.oracle.OracleConnectorConfig.LogMiningStrategy;
 import io.debezium.connector.oracle.OracleConnectorConfig.SnapshotMode;
@@ -78,10 +80,9 @@ import io.debezium.connector.oracle.junit.SkipTestDependingOnStrategyRule;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIs;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIsNot;
 import io.debezium.connector.oracle.junit.SkipWhenLogMiningStrategyIs;
-import io.debezium.connector.oracle.logminer.LogMinerAdapter;
-import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSource;
-import io.debezium.connector.oracle.logminer.processor.AbstractLogMinerEventProcessor;
-import io.debezium.connector.oracle.logminer.processor.memory.MemoryLogMinerEventProcessor;
+import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingAdapter;
+import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
+import io.debezium.connector.oracle.logminer.buffered.BufferedLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.converters.CloudEventsConverterTest;
 import io.debezium.converters.spi.CloudEventsMaker;
@@ -91,8 +92,8 @@ import io.debezium.data.SchemaAndValueField;
 import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.embedded.EmbeddedEngineConfig;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.heartbeat.DatabaseHeartbeatImpl;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConnection;
@@ -101,6 +102,7 @@ import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalSnapshotChangeEventSource;
 import io.debezium.relational.history.MemorySchemaHistory;
 import io.debezium.storage.file.history.FileSchemaHistory;
+import io.debezium.util.Strings;
 import io.debezium.util.Testing;
 
 import ch.qos.logback.classic.Level;
@@ -110,7 +112,7 @@ import ch.qos.logback.classic.Level;
  *
  * @author Gunnar Morling
  */
-public class OracleConnectorIT extends AbstractConnectorTest {
+public class OracleConnectorIT extends AbstractAsyncEngineConnectorTest {
     private static final Logger LOGGER = LoggerFactory.getLogger(OracleConnectorIT.class);
 
     private static final long MICROS_PER_SECOND = TimeUnit.SECONDS.toMicros(1);
@@ -260,7 +262,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
             assertThat(after1.get("ID")).isEqualTo(1);
             assertThat(after1.get("C1")).isEqualTo(BigDecimal.valueOf(25L));
             assertThat(after1.get("C2")).isEqualTo("Test");
-            assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+            assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
             assertThat(record1.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(true);
 
             // insert
@@ -304,7 +306,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         assertThat(after.get("SCORE")).isEqualTo(BigDecimal.valueOf(1234.56));
         assertThat(after.get("REGISTERED")).isEqualTo(toMicroSecondsSinceEpoch(LocalDateTime.of(2018, 2, 22, 0, 0, 0)));
 
-        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record1.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(false);
 
         Struct source = (Struct) ((Struct) record1.value()).get("source");
@@ -318,7 +320,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         assertThat(after.get("SCORE")).isEqualTo(BigDecimal.valueOf(2345.67));
         assertThat(after.get("REGISTERED")).isNull();
 
-        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record2.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(true);
 
         source = (Struct) ((Struct) record2.value()).get("source");
@@ -382,7 +384,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         assertThat(source.get(SourceInfo.TXID_KEY)).isNull();
         assertThat(source.get(SourceInfo.TIMESTAMP_KEY)).isNotNull();
 
-        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record1.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(false);
 
         SourceRecord record2 = testTableRecords.get(1);
@@ -390,7 +392,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         after = (Struct) ((Struct) record2.value()).get("after");
         assertThat(after.get("ID")).isEqualTo(2);
 
-        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record2.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(true);
 
         source = (Struct) ((Struct) record2.value()).get("source");
@@ -457,7 +459,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         assertThat(source.get(SourceInfo.TXID_KEY)).isNull();
         assertThat(source.get(SourceInfo.TIMESTAMP_KEY)).isNotNull();
 
-        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record1.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record1.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(false);
 
         SourceRecord record2 = testTableRecords.get(1);
@@ -465,7 +467,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         after = (Struct) ((Struct) record2.value()).get("after");
         assertThat(after.get("ID")).isEqualTo(2);
 
-        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(true);
+        assertThat(record2.sourceOffset().get(SourceInfo.SNAPSHOT_KEY)).isEqualTo(SnapshotType.INITIAL.toString());
         assertThat(record2.sourceOffset().get(SNAPSHOT_COMPLETED_KEY)).isEqualTo(true);
 
         expectedRecordCount = 30;
@@ -1362,11 +1364,6 @@ public class OracleConnectorIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-2624")
     public void shouldSnapshotAndStreamChangesFromTableWithNumericDefaultValues() throws Exception {
-        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
-        if (VerifyRecord.isApucurioAvailable()) {
-            skipAvroValidation();
-        }
-
         // Drop table if it exists
         TestHelper.dropTable(connection, "debezium.complex_ddl");
 
@@ -1524,7 +1521,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-2825")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Tests archive log support for LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Tests archive log support for LogMiner only")
     public void testArchiveLogScnBoundariesAreIncluded() throws Exception {
         // Drop table if it exists
         TestHelper.dropTable(connection, "alog_test");
@@ -2504,7 +2501,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-3616")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldNotLogWarningsAboutCommittedTransactionsWhileStreamingNormally() throws Exception {
         TestHelper.dropTables(connection, "dbz3616", "dbz3616");
         try {
@@ -2633,7 +2630,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-3898")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Tests specific LogMiner features")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Tests specific LogMiner features")
     @SkipOnDatabaseOption(value = "Real Application Clusters", enabled = true, reason = "Performance w/CATALOG_IN_REDO on Oracle RAC")
     public void shouldIgnoreAllTablesInExcludedSchemas() throws Exception {
         try {
@@ -2672,7 +2669,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor({ "DBZ-3712", "DBZ-4879" })
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Tests archive log support for LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Tests archive log support for LogMiner only")
     public void shouldStartWithArchiveLogOnlyModeAndStreamWhenRecordsBecomeAvailable() throws Exception {
         TestHelper.dropTable(connection, "dbz3712");
         try {
@@ -2719,7 +2716,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-3712")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Tests archive log support for LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Tests archive log support for LogMiner only")
     public void shouldPermitChangingToArchiveLogOnlyModeOnExistingConnector() throws Exception {
         TestHelper.dropTable(connection, "dbz3712");
         try {
@@ -2807,47 +2804,6 @@ public class OracleConnectorIT extends AbstractConnectorTest {
             // expected if Oracle doesn't trigger its own log switch
             TestHelper.forceLogfileSwitch();
         }
-    }
-
-    @Test
-    @FixFor("DBZ-3978")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Specific to only LogMiner")
-    public void shouldFilterUser() throws Exception {
-        try {
-            TestHelper.dropTable(connection, "dbz3978");
-
-            connection.execute("CREATE TABLE dbz3978 (id number(9,0), data varchar2(50), primary key (id))");
-            TestHelper.streamTable(connection, "dbz3978");
-
-            Configuration config = TestHelper.defaultConfig()
-                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ3978")
-                    .with(OracleConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
-                    .with(OracleConnectorConfig.LOG_MINING_USERNAME_EXCLUDE_LIST, "DEBEZIUM")
-                    // This test expects the filtering to occur in the connector, not the query
-                    .with(OracleConnectorConfig.LOG_MINING_QUERY_FILTER_MODE, "none")
-                    .build();
-
-            start(OracleConnector.class, config);
-            assertConnectorIsRunning();
-
-            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
-
-            connection.executeWithoutCommitting("INSERT INTO debezium.dbz3978 VALUES (1, 'Test1')");
-            connection.executeWithoutCommitting("INSERT INTO debezium.dbz3978 VALUES (2, 'Test2')");
-            connection.execute("COMMIT");
-
-            // all messages are filtered out
-            assertThat(waitForAvailableRecords(10, TimeUnit.SECONDS)).isFalse();
-
-            // There should be at least 2 DML events captured but ignored
-            Long totalDmlCount = getStreamingMetric("TotalCapturedDmlCount");
-            assertThat(totalDmlCount).isGreaterThanOrEqualTo(2L);
-
-        }
-        finally {
-            TestHelper.dropTable(connection, "dbz3978");
-        }
-
     }
 
     @Test
@@ -3056,7 +3012,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4161")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies to LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies to LogMiner only")
     public void shouldWarnAboutTableNameLengthExceeded() throws Exception {
         try {
             TestHelper.dropTable(connection, "dbz4161_with_a_name_that_is_greater_than_30");
@@ -3070,7 +3026,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ4161_WITH_A_NAME_THAT_IS_GREATER_THAN_30")
                     .build();
 
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
+            LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
 
@@ -3099,7 +3055,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4161")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies to LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies to LogMiner only")
     public void shouldWarnAboutColumnNameLengthExceeded() throws Exception {
         try {
             TestHelper.dropTable(connection, "dbz4161");
@@ -3113,7 +3069,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ4161")
                     .build();
 
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
+            LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
 
@@ -3257,6 +3213,32 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         assertThat(((Struct) records.get(0).value()).getStruct(AFTER).get("ID")).isEqualTo(1);
     }
 
+    @Test
+    @FixFor("DBZ-8710")
+    public void shouldTreatQuotedPdbOrDatabaseNameAsCaseSensitive() throws Exception {
+        final Configuration config;
+        if (TestHelper.isUsingPdb()) {
+            config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.PDB_NAME, "\"" + TestHelper.getDatabaseName() + "\"")
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.CUSTOMER")
+                    .build();
+        }
+        else {
+            config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.DATABASE_NAME, "\"" + TestHelper.getDatabaseName() + "\"")
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.CUSTOMER")
+                    .build();
+        }
+
+        connection.execute("INSERT INTO debezium.customer (id,name) values (1, 'Bugs Bunny')");
+        start(OracleConnector.class, config);
+
+        waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+        List<SourceRecord> records = consumeRecordsByTopic(1).recordsForTopic("server1.DEBEZIUM.CUSTOMER");
+        assertThat(((Struct) records.get(0).value()).getStruct(AFTER).get("ID")).isEqualTo(1);
+    }
+
     @FixFor("DBZ-3986")
     private void consumeRecords(Configuration config) throws SQLException, InterruptedException {
         // Poll for records ...
@@ -3361,7 +3343,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4367")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "User-defined types not supported")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "User-defined types not supported")
     public void shouldCaptureChangesForTransactionsAcrossSnapshotBoundaryWithoutReemittingDDLChanges() throws Exception {
         OracleConnection secondConnection = TestHelper.testConnection();
         TestHelper.dropTable(connection, "DBZ4367");
@@ -3450,11 +3432,11 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5085")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to LogMiner")
     public void shouldSnapshotAndStreamAllRecordsThatSpanAcrossSnapshotStreamingBoundarySmallTrxs() throws Exception {
         TestHelper.dropTable(connection, "dbz5085");
         try {
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerAdapter.class);
+            LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingAdapter.class);
 
             setConsumeTimeout(10, TimeUnit.SECONDS);
 
@@ -3525,11 +3507,11 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5085")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to LogMiner")
     public void shouldSnapshotAndStreamAllRecordsThatSpanAcrossSnapshotStreamingBoundaryLargeTrxs() throws Exception {
         TestHelper.dropTable(connection, "dbz5085");
         try {
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerAdapter.class);
+            LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingAdapter.class);
 
             setConsumeTimeout(10, TimeUnit.SECONDS);
 
@@ -3600,7 +3582,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4842")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to LogMiner")
     @SkipWhenLogMiningStrategyIs(value = SkipWhenLogMiningStrategyIs.Strategy.HYBRID, reason = "Hybrid strategy now detects and handles this use case")
     public void shouldRestartAfterCapturedTableIsDroppedWhileConnectorDown() throws Exception {
         TestHelper.dropTable(connection, "dbz4842");
@@ -3646,7 +3628,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4852")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "User-defined types not supported")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "User-defined types not supported")
     public void shouldCaptureChangeForTableWithUnsupportedColumnType() throws Exception {
         TestHelper.dropTable(connection, "dbz4852");
         try {
@@ -3757,7 +3739,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4907")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only LogMiner performs flushes")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER_BUFFERED)
     public void shouldContinueToUpdateOffsetsEvenWhenTableIsNotChanged() throws Exception {
         TestHelper.dropTable(connection, "dbz4907");
         try {
@@ -3875,7 +3857,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DbZ-3318")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldSuccessfullyConnectAndStreamWithDatabaseUrl() throws Exception {
         connection.execute("INSERT INTO customer (id,name,score) values (1001, 'DBZ3668', 100)");
 
@@ -3949,7 +3931,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-4963")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldRestartLogMiningSessionAfterMaxSessionElapses() throws Exception {
         TestHelper.dropTable(connection, "dbz4963");
         try {
@@ -3961,7 +3943,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.LOG_MINING_SESSION_MAX_MS, 10_000L)
                     .build();
 
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
+            LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
 
@@ -3993,7 +3975,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ4963")
                     .build();
 
-            LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
+            LogInterceptor logInterceptor = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
 
@@ -4078,7 +4060,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5147")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
     @SkipWhenLogMiningStrategyIs(value = SkipWhenLogMiningStrategyIs.Strategy.HYBRID, reason = "Test overrides strategy as requires online_catalog")
     public void shouldStopWhenErrorProcessingFailureHandlingModeIsDefault() throws Exception {
         TestHelper.dropTable(connection, "dbz5147");
@@ -4113,7 +4095,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
             connection.execute("ALTER TABLE dbz5147 drop column data2");
             connection.execute("INSERT INTO dbz5147 values (3, 'test3')");
 
-            final LogInterceptor interceptor = new LogInterceptor(AbstractLogMinerEventProcessor.class);
+            final LogInterceptor interceptor = TestHelper.getAbstractEventProcessorLogInterceptor();
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -4133,7 +4115,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5147")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
     @SkipWhenLogMiningStrategyIs(value = SkipWhenLogMiningStrategyIs.Strategy.HYBRID, reason = "Test overrides strategy as requires online_catalog")
     public void shouldLogWarningAndSkipWhenErrorProcessingFailureHandlingModeIsWarn() throws Exception {
         TestHelper.dropTable(connection, "dbz5147");
@@ -4169,7 +4151,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
             connection.execute("ALTER TABLE dbz5147 drop column data2");
             connection.execute("INSERT INTO dbz5147 values (3, 'test3')");
 
-            final LogInterceptor interceptor = new LogInterceptor(AbstractLogMinerEventProcessor.class);
+            final LogInterceptor interceptor = TestHelper.getAbstractEventProcessorLogInterceptor();
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -4195,7 +4177,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5147")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Only applies to Oracle LogMiner implementation")
     @SkipWhenLogMiningStrategyIs(value = SkipWhenLogMiningStrategyIs.Strategy.HYBRID, reason = "Test overrides strategy as requires online_catalog")
     public void shouldSilentlySkipWhenErrorProcessingFailureHandlingModeIsSkip() throws Exception {
         TestHelper.dropTable(connection, "dbz5147");
@@ -4231,7 +4213,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
             connection.execute("ALTER TABLE dbz5147 drop column data2");
             connection.execute("INSERT INTO dbz5147 values (3, 'test3')");
 
-            final LogInterceptor interceptor = new LogInterceptor(AbstractLogMinerEventProcessor.class);
+            final LogInterceptor interceptor = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -4255,8 +4237,8 @@ public class OracleConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
-    @FixFor("DBZ-5139")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @FixFor({ "DBZ-5139", "DBZ-8880" })
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER_BUFFERED)
     public void shouldDiscardTransactionThatExceedsEventThreshold() throws Exception {
         TestHelper.dropTable(connection, "dbz5139");
         try {
@@ -4303,7 +4285,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5139")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldNotDiscardTransactionWhenNoEventThresholdSet() throws Exception {
         TestHelper.dropTable(connection, "dbz5139");
         try {
@@ -4459,15 +4441,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
             int waitTime = TestHelper.defaultMessageConsumerPollTimeout() * 2;
 
-            final LogInterceptor streamInterceptor;
-            switch (TestHelper.getAdapter(config)) {
-                case XSTREAM:
-                    streamInterceptor = new LogInterceptor("io.debezium.connector.oracle.xstream.LcrEventHandler");
-                    waitTime *= 2; // XStream on CI can be quite slow, double the wait time to avoid failure
-                    break;
-                default:
-                    streamInterceptor = new LogInterceptor(AbstractLogMinerEventProcessor.class);
-            }
+            final LogInterceptor streamInterceptor = TestHelper.getAbstractEventProcessorLogInterceptor();
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -4483,7 +4457,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
             Awaitility.await()
                     .atMost(waitTime, TimeUnit.SECONDS)
-                    .until(() -> streamInterceptor.containsMessage("is not a relational table and will be skipped"));
+                    .until(() -> streamInterceptor.containsMessage("not a relational table. The event will be skipped."));
 
             assertNoRecordsToConsume();
             stopConnector();
@@ -4641,7 +4615,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5907")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "LogMiner only")
     public void shouldUndoOnlyLastEventWithSavepoint() throws Exception {
         TestHelper.dropTable(connection, "dbz5907");
         try {
@@ -4700,7 +4674,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5907")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "LogMiner only")
     public void shouldCorrectlyUndoWithMultipleSavepoints() throws Exception {
         TestHelper.dropTable(connection, "dbz5907");
         try {
@@ -4712,13 +4686,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ5907")
                     .build();
 
-            final LogInterceptor interceptor;
-            if (config.getString(OracleConnectorConfig.LOG_MINING_BUFFER_TYPE).equals("memory")) {
-                interceptor = new LogInterceptor(MemoryLogMinerEventProcessor.class.getName());
-            }
-            else {
-                interceptor = new LogInterceptor(AbstractLogMinerEventProcessor.class.getName());
-            }
+            final LogInterceptor interceptor = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -4759,8 +4727,12 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
             stopConnector();
 
-            assertThat(interceptor.containsMessage("Cannot undo change on table"))
+            assertThat(interceptor.containsMessage("Cannot apply undo change"))
                     .as("Unable to correctly undo operation within transaction")
+                    .isFalse();
+
+            assertThat(interceptor.containsMessage("Failed to apply undo change"))
+                    .as("Unable to apply undo operation")
                     .isFalse();
         }
         finally {
@@ -5140,7 +5112,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-5395")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies to LogMiner only")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies to LogMiner only")
     @SkipWhenLogMiningStrategyIs(value = SkipWhenLogMiningStrategyIs.Strategy.HYBRID, reason = "Cannot use lob.enabled with Hybrid")
     public void testShouldAdvanceStartScnWhenNoActiveTransactionsBetweenIterationsWhenLobEnabled() throws Exception {
         TestHelper.dropTable(connection, "dbz5395");
@@ -5179,10 +5151,12 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-6355")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "User-defined types not supported")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER_BUFFERED, reason = "User-defined types not supported")
     public void testBacklogTransactionShouldNotBeAbandon() throws Exception {
         TestHelper.dropTable(connection, "dbz6355");
         try {
+            final LogInterceptor logInterceptor = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
+
             connection.execute("CREATE TABLE dbz6355 (id numeric(9,0) primary key, name varchar2(50))");
             TestHelper.streamTable(connection, "dbz6355");
 
@@ -5229,17 +5203,21 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                 waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
 
                 // Get the number of fetching queries up to this point.
-                final Long fetchingQueryCount = getStreamingMetric("FetchingQueryCount");
+                final Long fetchingQueryCount = getStreamingMetric("FetchQueryCount");
 
                 connection.execute("INSERT INTO dbz6355 (id,name) VALUES (3, 'Donald Duck')");
 
                 // Fetch for a few mining iterations to guarantee that the abandonment process has fired
                 Awaitility.waitAtMost(Duration.ofSeconds(60)).until(() -> {
-                    return (fetchingQueryCount + 5L) <= (Long) getStreamingMetric("FetchingQueryCount");
+                    return (fetchingQueryCount + 5L) <= (Long) getStreamingMetric("FetchQueryCount");
                 });
 
                 // Commit in progress transaction
                 otherConnection.commit();
+
+                Awaitility.await()
+                        .atMost(Duration.ofSeconds(60))
+                        .until(() -> logInterceptor.containsWarnMessage(" is being abandoned."));
             }
 
             // Get only record
@@ -5284,7 +5262,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-6499")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldRestartOracleJdbcConnectionAtMaxSessionThreshold() throws Exception {
         // In order to guarantee there are no log switches during this test, this test will preemptively
         // perform a transaction log switch before initiating the test.
@@ -5297,8 +5275,8 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                 .with(OracleConnectorConfig.LOG_MINING_RESTART_CONNECTION, "true")
                 .build();
 
-        LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
-        logInterceptor.setLoggerLevel(LogMinerStreamingChangeEventSource.class, Level.DEBUG);
+        LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
+        logInterceptor.setLoggerLevel(AbstractLogMinerStreamingChangeEventSource.class, Level.DEBUG);
 
         start(OracleConnector.class, config);
         assertConnectorIsRunning();
@@ -5318,7 +5296,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-6499")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "Applies only to LogMiner")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies only to LogMiner")
     public void shouldRestartOracleJdbcConnectionUponLogSwitch() throws Exception {
         Configuration config = TestHelper.defaultConfig()
                 .with(OracleConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
@@ -5326,8 +5304,8 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                 .with(OracleConnectorConfig.LOG_MINING_RESTART_CONNECTION, "true")
                 .build();
 
-        LogInterceptor logInterceptor = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
-        logInterceptor.setLoggerLevel(LogMinerStreamingChangeEventSource.class, Level.DEBUG);
+        LogInterceptor logInterceptor = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
+        logInterceptor.setLoggerLevel(AbstractLogMinerStreamingChangeEventSource.class, Level.DEBUG);
 
         start(OracleConnector.class, config);
         assertConnectorIsRunning();
@@ -5489,7 +5467,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-6660")
-    @SkipWhenAdapterNameIsNot(SkipWhenAdapterNameIsNot.AdapterName.LOGMINER)
+    @SkipWhenAdapterNameIsNot(SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER)
     public void shouldPauseAndWaitForDeviationCalculationIfBeforeMiningRange() throws Exception {
         try {
             TestHelper.dropTable(connection, "dbz6660");
@@ -5507,11 +5485,11 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MIN, "100")
                     .build();
 
-            final LogInterceptor sourceLogging = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
-            sourceLogging.setLoggerLevel(LogMinerStreamingChangeEventSource.class, Level.DEBUG);
+            final LogInterceptor sourceLogging = new LogInterceptor(AbstractLogMinerStreamingChangeEventSource.class);
+            sourceLogging.setLoggerLevel(AbstractLogMinerStreamingChangeEventSource.class, Level.DEBUG);
 
-            final LogInterceptor processorLogging = new LogInterceptor(AbstractLogMinerEventProcessor.class);
-            processorLogging.setLoggerLevel(AbstractLogMinerEventProcessor.class, Level.DEBUG);
+            final LogInterceptor processorLogging = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
+            processorLogging.setLoggerLevel(BufferedLogMinerStreamingChangeEventSource.class, Level.DEBUG);
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -5560,6 +5538,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-6660")
     @Ignore("Test can be flaky when using a brand new docker instance")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER_BUFFERED)
     public void shouldUseEndScnIfDeviationProducesScnOutsideOfUndoRetention() throws Exception {
         try {
             TestHelper.dropTable(connection, "dbz6660");
@@ -5579,8 +5558,8 @@ public class OracleConnectorIT extends AbstractConnectorTest {
                     .with(OracleConnectorConfig.LOG_MINING_BATCH_SIZE_MIN, "100")
                     .build();
 
-            final LogInterceptor sourceLogging = new LogInterceptor(LogMinerStreamingChangeEventSource.class);
-            sourceLogging.setLoggerLevel(LogMinerStreamingChangeEventSource.class, Level.DEBUG);
+            final LogInterceptor sourceLogging = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
+            sourceLogging.setLoggerLevel(BufferedLogMinerStreamingChangeEventSource.class, Level.DEBUG);
 
             start(OracleConnector.class, config);
             assertConnectorIsRunning();
@@ -5661,7 +5640,7 @@ public class OracleConnectorIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-6975")
-    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.LOGMINER, reason = "LogMiner performs DML parsing")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "LogMiner performs DML parsing")
     public void shouldHandleEscapedSingleQuotesInCharacterFields() throws Exception {
         TestHelper.dropTable(connection, "dbz6975");
         try {
@@ -5804,6 +5783,160 @@ public class OracleConnectorIT extends AbstractConnectorTest {
         }
         finally {
             TestHelper.dropTable(connection, "\"debezium_test'\"");
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-8577")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Specific to LogMiner")
+    public void shouldRestoreConnectionStateWhenConnectionIsRestartedOnMiningRestartConnectToPdb() throws Exception {
+        TestHelper.dropTable(connection, "dbz8577");
+        try {
+            connection.execute("CREATE TABLE dbz8577 (id number(9,0) primary key, data varchar2(50))");
+            TestHelper.streamTable(connection, "dbz8577");
+
+            Configuration tempConfig = TestHelper.defaultConfig().build();
+
+            final Configuration.Builder builder = TestHelper.defaultConfig();
+            if (!Strings.isNullOrEmpty(tempConfig.getString(OracleConnectorConfig.PDB_NAME))) {
+                // For this use case, both PDB and DBNAME should refer to PDB
+                // This is an unconventional configuration, but permissible.
+                builder.with(OracleConnectorConfig.DATABASE_NAME, tempConfig.getString(OracleConnectorConfig.PDB_NAME));
+            }
+            builder.with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ8577")
+                    .with(OracleConnectorConfig.LOG_MINING_RESTART_CONNECTION, "true");
+
+            start(OracleConnector.class, builder.build());
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            // Wait for CURRENT_SCN to be seen by the connector
+            // Then force a log switch
+            // Then wait for new CURRENT_SCN to be seen by the connector
+            waitForCurrentScnToHaveBeenSeenByConnector();
+            TestHelper.forceLogfileSwitch();
+            waitForCurrentScnToHaveBeenSeenByConnector();
+
+            // Insert a row to act as a marker
+            connection.execute("INSERT INTO dbz8577 (id,data) values (1,'test')");
+
+            final SourceRecords records = consumeRecordsByTopic(1);
+            assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ8577")).hasSize(1);
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz8577");
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-8577")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Specific to LogMiner")
+    public void shouldRestoreConnectionStateWhenConnectionIsRestartedOnMiningRestart() throws Exception {
+        TestHelper.dropTable(connection, "dbz8577");
+        try {
+            connection.execute("CREATE TABLE dbz8577 (id number(9,0) primary key, data varchar2(50))");
+            TestHelper.streamTable(connection, "dbz8577");
+
+            final Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ8577")
+                    .with(OracleConnectorConfig.LOG_MINING_RESTART_CONNECTION, "true")
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            // Wait for CURRENT_SCN to be seen by the connector
+            // Then force a log switch
+            // Then wait for new CURRENT_SCN to be seen by the connector
+            waitForCurrentScnToHaveBeenSeenByConnector();
+            TestHelper.forceLogfileSwitch();
+            waitForCurrentScnToHaveBeenSeenByConnector();
+
+            // Insert a row to act as a marker
+            connection.execute("INSERT INTO dbz8577 (id,data) values (1,'test')");
+
+            final SourceRecords records = consumeRecordsByTopic(1);
+            assertThat(records.recordsForTopic("server1.DEBEZIUM.DBZ8577")).hasSize(1);
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz8577");
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-8740")
+    @SkipWhenAdapterNameIsNot(value = SkipWhenAdapterNameIsNot.AdapterName.ANY_LOGMINER, reason = "Applies to LogMiner")
+    public void shouldPopulateCommitScnAndTimestampInSourceInfoBlock() throws Exception {
+        TestHelper.dropTable(connection, "dbz8740");
+        try {
+            connection.execute("CREATE TABLE dbz8740 (id numeric(9,0) primary key, data varchar2(50))");
+            TestHelper.streamTable(connection, "dbz8740");
+
+            final Configuration config = TestHelper.defaultConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ8740")
+                    .build();
+
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            // Insert, wait 2 seconds, and insert to guarantee differing SCN values
+            connection.execute("INSERT INTO dbz8740 (id,data) values (1,'Test1')");
+            Thread.sleep(2000);
+            connection.execute("INSERT INTO dbz8740 (id,data) values (2,'Test2')");
+
+            final SourceRecords records = consumeRecordsByTopic(2);
+            final List<SourceRecord> tableRecords = records.recordsForTopic("server1.DEBEZIUM.DBZ8740");
+            assertThat(tableRecords).hasSize(2);
+
+            // Verify that the source info fields are populated
+
+            Struct after1 = ((Struct) tableRecords.get(0).value()).getStruct(FieldName.AFTER);
+            assertThat(after1.get("ID")).isEqualTo(1);
+            assertThat(after1.get("DATA")).isEqualTo("Test1");
+
+            Struct source1 = ((Struct) tableRecords.get(0).value()).getStruct(FieldName.SOURCE);
+            assertThat(source1.get(SourceInfo.COMMIT_SCN_KEY)).isNotNull();
+            assertThat(source1.get(SourceInfo.COMMIT_TIMESTAMP_KEY)).isNotNull();
+            assertThat(source1.get(SourceInfo.START_SCN_KEY)).isNotNull();
+            assertThat(source1.get(SourceInfo.START_TIMESTAMP_KEY)).isNotNull();
+
+            Struct after2 = ((Struct) tableRecords.get(1).value()).getStruct(FieldName.AFTER);
+            assertThat(after2.get("ID")).isEqualTo(2);
+            assertThat(after2.get("DATA")).isEqualTo("Test2");
+
+            Struct source2 = ((Struct) tableRecords.get(1).value()).getStruct(FieldName.SOURCE);
+            assertThat(source2.get(SourceInfo.COMMIT_SCN_KEY)).isNotNull();
+            assertThat(source2.get(SourceInfo.COMMIT_TIMESTAMP_KEY)).isNotNull();
+            assertThat(source2.get(SourceInfo.START_SCN_KEY)).isNotNull();
+            assertThat(source2.get(SourceInfo.START_TIMESTAMP_KEY)).isNotNull();
+
+            // Test that first transaction values are prior to second transaction values
+
+            final Scn startScn1 = Scn.valueOf(source1.getString(SourceInfo.START_SCN_KEY));
+            final Scn startScn2 = Scn.valueOf(source2.getString(SourceInfo.START_SCN_KEY));
+            assertThat(startScn1.compareTo(startScn2) < 0).isTrue();
+
+            final Instant startTime1 = Instant.ofEpochMilli(source1.getInt64(SourceInfo.START_TIMESTAMP_KEY));
+            final Instant startTime2 = Instant.ofEpochMilli(source2.getInt64(SourceInfo.START_TIMESTAMP_KEY));
+            assertThat(startTime1.isBefore(startTime2)).isTrue();
+
+            final Scn commitScn1 = Scn.valueOf(source1.getString(SourceInfo.COMMIT_SCN_KEY));
+            final Scn commitScn2 = Scn.valueOf(source2.getString(SourceInfo.COMMIT_SCN_KEY));
+            assertThat(commitScn1.compareTo(commitScn2) < 0).isTrue();
+
+            final Instant commitTime1 = Instant.ofEpochMilli(source1.getInt64(SourceInfo.COMMIT_TIMESTAMP_KEY));
+            final Instant commitTime2 = Instant.ofEpochMilli(source2.getInt64(SourceInfo.COMMIT_TIMESTAMP_KEY));
+            assertThat(commitTime1.isBefore(commitTime2)).isTrue();
+
+            assertNoRecordsToConsume();
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz8740");
         }
     }
 

@@ -16,13 +16,13 @@ import java.util.Collections;
 import java.util.Map;
 
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.sink.SinkRecord;
 import org.hibernate.PessimisticLockException;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
+import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.integration.AbstractJdbcSinkTest;
 import io.debezium.connector.jdbc.junit.jupiter.MySqlSinkDatabaseContextProvider;
@@ -79,7 +79,7 @@ public class JdbcSinkRetryIT extends AbstractJdbcSinkTest {
         properties.put(JdbcSinkConnectorConfig.INSERT_MODE, JdbcSinkConnectorConfig.InsertMode.UPSERT.getValue());
         // rollback after 5 seconds waiting for lock.
         properties.put(JdbcSinkConnectorConfig.CONNECTION_URL, getSink().getJdbcUrl(Map.of("sessionVariables", "innodb_lock_wait_timeout=5")));
-        properties.put(JdbcSinkConnectorConfig.TABLE_NAME_FORMAT, tableName);
+        properties.put(JdbcSinkConnectorConfig.COLLECTION_NAME_FORMAT, tableName);
         properties.put(JdbcSinkConnectorConfig.FLUSH_MAX_RETRIES, "1");
         properties.put(JdbcSinkConnectorConfig.FLUSH_RETRY_DELAY_MS, "1000");
 
@@ -88,7 +88,7 @@ public class JdbcSinkRetryIT extends AbstractJdbcSinkTest {
 
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord updateRecord = factory.updateRecordWithSchemaValue(
+        final KafkaDebeziumSinkRecord updateRecord = factory.updateRecordWithSchemaValue(
                 topicName,
                 (byte) 1,
                 "content",

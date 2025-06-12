@@ -13,21 +13,21 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.kafka.connect.data.SchemaBuilder;
-import org.apache.kafka.connect.sink.SinkRecord;
 import org.assertj.db.api.TableAssert;
 import org.assertj.db.type.ValueType;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
+import io.debezium.bindings.kafka.KafkaDebeziumSinkRecord;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig.InsertMode;
-import io.debezium.connector.jdbc.JdbcSinkConnectorConfig.PrimaryKeyMode;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig.SchemaEvolutionMode;
 import io.debezium.connector.jdbc.junit.TestHelper;
 import io.debezium.connector.jdbc.junit.jupiter.Sink;
 import io.debezium.connector.jdbc.junit.jupiter.SinkRecordFactoryArgumentsProvider;
 import io.debezium.connector.jdbc.util.SinkRecordFactory;
 import io.debezium.doc.FixFor;
+import io.debezium.sink.SinkConnectorConfig.PrimaryKeyMode;
 
 /**
  * Common insert mode tests.
@@ -58,11 +58,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecordNoKey(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
         consume(createRecord);
         consume(factory.createRecordNoKey(topicName));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(2).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1, (byte) 1);
@@ -83,11 +83,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecordNoKey(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
         consume(createRecord);
         consume(factory.createRecord(topicName));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(2).hasNumberOfColumns(6);
 
         getSink().assertColumnType(tableAssert, "__connect_topic", ValueType.TEXT, topicName, topicName);
@@ -111,11 +111,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
         consume(createRecord);
         consume(factory.createRecord(topicName, (byte) 2));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(2).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1, (byte) 2);
@@ -137,11 +137,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
         consume(createRecord);
         consume(factory.createRecord(topicName, (byte) 2));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(2).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1, (byte) 2);
@@ -190,11 +190,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
         consume(createRecord);
         consume(factory.createRecord(topicName, (byte) 1));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(6);
 
         getSink().assertColumnType(tableAssert, "__connect_topic", ValueType.TEXT, topicName);
@@ -218,11 +218,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
         consume(createRecord);
         consume(factory.createRecord(topicName, (byte) 1));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1);
@@ -244,11 +244,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName, (byte) 1);
         consume(createRecord);
         consume(factory.createRecord(topicName, (byte) 1));
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1);
@@ -269,11 +269,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecordNoKey(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecordNoKey(topicName);
         consume(createRecord);
 
         // No changes detected because there is no existing record.
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
@@ -294,11 +294,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
         consume(createRecord);
 
         // No changes detected because there is no existing record.
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(6);
 
         getSink().assertColumnType(tableAssert, "__connect_topic", ValueType.TEXT);
@@ -322,11 +322,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
         consume(createRecord);
 
         // No changes detected because there is no existing record.
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
@@ -348,11 +348,11 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecord(topicName);
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecord(topicName);
         consume(createRecord);
 
         // No changes detected because there is no existing record.
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(0).hasNumberOfColumns(3);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER);
@@ -374,7 +374,7 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
         final String tableName = randomTableName();
         final String topicName = topicName("server1", "schema", tableName);
 
-        final SinkRecord createRecord = factory.createRecordWithSchemaValue(topicName,
+        final KafkaDebeziumSinkRecord createRecord = factory.createRecordWithSchemaValue(topicName,
                 (byte) 1,
                 List.of("optional_with_default_null_value"),
                 List.of(SchemaBuilder.string().defaultValue("default").optional().build()),
@@ -382,7 +382,7 @@ public abstract class AbstractJdbcSinkInsertModeTest extends AbstractJdbcSinkTes
 
         consume(createRecord);
 
-        final TableAssert tableAssert = TestHelper.assertTable(dataSource(), destinationTableName(createRecord));
+        final TableAssert tableAssert = TestHelper.assertTable(assertDbConnection(), destinationTableName(createRecord));
         tableAssert.exists().hasNumberOfRows(1).hasNumberOfColumns(2);
 
         getSink().assertColumnType(tableAssert, "id", ValueType.NUMBER, (byte) 1);

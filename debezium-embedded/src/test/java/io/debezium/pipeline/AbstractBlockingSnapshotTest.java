@@ -36,6 +36,7 @@ import org.apache.kafka.connect.source.SourceConnector;
 import org.awaitility.Awaitility;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.doc.FixFor;
 import io.debezium.jdbc.JdbcConnection;
@@ -190,7 +191,7 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
     public void readsSchemaOnlyForSignaledTables() throws Exception {
         // Testing.Print.enable();
 
-        populateTable(tableNames().get(1).toString());
+        populateTable(tableNames().get(1));
 
         startConnectorWithSnapshot(x -> historizedMutableConfig(false, false));
 
@@ -198,7 +199,7 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
 
         sendAdHocSnapshotSignalWithAdditionalConditionsWithSurrogateKey(
                 Map.of(tableDataCollectionIds().get(1), String.format("SELECT * FROM %s WHERE aa < 500", tableNames().get(1))), "", BLOCKING,
-                tableDataCollectionIds().get(1).toString());
+                tableDataCollectionIds().get(1));
 
         waitForLogMessage("Snapshot completed", AbstractSnapshotChangeEventSource.class);
 
@@ -243,6 +244,89 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
         insertRecords(ROW_COUNT, ROW_COUNT * 2);
 
         assertStreamingRecordsArePresent(ROW_COUNT, consumeRecordsByTopic(ROW_COUNT, 10));
+
+    }
+
+    @Test
+    @FixFor("DBZ-8244")
+    public void anErrorDuringBlockingSnapshotShouldLeaveTheConnectorInAGoodState() throws Exception {
+        // Testing.Print.enable();
+
+        populateTable();
+
+        startConnectorWithSnapshot(x -> mutableConfig(false, false)
+                .with(CommonConnectorConfig.MAX_BATCH_SIZE, 1));
+
+        waitForSnapshotToBeCompleted(connector(), server(), task(), database());
+
+        insertRecords(ROW_COUNT, ROW_COUNT);
+
+        SourceRecords consumedRecordsByTopic = consumeRecordsByTopic(ROW_COUNT * 2, 20);
+        assertRecordsFromSnapshotAndStreamingArePresent(ROW_COUNT * 2, consumedRecordsByTopic);
+
+        sendAdHocSnapshotSignalWithAdditionalConditionsWithSurrogateKey(
+                Map.of(tableDataCollectionIds().get(1), "SELECT WITH AN ERROR"), "", BLOCKING,
+                tableDataCollectionIds().get(1));
+
+        waitForLogMessage("Snapshot was not completed successfully", AbstractSnapshotChangeEventSource.class);
+
+        insertRecords(ROW_COUNT, ROW_COUNT * 2);
+
+        signalingRecords = 1;
+
+        assertStreamingRecordsArePresent(ROW_COUNT, consumeRecordsByTopic(ROW_COUNT + signalingRecords, 10));
+
+    }
+
+    @FixFor("DBZ-7903")
+    @Test
+    public void aFailedBlockingSnapshotShouldNotCauseInitialSnapshotOnRestart() throws Exception {
+        // Testing.Print.enable();
+
+        populateTable();
+
+        startConnectorWithSnapshot(x -> mutableConfig(false, false));
+
+        waitForSnapshotToBeCompleted(connector(), server(), task(), database());
+
+        SourceRecords consumedRecordsByTopic = consumeRecordsByTopic(ROW_COUNT, 10);
+        List<Integer> expectedValues = IntStream.rangeClosed(0, 999).boxed().collect(Collectors.toList());
+
+        assertRecordsWithValuesPresent(ROW_COUNT, expectedValues, topicName(), consumedRecordsByTopic);
+
+        stopConnector();
+        assertConnectorNotRunning();
+
+        startConnectorWithSnapshot(x -> mutableConfig(false, false)
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, String.join(",", tableDataCollectionIds())));
+
+        sendAdHocSnapshotSignalWithAdditionalConditionsWithSurrogateKey(
+                Map.of(tableDataCollectionIds().get(0), String.format("SELECT * FROM %s ORDER BY PK ASC", tableNames().get(0)),
+                        tableDataCollectionIds().get(1), "SELECT failing query"),
+                "", BLOCKING,
+                tableDataCollectionIds().get(0), tableDataCollectionIds().get(1));
+
+        waitForLogMessage("Snapshot was not completed successfully", AbstractSnapshotChangeEventSource.class);
+
+        // Here we expect one record less since the last record (999) is buffered.
+        // This to maintain the same behavior of initial snapshot.
+        // Followup JIRA https://issues.redhat.com/browse/DBZ-8335
+        consumedRecordsByTopic = consumeRecordsByTopic(ROW_COUNT, 10);
+        expectedValues = IntStream.rangeClosed(0, 998).boxed().collect(Collectors.toList());
+
+        assertRecordsWithValuesPresent(ROW_COUNT - 1, expectedValues, topicName(), consumedRecordsByTopic);
+
+        insertRecords(1, ROW_COUNT * 2);
+
+        waitForAvailableRecords();
+
+        assertRecordsWithValuesPresent(1, List.of(2000), topicName(), consumeRecordsByTopic(1, 10));
+
+        stopConnector();
+
+        startConnectorWithSnapshot(x -> mutableConfig(false, false));
+
+        assertNoRecordsToConsume();
 
     }
 
@@ -313,7 +397,7 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
         Awaitility.await()
                 .alias("Snapshot not completed on time")
                 .pollInterval(100, TimeUnit.MILLISECONDS)
-                .atMost(waitTimeForRecords() * 30L, TimeUnit.SECONDS)
+                .atMost(waitTimeForRecords() * 60L, TimeUnit.SECONDS)
                 .until(() -> interceptor.containsMessage(message));
     }
 
@@ -342,7 +426,7 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
 
     protected void assertStreamingRecordsArePresent(int expectedRecords, SourceRecords recordsByTopic) {
 
-        assertRecordsWithValuesPresent(expectedRecords, IntStream.range(2000, 2999).boxed().collect(Collectors.toList()), topicName(),
+        assertRecordsWithValuesPresent(expectedRecords, IntStream.rangeClosed(2000, 2999).boxed().collect(Collectors.toList()), topicName(),
                 recordsByTopic);
     }
 
@@ -352,7 +436,7 @@ public abstract class AbstractBlockingSnapshotTest<T extends SourceConnector> ex
                 recordsByTopic);
     }
 
-    private void assertRecordsWithValuesPresent(int expectedRecords, List<Integer> expectedValues, String topicName, SourceRecords recordsByTopic) {
+    protected void assertRecordsWithValuesPresent(int expectedRecords, List<Integer> expectedValues, String topicName, SourceRecords recordsByTopic) {
 
         List<Integer> actual = recordsByTopic.recordsForTopic(topicName).stream()
                 .map(s -> ((Struct) s.value()).getStruct("after").getInt32(valueFieldName()))

@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -218,7 +219,14 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             LOGGER.debug("Starting tasks polling.");
             setEngineState(State.STARTING_TASKS, State.POLLING_TASKS);
             runTasksPolling(tasks);
-            // Tasks run infinite polling loop until close() is called or exception is thrown.
+
+            // Check the state first - if the polling was stopped by calling close() method (not by throwing StopEngineException),
+            // engine is already in STOPPING state.
+            if (State.canBeStopped(getEngineState())) {
+                LOGGER.debug("Stopping " + AsyncEmbeddedEngine.class.getName());
+                setEngineState(State.POLLING_TASKS, State.STOPPING);
+                close(State.POLLING_TASKS);
+            }
         }
         catch (Throwable t) {
             exitError = t;
@@ -282,7 +290,12 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      * @param stateBeforeStop {@link State} of the engine when the shutdown was requested.
      */
     private void close(final State stateBeforeStop) {
-        stopConnector(tasks, stateBeforeStop);
+        try {
+            stopConnector(tasks, stateBeforeStop);
+        }
+        catch (Exception e) {
+            LOGGER.warn("Failed to stop connector properly: ", e);
+        }
         if (headerConverter != null) {
             try {
                 headerConverter.close();
@@ -331,7 +344,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     private void finishShutDown(Throwable exitError) {
         try {
-            shutDownLatch.await();
+            shutDownLatch.await(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS), TimeUnit.MILLISECONDS);
         }
         catch (InterruptedException e) {
             LOGGER.warn("Interrupted while waiting for shutdown to finish.");
@@ -470,13 +483,27 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     private void runTasksPolling(final List<EngineSourceTask> tasks)
             throws ExecutionException {
+        LOGGER.debug("Calling connector callback before starting polling.");
+        connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::pollingStarted);
+
         LOGGER.debug("Starting tasks polling.");
         final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(taskService);
         final String processorClassName = selectRecordProcessor();
-        for (EngineSourceTask task : tasks) {
-            final RecordProcessor processor = createRecordProcessor(processorClassName, task);
-            processor.initialize(recordService, transformations);
-            pollingFutures.add(taskCompletionService.submit(new PollRecords(task, processor, state)));
+        try {
+            for (EngineSourceTask task : tasks) {
+                final RecordProcessor processor = createRecordProcessor(processorClassName, task);
+                processor.initialize(recordService, transformations);
+                pollingFutures.add(taskCompletionService.submit(new PollRecords(task, processor, state)));
+            }
+        }
+        catch (RejectedExecutionException e) {
+            if (getEngineState().compareTo(State.POLLING_TASKS) > 0) {
+                LOGGER.debug("Engine stopped while submitting polling tasks, ignoring RejectedExecutionException and exiting gracefully.");
+                return;
+            }
+            else {
+                throw e;
+            }
         }
 
         for (int i = 0; i < tasks.size(); i++) {
@@ -488,6 +515,9 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             }
             LOGGER.debug("Task #{} out of {} tasks has stopped polling.", i, tasks.size());
         }
+
+        LOGGER.debug("Calling connector callback after polling has stopped.");
+        connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::pollingStopped);
     }
 
     /**
@@ -801,7 +831,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private static boolean commitOffsets(final OffsetStorageWriter offsetWriter, final io.debezium.util.Clock clock, final long commitTimeout, final SourceTask task)
             throws InterruptedException, TimeoutException {
         final long timeout = clock.currentTimeInMillis() + commitTimeout;
-        if (!offsetWriter.beginFlush(commitTimeout, TimeUnit.MICROSECONDS)) {
+        if (!offsetWriter.beginFlush(commitTimeout, TimeUnit.MILLISECONDS)) {
             LOGGER.trace("No offset to be committed.");
             return false;
         }
@@ -985,7 +1015,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                     catch (StopEngineException ex) {
                         // Ensure that we mark the record as finished in this case.
                         committer.markProcessed(record);
-                        throw ex;
+                        break;
                     }
                 }
                 committer.markBatchFinished();
@@ -1013,7 +1043,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                     catch (StopEngineException ex) {
                         // Ensure that we mark the record as finished in this case.
                         committer.markProcessed(record);
-                        throw ex;
+                        break;
                     }
                 }
                 committer.markBatchFinished();
@@ -1163,6 +1193,10 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      * If there are any records, they are passed to the provided processor.
      * The {@link Callable} is {@link RetryingCallable} - if the {@link org.apache.kafka.connect.errors.RetriableException}
      * is thrown, the {@link Callable} is executed again according to configured {@link DelayStrategy} and number of retries.
+     *
+     * The polling runs in an infinite polling loop until close() is called or exception is thrown.
+     * The only exception is catching {@link StopEngineException}, which also leads to finishing the polling loop,
+     * but in this case the shutdown is graceful.
      */
     private static class PollRecords extends RetryingCallable<Void> {
         final EngineSourceTask task;
@@ -1183,7 +1217,13 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 final List<SourceRecord> changeRecords = task.connectTask().poll(); // blocks until there are values ...
                 LOGGER.trace("Thread {} polled {} records.", Thread.currentThread().getName(), changeRecords == null ? "no" : changeRecords.size());
                 if (changeRecords != null && !changeRecords.isEmpty()) {
-                    processor.processRecords(changeRecords);
+                    try {
+                        processor.processRecords(changeRecords);
+                    }
+                    catch (StopEngineException e) {
+                        LOGGER.debug("Interrupting polling loop due to receiving StopEngineException.");
+                        break;
+                    }
                 }
                 else {
                     LOGGER.trace("No records.");
@@ -1225,7 +1265,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
 
         @Override
         public void markProcessed(SourceRecord record) throws InterruptedException {
-            task.commitRecord(record);
+            task.commitRecord(record, null);
             recordsSinceLastCommit += 1;
             offsetWriter.offset(record.sourcePartition(), record.sourceOffset());
         }

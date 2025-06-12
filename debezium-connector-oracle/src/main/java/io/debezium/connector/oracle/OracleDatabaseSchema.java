@@ -44,12 +44,15 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
 
     public static final String ATTRIBUTE_OBJECT_ID = "OBJECT_ID";
     public static final String ATTRIBUTE_DATA_OBJECT_ID = "DATA_OBJECT_ID";
+    private static final TableId NO_SUCH_TABLE = new TableId(null, null, "__NULL");
 
     private final OracleDdlParser ddlParser;
     private final ConcurrentMap<TableId, List<Column>> lobColumnsByTableId = new ConcurrentHashMap<>();
     private final OracleValueConverters valueConverters;
     private final LRUCacheMap<Long, TableId> objectIdToTableId;
     private final boolean extendedStringsSupported;
+
+    private LastObjectTableIdLookup lastObjectTableIdLookup;
 
     public OracleDatabaseSchema(OracleConnectorConfig connectorConfig, OracleValueConverters valueConverters,
                                 DefaultValueConverter defaultValueConverter, SchemaNameAdjuster schemaNameAdjuster,
@@ -146,28 +149,29 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      */
     public TableId getTableIdByObjectId(Long objectId, Long dataObjectId) {
         Objects.requireNonNull(objectId, "The database table object id is null and is not allowed");
+
+        // Fast path: check if the last lookup matches
+        if (lastObjectTableIdLookup != null &&
+                objectId.equals(lastObjectTableIdLookup.objectId()) &&
+                Objects.equals(lastObjectTableIdLookup.dataObjectId(), dataObjectId)) {
+            return (lastObjectTableIdLookup.tableId() == NO_SUCH_TABLE) ? null : lastObjectTableIdLookup.tableId();
+        }
+
         // Internally we cache this using a bounded cache for performance reasons, particularly when a
         // transaction may refer to the same table for consecutive DML events. This avoids the need to
         // iterate the list of tables on each DML event observed.
-        return objectIdToTableId.computeIfAbsent(objectId, (tableObjectId) -> {
-            for (TableId tableId : tableIds()) {
-                final Table table = tableFor(tableId);
-                final Attribute attribute = table.attributeWithName(ATTRIBUTE_OBJECT_ID);
-                if (attribute != null && attribute.asLong().equals(tableObjectId)) {
-                    if (dataObjectId != null) {
-                        final Attribute dataAttribute = table.attributeWithName(ATTRIBUTE_DATA_OBJECT_ID);
-                        if (dataAttribute == null || !dataAttribute.asLong().equals(dataObjectId)) {
-                            // Did not match, continue
-                            continue;
-                        }
-                    }
-                    LOGGER.debug("Table lookup for object {} resolved to '{}'", tableObjectId, table.id());
-                    return table.id();
-                }
-            }
-            LOGGER.debug("Table lookup for object id {} did not find a match.", tableObjectId);
-            return null;
-        });
+        TableId cachedTableId = objectIdToTableId.get(objectId);
+        if (cachedTableId == null) {
+            cachedTableId = tableObjectIdToTableId(objectId, dataObjectId);
+            objectIdToTableId.put(objectId, cachedTableId);
+        }
+
+        // Cache the lookup to avoid a map hit should the next inquiry be for the same objectId/dataObjectId.
+        lastObjectTableIdLookup = new LastObjectTableIdLookup(objectId, dataObjectId, cachedTableId);
+
+        // There is not any table for this object ID, so we have to convert back the placeholder
+        // and return null.
+        return (cachedTableId == NO_SUCH_TABLE) ? null : cachedTableId;
     }
 
     /**
@@ -273,5 +277,40 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
         else {
             lobColumnsByTableId.remove(table.id());
         }
+    }
+
+    private TableId tableObjectIdToTableId(Long tableObjectId, Long dataObjectId) {
+        for (TableId tableId : tableIds()) {
+            final Table table = tableFor(tableId);
+            final Attribute attribute = table.attributeWithName(ATTRIBUTE_OBJECT_ID);
+            if (attribute != null && attribute.asLong().equals(tableObjectId)) {
+                if (dataObjectId != null) {
+                    final Attribute dataAttribute = table.attributeWithName(ATTRIBUTE_DATA_OBJECT_ID);
+                    if (dataAttribute == null || !dataAttribute.asLong().equals(dataObjectId)) {
+                        // Did not match, continue
+                        continue;
+                    }
+                }
+                LOGGER.debug("Table lookup for object {} resolved to '{}'", tableObjectId, table.id());
+                return table.id();
+            }
+        }
+        // A non-null placeholder must be inserted for non-existing value to avoid the expensive
+        // look-up across the table schemas in future calls, so inserting explicitly non-existing
+        // placeholder here.
+        LOGGER.debug("Table lookup for object id {} did not find a match.", tableObjectId);
+        return NO_SUCH_TABLE;
+    }
+
+    /**
+     * A simple record that represents the last lookup in the {@code objectIdToTableId} map.
+     * This is to provide a more efficient way to resolve the identifier lookup when there
+     * are repeated operations for the same table in the transaction logs.
+     *
+     * @param objectId object's identifier, should not be {@code null}
+     * @param dataObjectId object's data identifier, should not be {@code null}
+     * @param tableId the lookup table identifier
+     */
+    record LastObjectTableIdLookup(Long objectId, Long dataObjectId, TableId tableId) {
     }
 }

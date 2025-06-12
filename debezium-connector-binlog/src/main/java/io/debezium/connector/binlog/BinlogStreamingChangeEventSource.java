@@ -253,7 +253,18 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                 // We've not yet seen any GTIDs, so that means we have to start reading the binlog from the beginning ...
                 client.setBinlogFilename(effectiveOffsetContext.getSource().binlogFilename());
                 client.setBinlogPosition(effectiveOffsetContext.getSource().binlogPosition());
-                initializeGtidSet("");
+                if (purgedServerGtidSet == null || purgedServerGtidSet.isEmpty()) {
+                    LOGGER.info("No GTID stored in the offset, registering binlog reader with empty GTID set.");
+                    client.setGtidSet("");
+                    initializeGtidSet("");
+                }
+                else {
+                    LOGGER.info("No GTID stored in the offset, but there is non-empty purged GTID set. Registering binlog reader with purged GTID set: '{}'",
+                            purgedServerGtidSet.toString());
+                    client.setGtidSet(purgedServerGtidSet.toString());
+                    // We don't have stored any GTID in the offset, so start from empty GTID set.
+                    initializeGtidSet("");
+                }
             }
         }
         else {
@@ -495,6 +506,7 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
 
     protected void onEvent(O offsetContext, Event event) {
         long ts = 0;
+        totalRecordCounter.incrementAndGet();
 
         if (event.getHeader().getEventType() == EventType.HEARTBEAT) {
             // HEARTBEAT events have no timestamp but are fired only when
@@ -713,7 +725,9 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
             LOGGER.debug("DDL '{}' was filtered out of processing", sql);
             return;
         }
-        if (upperCasedStatementBegin.equals("INSERT ") || upperCasedStatementBegin.equals("UPDATE ") || upperCasedStatementBegin.equals("DELETE ")) {
+        // Check and exclude DML statements from DDL statements handling logic.
+        Set<String> DML_STATEMENTS = Set.of("INSERT ", "UPDATE ", "DELETE ", "REPLACE ");
+        if (DML_STATEMENTS.contains(upperCasedStatementBegin)) {
             LOGGER.warn("Received DML '" + sql + "' for processing, binlog probably contains events generated with statement or mixed based replication format");
             return;
         }
@@ -737,14 +751,16 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                     eventDispatcher.dispatchDataChangeEvent(partition, tableId,
                             new BinlogChangeRecordEmitter<>(partition, offsetContext, clock, Envelope.Operation.TRUNCATE, null, null, connectorConfig));
                 }
-                eventDispatcher.dispatchSchemaChangeEvent(partition, offsetContext, tableId, (receiver) -> {
-                    try {
-                        receiver.schemaChangeEvent(schemaChangeEvent);
-                    }
-                    catch (Exception e) {
-                        throw new DebeziumException(e);
-                    }
-                });
+                else {
+                    eventDispatcher.dispatchSchemaChangeEvent(partition, offsetContext, tableId, (receiver) -> {
+                        try {
+                            receiver.schemaChangeEvent(schemaChangeEvent);
+                        }
+                        catch (Exception e) {
+                            throw new DebeziumException(e);
+                        }
+                    });
+                }
             }
         }
         catch (InterruptedException e) {
@@ -1219,6 +1235,7 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
             // The event row number will be used when processing the first event ...
             LOGGER.info("Connected to binlog at {}:{}, starting at {}",
                     connectorConfig.getHostName(), connectorConfig.getPort(), offsetContext);
+            totalRecordCounter.set(0);
         }
 
         @Override
@@ -1253,21 +1270,7 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
         }
     }
 
-    private SSLMode sslModeFor(SecureConnectionMode mode) {
-        switch (mode) {
-            case DISABLED:
-                return SSLMode.DISABLED;
-            case PREFERRED:
-                return SSLMode.PREFERRED;
-            case REQUIRED:
-                return SSLMode.REQUIRED;
-            case VERIFY_CA:
-                return SSLMode.VERIFY_CA;
-            case VERIFY_IDENTITY:
-                return SSLMode.VERIFY_IDENTITY;
-        }
-        return null;
-    }
+    protected abstract SSLMode sslModeFor(SecureConnectionMode mode);
 
     private SSLSocketFactory getBinlogSslSocketFactory(BinlogConnectorConfig connectorConfig, BinlogConnectorConnection connection) {
         String acceptedTlsVersion = connection.getSessionVariableForSslVersion();

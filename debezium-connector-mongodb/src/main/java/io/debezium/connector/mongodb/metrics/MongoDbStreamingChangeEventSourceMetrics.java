@@ -28,7 +28,7 @@ import io.debezium.util.Collect;
  */
 @ThreadSafe
 public class MongoDbStreamingChangeEventSourceMetrics extends DefaultStreamingChangeEventSourceMetrics<MongoDbPartition>
-        implements MongoDbStreamingChangeEventSourceMetricsMBean {
+        implements MongoDbStreamingChangeEventSourceMetricsMXBean {
 
     private final AtomicLong numberOfPrimaryElections = new AtomicLong();
     private final AtomicLong numberOfDisconnects = new AtomicLong();
@@ -41,7 +41,7 @@ public class MongoDbStreamingChangeEventSourceMetrics extends DefaultStreamingCh
                                                                                      EventMetadataProvider eventMetadataProvider) {
         super(taskContext, changeEventQueueMetrics, eventMetadataProvider, Collect.linkMapOf(
                 "context", "streaming",
-                "server", taskContext.getConnectorName(),
+                "server", taskContext.getConnectorLogicalName(),
                 "task", taskContext.getTaskId()));
     }
 

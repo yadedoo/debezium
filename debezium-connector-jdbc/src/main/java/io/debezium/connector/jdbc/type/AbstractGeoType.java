@@ -12,7 +12,7 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 
-import io.debezium.connector.jdbc.ValueBindDescriptor;
+import io.debezium.sink.valuebinding.ValueBindDescriptor;
 
 public abstract class AbstractGeoType extends AbstractType {
     public static final String SRID = "srid";
@@ -22,7 +22,9 @@ public abstract class AbstractGeoType extends AbstractType {
     public List<ValueBindDescriptor> bind(int index, Schema schema, Object value) {
 
         if (value == null) {
-            return List.of(new ValueBindDescriptor(index, null));
+            // When the value is null, bind two null values to represent the two function arguments that
+            // are bound to the ST_GeomFromWKB function call.
+            return List.of(new ValueBindDescriptor(index, null), new ValueBindDescriptor(index + 1, null));
         }
 
         if (value instanceof Struct) {

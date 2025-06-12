@@ -356,9 +356,15 @@ endif::community[]
 [id="{context}-property-skipped-operations"]
 xref:{context}-property-skipped-operations[`skipped.operations`]::
 Default value: `t` +
-A comma-separated list of operation types that will be skipped during streaming.
-The operations include: `c` for inserts/create, `u` for updates, `d` for deletes, `t` for truncates, and `none` to not skip any operations.
-By default, truncate operations are skipped.
+A comma-separated list of the operation types that you want the connector to skip during streaming.
+You can configure the connector to skip the following types of operations:
+
+* `c` (insert/create)
+* `u` (update)
+* `d` (delete)
+* `t` (truncate)
+
+Set the value to `none` if you do not want the connector to skip any operations.
 
 
 
@@ -371,9 +377,11 @@ An interval in milliseconds that the connector should wait before performing a s
 
 [id="{context}-property-snapshot-fetch-size"]
 xref:{context}-property-snapshot-fetch-size[`snapshot.fetch.size`]::
-Default value: No default +
-During a snapshot, the connector reads table content in batches of rows.
-This property specifies the maximum number of rows in a batch.
+Default value: Unset +
+By default, during a snapshot, the connector reads table content in batches of rows.
+Set this property to specify the maximum number of rows in a batch.
+
+include::{snippetsdir}/frag-{context}-props-snippets.adoc[tags=snapshot-fetch-size-note]
 
 
 [id="{context}-property-snapshot-include-collection-list"]

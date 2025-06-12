@@ -438,6 +438,13 @@ public abstract class BinlogSnapshotChangeEventSource<P extends BinlogPartition,
     }
 
     private boolean twoPhaseSchemaSnapshot() {
+        if (!isGloballyLocked() && connectorConfig.getSnapshotLockingStrategy().preventsTableLocks()) {
+            // Prevent obtaining individual table-level read locks
+            // using 'FLUSH TABLE <tableName> WITH READ LOCK'
+            // when using *_no_table_locks mode
+            throw new DebeziumException(
+                    "Cannot perform two-phase schema snapshot because global read lock was not acquired and table locks are not allowed in *_no_table_locks mode.");
+        }
         return connectorConfig.getSnapshotLockingStrategy().isLockingEnabled() && !isGloballyLocked();
     }
 
@@ -653,5 +660,13 @@ public abstract class BinlogSnapshotChangeEventSource<P extends BinlogPartition,
     protected void preSnapshot() throws InterruptedException {
         preSnapshotAction.run();
         super.preSnapshot();
+    }
+
+    @Override
+    protected void aborted(SnapshotContext<P, O> snapshotContext) throws InterruptedException {
+
+        lastEventProcessor.accept(Function.identity());
+
+        super.aborted(snapshotContext);
     }
 }

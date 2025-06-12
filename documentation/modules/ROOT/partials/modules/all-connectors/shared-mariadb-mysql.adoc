@@ -644,7 +644,7 @@ ifdef::community[]
 |The `custom` snapshot mode lets you inject your own implementation of the `io.debezium.spi.snapshot.Snapshotter` interface.
 Set the `snapshot.mode.custom.name` configuration property to the name provided by the `name()` method of your implementation.
 The name is specified on the classpath of your Kafka Connect cluster.
-If you use the `EmbeddedEngine`, the name is included in the connector JAR file.
+If you use the `DebeziumEngine`, the name is included in the connector JAR file.
 For more information, see xref:connector-custom-snapshot[custom snapshotter SPI].
 endif::community[]
 
@@ -706,14 +706,14 @@ For information about capturing data from a new table that has undergone structu
 1. Stop the connector.
 2. Remove the internal database schema history topic that is specified by the xref:{context}-property-database-history-kafka-topic[`schema.history.internal.kafka.topic property`].
 3. Apply the following changes to the connector configuration:
-.. Set the xref:{context}-property-snapshot-mode[`snapshot.mode`] to `schema_only_recovery`.
+.. Set the xref:{context}-property-snapshot-mode[`snapshot.mode`] to `recovery`.
 .. Set the value of xref:{context}-property-database-history-store-only-captured-tables-ddl[`schema.history.internal.store.only.captured.tables.ddl`] to `false`.
 .. Add the tables that you want the connector to capture to `table.include.list`.
 This guarantees that in the future, the connector can reconstruct the schema history for all tables.
 4. Restart the connector.
 The snapshot recovery process rebuilds the schema history based on the current structure of the tables.
 5. (Optional) After the snapshot completes, initiate an xref:debezium-{context}-incremental-snapshots[incremental snapshot] to capture existing data for newly added tables along with changes to other tables that occurred while that connector was off-line.
-6. (Optional) Reset the `snapshot.mode` back to `schema_only` to prevent the connector from initiating recovery after a future restart.
+6. (Optional) Reset the `snapshot.mode` back to `no_data` to prevent the connector from initiating recovery after a future restart.
 end::cap-tbls-not-in-initial-no-schema-chg[]
 
 
@@ -757,7 +757,7 @@ Removing offsets should be performed only by advanced users who have experience 
 This operation is potentially destructive, and should be performed only as a last resort.
 ====
 4. Set values for properties in the connector configuration as described in the following steps:
-.. Set the value of the xref:{context}-property-snapshot-mode[`snapshot.mode`] property to `schema_only`.
+.. Set the value of the xref:{context}-property-snapshot-mode[`snapshot.mode`] property to `no_data`.
 .. Edit the xref:{context}-property-table-include-list[`table.include.list`] to add the tables that you want to capture.
 5. Restart the connector.
 6. Wait for {prodname} to capture the schema of the new and existing tables.
@@ -1757,28 +1757,33 @@ a|Mandatory string that describes the type of operation. The `op` field value is
 a|Optional field that displays the time at which the connector processed the event.
 The time is based on the system clock in the JVM running the Kafka Connect task.  +
  +
-In the `source` object, `ts_ms` indicates the time that the change was made in the database. By comparing the value for `payload.source.ts_ms` with the value for `payload.ts_ms`, you can determine the lag between the source database update and {prodname}.
+In the `source` object, `ts_ms` indicates the time that the change was made in the database.
+By comparing the value for `payload.source.ts_ms` with the value for `payload.ts_ms`, you can determine the lag between the source database update and {prodname}.
 
 |4
 |`ts_us`
-a|Optional field that displays the time at which the connector processed the event, in microseconds. The time is based on the system clock in the JVM running the Kafka Connect task.
+a|Optional field that displays the time at which the connector processed the event, in microseconds.
+The time is based on the system clock in the JVM running the Kafka Connect task.
 
 |5
 |`ts_ns`
-a|Optional field that displays the time at which the connector processed the event, in nanoseconds. The time is based on the system clock in the JVM running the Kafka Connect task.
+a|Optional field that displays the time at which the connector processed the event, in nanoseconds.
+The time is based on the system clock in the JVM running the Kafka Connect task.
 
 |===
 
-In case a single `TRUNCATE` statement applies to multiple tables,
-one _truncate_ change event record for each truncated table will be emitted.
+If a single `TRUNCATE` statement applies to multiple tables, the connector emits one _truncate_ change event record for each truncated table.
 
 [NOTE]
 ====
-A _truncate_ event represents a change that applies to an entire table, and it does not have a message key.
-In topics that span multiple partition, the order of change events that apply to an entire table is is not guaranteed.
-That is, there is no ordering guarantee for (_create_, _update_, etc.), or for the _truncate_ events for that table.
-When a consumer reads events from different partition, it might read an _update_ event for a table from one partition only after it reads a _truncate_ event for the same table from a second partition.
+A _truncate_ event represents a change that is made to an entire table and it has no message key.
+As a result, for topics with multiple partitions, there is no ordering guarantee for the change events (_create_, _update_, and so forth), or _truncate_ events that pertain to a table.
+For example, if a consumer reads events for a table from multiple partitions, it might receive an _update_ event for a table from one partition after it receives a _truncate_ event that deletes all of the data in the table from another partition.
+Ordering is guaranteed only for topics that use a single partition.
 ====
+
+If you do not want the connector to capture _truncate_ events, use the xref:{context}-property-skipped-operations[`skipped.operations`] option to filter them out.
+
 end::truncate-events[]
 
 
@@ -2578,6 +2583,13 @@ endif::[]
 
 If you are working with immutable containers, see link:https://quay.io/organization/debezium[{prodname}'s Container images] for Apache Zookeeper, Apache Kafka, {connector-name}, and Kafka Connect with the {connector-name} connector already installed and ready to run.
 
+[IMPORTANT]
+====
+The {prodname} container images that you obtain from `quay.io` do not undergo rigorous testing or security analysis, and are provided for testing and evaluation purposes only.
+These images are not intended for use in production environments.
+To mitigate risk in production deployments, deploy only containers that are actively maintained by trusted vendors, and thoroughly tested for potential vulnerabilities.
+====
+
 You can also xref:operations/openshift.adoc[run {prodname} on Kubernetes and OpenShift].
 endif::community[]
 
@@ -2587,7 +2599,9 @@ You can use either of the following methods to deploy a {prodname} {connector-na
 * xref:openshift-streams-{context}-connector-deployment[Use {StreamsName} to automatically create an image that includes the connector plug-in].
 +
 This is the preferred method.
-* xref:deploying-debezium-{context}-connectors[Build a custom Kafka Connect container image from a Dockerfile].
+* xref:deploying-debezium-{context}-connectors[Build a custom Kafka Connect container image from a Dockerfile]. +
+This Containerfile deployment method is deprecated.
+The instructions for this method are scheduled for removal in future versions of the documentation.
 
 .Additional resources
 

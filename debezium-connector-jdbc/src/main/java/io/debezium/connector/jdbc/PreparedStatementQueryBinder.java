@@ -11,6 +11,8 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.Collection;
 
+import io.debezium.sink.valuebinding.ValueBindDescriptor;
+
 public class PreparedStatementQueryBinder implements QueryBinder {
 
     private final PreparedStatement binder;
@@ -21,7 +23,6 @@ public class PreparedStatementQueryBinder implements QueryBinder {
 
     @Override
     public void bind(ValueBindDescriptor valueBindDescriptor) {
-
         try {
             if (valueBindDescriptor.getTargetSqlType() != null) {
                 if (valueBindDescriptor.getTargetSqlType() == Types.ARRAY) {

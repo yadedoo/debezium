@@ -8,6 +8,7 @@ package io.debezium.connector.mysql;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
@@ -22,6 +23,7 @@ import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.binlog.BinlogEventMetadataProvider;
 import io.debezium.connector.binlog.BinlogSourceTask;
 import io.debezium.connector.binlog.jdbc.BinlogConnectorConnection;
+import io.debezium.connector.common.DebeziumHeaderProducer;
 import io.debezium.connector.mysql.jdbc.MySqlConnection;
 import io.debezium.connector.mysql.jdbc.MySqlConnectionConfiguration;
 import io.debezium.connector.mysql.jdbc.MySqlFieldReaderResolver;
@@ -97,6 +99,7 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
 
         final boolean tableIdCaseInsensitive = connection.isTableIdCaseSensitive();
         this.schema = new MySqlDatabaseSchema(connectorConfig, valueConverters, topicNamingStrategy, schemaNameAdjuster, tableIdCaseInsensitive);
+        taskContext = new MySqlTaskContext(connectorConfig, schema);
 
         // Manual Bean Registration
         beanRegistryJdbcConnection = connectionFactory.newConnection();
@@ -106,6 +109,7 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
         connectorConfig.getBeanRegistry().add(StandardBeanNames.JDBC_CONNECTION, beanRegistryJdbcConnection);
         connectorConfig.getBeanRegistry().add(StandardBeanNames.VALUE_CONVERTER, valueConverters);
         connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, previousOffsets);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
 
         // Service providers
         registerServiceProviders(connectorConfig.getServiceRegistry());
@@ -131,15 +135,29 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
 
         MySqlOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
 
-        validateAndLoadSchemaHistory(connectorConfig, connection::validateLogPosition, previousOffsets, schema, snapshotter);
+        validateSchemaHistory(connectorConfig, connection::validateLogPosition, previousOffsets, schema, snapshotter);
 
-        LOGGER.info("Reconnecting after finishing schema recovery");
+        LOGGER.info("Reconnecting after validating schema recovery");
 
         try {
+            try {
+                connection.execute("SELECT 1");
+            }
+            catch (SQLException e) {
+                LOGGER.warn("Connection was dropped during schema recovery. Reconnecting...");
+                try {
+                    connection.close();
+                }
+                catch (Exception e1) {
+                    // Ignore any error
+                }
+                connection = connectionFactory.mainConnection();
+            }
+
             connection.setAutoCommit(false);
         }
         catch (SQLException e) {
-            throw new DebeziumException(e);
+            throw new DebeziumException("Failed to reconnect after schema recovery", e);
         }
 
         // If the binlog position is not available it is necessary to re-execute snapshot
@@ -149,8 +167,6 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
         else {
             LOGGER.info("Found previous offset {}", previousOffset);
         }
-
-        taskContext = new MySqlTaskContext(connectorConfig, schema);
 
         // Set up the task record queue ...
         this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
@@ -171,7 +187,6 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
                 getAvailableSignalChannels(),
                 DocumentReader.defaultReader(),
                 previousOffsets);
-        resetOffset(connectorConfig, previousOffset, signalProcessor);
 
         final Configuration heartbeatConfig = config;
         final EventDispatcher<MySqlPartition, TableId> dispatcher = new EventDispatcher<>(
@@ -190,8 +205,7 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
                                 new MySqlConnectionConfiguration(heartbeatConfig),
                                 MySqlFieldReaderResolver.resolve(connectorConfig)),
                         new BinlogHeartbeatErrorHandler()),
-                schemaNameAdjuster,
-                signalProcessor);
+                schemaNameAdjuster, signalProcessor, connectorConfig.getServiceRegistry().tryGetService(DebeziumHeaderProducer.class));
 
         final MySqlStreamingChangeEventSourceMetrics streamingMetrics = new MySqlStreamingChangeEventSourceMetrics(taskContext, queue, metadataProvider);
 
@@ -226,6 +240,11 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
         return coordinator;
     }
 
+    @Override
+    protected String connectorName() {
+        return Module.name();
+    }
+
     private MySqlValueConverters getValueConverters(MySqlConnectorConfig configuration) {
         return new MySqlValueConverters(
                 configuration.getDecimalMode(),
@@ -241,6 +260,11 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
     public List<SourceRecord> doPoll() throws InterruptedException {
         final List<DataChangeEvent> records = queue.poll();
         return records.stream().map(DataChangeEvent::getRecord).collect(Collectors.toList());
+    }
+
+    @Override
+    protected Optional<ErrorHandler> getErrorHandler() {
+        return Optional.of(errorHandler);
     }
 
     @Override
@@ -273,9 +297,4 @@ public class MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOf
         return MySqlConnectorConfig.ALL_FIELDS;
     }
 
-    @Override
-    @SuppressWarnings("unchecked")
-    protected Long getReadOnlyIncrementalSnapshotSignalOffset(MySqlOffsetContext previousOffset) {
-        return ((MySqlReadOnlyIncrementalSnapshotContext<TableId>) previousOffset.getIncrementalSnapshotContext()).getSignalOffset();
-    }
 }

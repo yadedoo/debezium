@@ -91,6 +91,7 @@ public class FabricKafkaConnectBuilder extends
     public FabricKafkaConnectBuilder withBuild(OcpArtifactServerController artifactServer) {
         List<Plugin> plugins = new ArrayList<>(List.of(
                 artifactServer.createDebeziumPlugin("mysql"),
+                artifactServer.createDebeziumPlugin("mariadb"),
                 artifactServer.createDebeziumPlugin("postgres"),
                 artifactServer.createDebeziumPlugin("mongodb"),
                 artifactServer.createDebeziumPlugin("sqlserver"),
@@ -100,7 +101,7 @@ public class FabricKafkaConnectBuilder extends
 
         if (ConfigProperties.DATABASE_ORACLE) {
             plugins.add(
-                    artifactServer.createDebeziumPlugin("oracle", List.of("jdbc/ojdbc8")));
+                    artifactServer.createDebeziumPlugin("oracle", List.of("jdbc/ojdbc11")));
         }
 
         return withBuild(plugins);

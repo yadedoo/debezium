@@ -27,7 +27,7 @@ import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.data.Envelope;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.time.Interval;
 import io.debezium.time.MicroDuration;
@@ -39,7 +39,7 @@ import io.debezium.util.Testing;
  *
  * @author Chris Cranford
  */
-public class OracleDefaultValueIT extends AbstractConnectorTest {
+public class OracleDefaultValueIT extends AbstractAsyncEngineConnectorTest {
 
     private OracleConnection connection;
     private Consumer<Configuration.Builder> configUpdater;
@@ -71,11 +71,6 @@ public class OracleDefaultValueIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-3710")
     public void shouldHandleNumericDefaultTypes() throws Exception {
-        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
-        if (VerifyRecord.isApucurioAvailable()) {
-            skipAvroValidation();
-        }
-
         List<ColumnDefinition> columnDefinitions = Arrays.asList(
                 new ColumnDefinition("val_int", "int",
                         "1", "2",
@@ -152,11 +147,6 @@ public class OracleDefaultValueIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-3710")
     public void shouldHandleFloatPointDefaultTypes() throws Exception {
-        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
-        if (VerifyRecord.isApucurioAvailable()) {
-            skipAvroValidation();
-        }
-
         List<ColumnDefinition> columnDefinitions = Arrays.asList(
                 new ColumnDefinition("val_bf", "binary_float",
                         "3.14", "6.28",

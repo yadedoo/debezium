@@ -37,6 +37,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Configuration.Builder;
 import io.debezium.config.Field;
+import io.debezium.connector.SnapshotType;
 import io.debezium.connector.binlog.BinlogConnectorConfig.SnapshotMode;
 import io.debezium.connector.binlog.junit.SkipTestDependingOnDatabaseRule;
 import io.debezium.connector.binlog.junit.SkipWhenDatabaseIs;
@@ -56,7 +57,6 @@ import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalDatabaseConnectorConfig.SnapshotTablesRowCountOrder;
 import io.debezium.relational.history.MemorySchemaHistory;
-import io.debezium.relational.history.SchemaHistory;
 
 /**
  * @author Randall Hauch
@@ -154,7 +154,7 @@ public abstract class BinlogSnapshotSourceIT<C extends SourceConnector> extends 
                     .with(BinlogConnectorConfig.USER, "cloud")
                     .with(BinlogConnectorConfig.PASSWORD, "cloudpass")
                     .with(BinlogConnectorConfig.TEST_DISABLE_GLOBAL_LOCKING, "true")
-                    .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, storeOnlyCapturedTables);
+                    .with(BinlogConnectorConfig.STORE_ONLY_CAPTURED_TABLES_DDL, storeOnlyCapturedTables);
         }
         if (!data) {
             builder.with(BinlogConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA);
@@ -187,7 +187,7 @@ public abstract class BinlogSnapshotSourceIT<C extends SourceConnector> extends 
             String currentRecordTable = ((Struct) record.value()).getStruct("source").getString("table");
             if (i.hasNext()) {
                 final Object snapshotOffsetField = record.sourceOffset().get("snapshot");
-                assertThat(snapshotOffsetField).isEqualTo(true);
+                assertThat(snapshotOffsetField).isEqualTo(SnapshotType.INITIAL.toString());
 
                 if (Objects.equals(snapshotSourceField, "first")) {
                     assertThat(previousRecordTable).isNull();
@@ -225,7 +225,7 @@ public abstract class BinlogSnapshotSourceIT<C extends SourceConnector> extends 
                     .isEqualTo(schemaEventsCount);
             assertThat(schemaChanges.ddlRecordsForDatabaseOrEmpty("").size()
                     + schemaChanges.ddlRecordsForDatabaseOrEmpty(OTHER_DATABASE.getDatabaseName()).size())
-                    .isEqualTo(useGlobalLock ? 1 : 5);
+                    .isEqualTo(1);
         }
 
         if (!useGlobalLock) {
@@ -833,7 +833,7 @@ public abstract class BinlogSnapshotSourceIT<C extends SourceConnector> extends 
             final String snapshotSourceField = ((Struct) record.value()).getStruct("source").getString("snapshot");
             if (i.hasNext()) {
                 final Object snapshotOffsetField = record.sourceOffset().get("snapshot");
-                assertThat(snapshotOffsetField).isEqualTo(true);
+                assertThat(snapshotOffsetField).isEqualTo(SnapshotType.INITIAL.toString());
                 assertThat(snapshotSourceField).isEqualTo("true");
             }
             else {

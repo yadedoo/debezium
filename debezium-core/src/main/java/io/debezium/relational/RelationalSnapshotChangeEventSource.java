@@ -134,7 +134,7 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
             LOGGER.info("Snapshot step 1 - Preparing");
 
-            if (previousOffset != null && previousOffset.isSnapshotRunning()) {
+            if (previousOffset != null && previousOffset.isInitialSnapshotRunning()) {
                 LOGGER.info("Previous snapshot was cancelled before completion; a new snapshot will be taken.");
             }
 
@@ -268,10 +268,10 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
         boolean snapshotInProgress = false;
 
         if (offsetExists) {
-            snapshotInProgress = previousOffset.isSnapshotRunning();
+            snapshotInProgress = previousOffset.isInitialSnapshotRunning();
         }
 
-        if (offsetExists && !previousOffset.isSnapshotRunning()) {
+        if (offsetExists && !previousOffset.isInitialSnapshotRunning()) {
             LOGGER.info("A previous offset indicating a completed snapshot has been found.");
         }
 
@@ -520,13 +520,10 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
                 boolean lastTable = tableOrder == tableCount && snapshotMaxThreads == 1;
                 String selectStatement = queryTables.get(tableId);
                 OptionalLong rowCount = rowCountTables.get(tableId);
-                notificationService.initialSnapshotNotificationService().notifyTableInProgress(
-                        snapshotContext.partition,
-                        snapshotContext.offset,
-                        tableId.identifier(),
-                        rowCountTables.keySet());
+                Set<TableId> rowCountTablesKeySet = new HashSet<>(rowCountTables.keySet());
                 Callable<Void> callable = createDataEventsForTableCallable(sourceContext, snapshotContext, snapshotReceiver,
-                        snapshotContext.tables.forTable(tableId), firstTable, lastTable, tableOrder++, tableCount, selectStatement, rowCount, connectionPool, offsets);
+                        snapshotContext.tables.forTable(tableId), firstTable, lastTable, tableOrder++, tableCount, selectStatement, rowCount, rowCountTablesKeySet,
+                        connectionPool, offsets);
                 completionService.submit(callable);
             }
 
@@ -551,8 +548,8 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
     protected abstract O copyOffset(RelationalSnapshotContext<P, O> snapshotContext);
 
     protected void tryStartingSnapshot(RelationalSnapshotContext<P, O> snapshotContext) {
-        if (!snapshotContext.offset.isSnapshotRunning()) {
-            snapshotContext.offset.preSnapshotStart();
+        if (!snapshotContext.offset.isInitialSnapshotRunning()) {
+            snapshotContext.offset.preSnapshotStart(snapshotContext.onDemand);
         }
     }
 
@@ -577,14 +574,14 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
     protected Callable<Void> createDataEventsForTableCallable(ChangeEventSourceContext sourceContext, RelationalSnapshotContext<P, O> snapshotContext,
                                                               SnapshotReceiver<P> snapshotReceiver, Table table, boolean firstTable, boolean lastTable, int tableOrder,
-                                                              int tableCount, String selectStatement, OptionalLong rowCount, Queue<JdbcConnection> connectionPool,
-                                                              Queue<O> offsets) {
+                                                              int tableCount, String selectStatement, OptionalLong rowCount, Set<TableId> rowCountTablesKeySet,
+                                                              Queue<JdbcConnection> connectionPool, Queue<O> offsets) {
         return () -> {
             JdbcConnection connection = connectionPool.poll();
             O offset = offsets.poll();
             try {
                 doCreateDataEventsForTable(sourceContext, snapshotContext, offset, snapshotReceiver, table, firstTable, lastTable, tableOrder, tableCount,
-                        selectStatement, rowCount, connection);
+                        selectStatement, rowCount, rowCountTablesKeySet, connection);
             }
             catch (SQLException e) {
                 notificationService.initialSnapshotNotificationService().notifyCompletedTableWithError(snapshotContext.partition,
@@ -603,7 +600,7 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
     protected void doCreateDataEventsForTable(ChangeEventSourceContext sourceContext, RelationalSnapshotContext<P, O> snapshotContext, O offset,
                                               SnapshotReceiver<P> snapshotReceiver, Table table,
                                               boolean firstTable, boolean lastTable, int tableOrder, int tableCount, String selectStatement, OptionalLong rowCount,
-                                              JdbcConnection jdbcConnection)
+                                              Set<TableId> rowCountTablesKeySet, JdbcConnection jdbcConnection)
             throws InterruptedException, SQLException {
 
         if (!sourceContext.isRunning()) {
@@ -612,6 +609,12 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
         long exportStart = clock.currentTimeInMillis();
         LOGGER.info("Exporting data from table '{}' ({} of {} tables)", table.id(), tableOrder, tableCount);
+
+        notificationService.initialSnapshotNotificationService().notifyTableInProgress(
+                snapshotContext.partition,
+                snapshotContext.offset,
+                table.id().identifier(),
+                rowCountTablesKeySet);
 
         Instant sourceTableSnapshotTimestamp = getSnapshotSourceTimestamp(jdbcConnection, offset, table.id());
 

@@ -25,7 +25,6 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -36,6 +35,7 @@ import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
 import javax.management.InstanceNotFoundException;
@@ -57,6 +57,7 @@ import org.junit.rules.TestRule;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.SnapshotType;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
 import io.debezium.connector.sqlserver.util.TestHelper;
 import io.debezium.data.Envelope;
@@ -64,12 +65,12 @@ import io.debezium.data.SchemaAndValueField;
 import io.debezium.data.SourceRecordAssert;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.embedded.async.RetryingCallable;
 import io.debezium.heartbeat.DatabaseHeartbeatImpl;
 import io.debezium.junit.ConditionalFail;
 import io.debezium.junit.Flaky;
 import io.debezium.junit.logging.LogInterceptor;
-import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.spi.Offsets;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalDatabaseSchema;
@@ -94,7 +95,7 @@ import junit.framework.TestCase;
  *
  * @author Jiri Pechanec
  */
-public class SqlServerConnectorIT extends AbstractConnectorTest {
+public class SqlServerConnectorIT extends AbstractAsyncEngineConnectorTest {
 
     @Rule
     public TestRule conditionalFail = new ConditionalFail();
@@ -127,12 +128,39 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
     }
 
     @Test
-    public void createAndDelete() throws Exception {
+    public void createAndDeleteWithDataQueryModeFunctionWithoutFetchThreshold() throws Exception {
+        createAndDelete(builder -> builder
+                .with(SqlServerConnectorConfig.DATA_QUERY_MODE, SqlServerConnectorConfig.DataQueryMode.FUNCTION)
+                .with(SqlServerConnectorConfig.STREAMING_FETCH_SIZE, 0));
+    }
+
+    @Test
+    public void createAndDeleteWithDataQueryModeFunctionWithFetchThreshold() throws Exception {
+        createAndDelete(builder -> builder
+                .with(SqlServerConnectorConfig.DATA_QUERY_MODE, SqlServerConnectorConfig.DataQueryMode.FUNCTION)
+                .with(SqlServerConnectorConfig.STREAMING_FETCH_SIZE, 3));
+    }
+
+    @Test
+    public void createAndDeleteWithDataQueryModeDirectWithoutFetchThreshold() throws Exception {
+        createAndDelete(builder -> builder
+                .with(SqlServerConnectorConfig.DATA_QUERY_MODE, SqlServerConnectorConfig.DataQueryMode.DIRECT)
+                .with(SqlServerConnectorConfig.STREAMING_FETCH_SIZE, 0));
+    }
+
+    @Test
+    public void createAndDeleteWithDataQueryModeDirectWithFetchThreshold() throws Exception {
+        createAndDelete(builder -> builder
+                .with(SqlServerConnectorConfig.DATA_QUERY_MODE, SqlServerConnectorConfig.DataQueryMode.DIRECT)
+                .with(SqlServerConnectorConfig.STREAMING_FETCH_SIZE, 3));
+    }
+
+    private void createAndDelete(UnaryOperator<Configuration.Builder> configAugmenter) throws Exception {
         final int RECORDS_PER_TABLE = 5;
         final int TABLES = 2;
         final int ID_START = 10;
-        final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+        final Configuration config = configAugmenter.apply(TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL))
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -210,6 +238,7 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
         final Configuration config = TestHelper.defaultConfig()
                 .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
                 .with(SqlServerConnectorConfig.DATA_QUERY_MODE, SqlServerConnectorConfig.DataQueryMode.DIRECT)
+                .with(SqlServerConnectorConfig.STREAMING_FETCH_SIZE, 3)
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -644,7 +673,8 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
                 "UPDATE tableb SET id=100 WHERE id=1");
 
         final SourceRecords records1 = consumeRecordsByTopic(2);
-        stopConnector();
+        waitForEngineShutdown();
+        cleanupTestFwkState();
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
@@ -762,7 +792,8 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
 
         final SourceRecords records1 = consumeRecordsByTopic(14);
 
-        stopConnector();
+        waitForEngineShutdown();
+        cleanupTestFwkState();
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
@@ -884,14 +915,12 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
                     try {
                         final Lsn minLsn = connection.getMinLsn(TestHelper.TEST_DATABASE_1, tableName);
                         final Lsn maxLsn = connection.getMaxLsn(TestHelper.TEST_DATABASE_1);
-                        SqlServerChangeTable[] tables = Collections.singletonList(ct).toArray(new SqlServerChangeTable[]{});
                         final List<Integer> ids = new ArrayList<>();
-                        connection.getChangesForTables(TestHelper.TEST_DATABASE_1, tables, minLsn, maxLsn, resultsets -> {
-                            final ResultSet rs = resultsets[0];
+                        try (ResultSet rs = connection.getChangesForTable(ct, minLsn, maxLsn)) {
                             while (rs.next()) {
                                 ids.add(rs.getInt("id"));
                             }
-                        });
+                        }
                         if (ids.equals(expectedIds)) {
                             resultMap.put(tableName, true);
                         }
@@ -1876,7 +1905,8 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
                 new SchemaAndValueField("colb", Schema.OPTIONAL_STRING_SCHEMA, "b"));
         assertRecord((Struct) value.get("after"), expectedLastRow);
 
-        stopConnector();
+        waitForEngineShutdown();
+        cleanupTestFwkState();
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
 
@@ -1980,7 +2010,7 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
 
         start(SqlServerConnector.class, config);
         assertConnectorIsRunning();
-        waitForAvailableRecords(100, TimeUnit.MILLISECONDS);
+        waitForAvailableRecords(1, TimeUnit.SECONDS);
 
         stopConnector(value -> assertThat(logInterceptor.containsWarnMessage(DatabaseSchema.NO_CAPTURED_DATA_COLLECTIONS_WARNING)).isTrue());
     }
@@ -2164,7 +2194,7 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
         records = records.subList(1, records.size());
         for (Iterator<SourceRecord> it = records.iterator(); it.hasNext();) {
             SourceRecord record = it.next();
-            assertThat(record.sourceOffset().get("snapshot")).as("Snapshot phase").isEqualTo(true);
+            assertThat(record.sourceOffset().get("snapshot")).as("Snapshot phase").isEqualTo(SnapshotType.INITIAL.toString());
             if (it.hasNext()) {
                 assertThat(record.sourceOffset().get("snapshot_completed")).as("Snapshot in progress").isEqualTo(false);
             }
@@ -2643,10 +2673,10 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
                 "CREATE TABLE s2.tableb (id int PRIMARY KEY, valb integer);";
         connection.execute(statements);
         connection.setAutoCommit(true);
-        TestHelper.enableSchemaTableCdc(connection, new TableId(null, "s1", "tablea"));
-        TestHelper.enableSchemaTableCdc(connection, new TableId(null, "s1", "tableb"));
-        TestHelper.enableSchemaTableCdc(connection, new TableId(null, "s2", "tablea"));
-        TestHelper.enableSchemaTableCdc(connection, new TableId(null, "s2", "tableb"));
+        TestHelper.enableTableCdc(connection, new TableId(null, "s1", "tablea"));
+        TestHelper.enableTableCdc(connection, new TableId(null, "s1", "tableb"));
+        TestHelper.enableTableCdc(connection, new TableId(null, "s2", "tablea"));
+        TestHelper.enableTableCdc(connection, new TableId(null, "s2", "tableb"));
 
         // Test exclude filter, s2 schema and default dbo schema should be included.
         Configuration config = TestHelper.defaultConfig()
@@ -3138,12 +3168,15 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
         List<SourceRecord> s1recs = actualRecords.recordsForTopic("server1.testDB1.dbo.tablea");
         List<SourceRecord> s2recs = actualRecords.recordsForTopic("server1.testDB1.dbo.tableb");
 
+        assertThat(s1recs.size()).isEqualTo(1);
         if (s2recs != null) { // Sometimes the record is processed by the stream so filtering it out
             s2recs = s2recs.stream().filter(r -> "r".equals(((Struct) r.value()).get("op")))
                     .collect(Collectors.toList());
+            assertThat(s2recs).isEmpty();
         }
-        assertThat(s1recs.size()).isEqualTo(1);
-        assertThat(s2recs).isEmpty();
+        else {
+            assertThat(s2recs).isNull();
+        }
 
         SourceRecord record = s1recs.get(0);
         VerifyRecord.isValidRead(record, pkField, 1);
@@ -3323,21 +3356,20 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
                 .with("errors.max.retries", 1)
                 .with(SqlServerConnectorConfig.LOG_POSITION_CHECK_ENABLED, false)
                 .build();
-        final LogInterceptor logInterceptor = new LogInterceptor(ErrorHandler.class);
+        final LogInterceptor logInterceptor1 = new LogInterceptor(RetryingCallable.class);
 
         try {
             start(SqlServerConnector.class, config1);
             assertConnectorIsRunning();
             scenario.run();
 
-            final String message1 = "1 of 1 retries will be attempted";
-            final String message2 = "The maximum number of 1 retries has been attempted";
+            final String message = "Failed with retriable exception, will retry later; attempt #1 out of 1";
             Awaitility.await()
-                    .alias("Checking for maximum restart messages")
+                    .alias("Checking for maximum restart messages1")
                     .pollInterval(100, TimeUnit.MILLISECONDS)
                     .atMost(5, TimeUnit.SECONDS)
                     .ignoreException(InstanceNotFoundException.class)
-                    .until(() -> logInterceptor.containsMessage(message1) && logInterceptor.containsMessage(message2));
+                    .until(() -> logInterceptor1.containsMessage(message));
         }
         finally {
             // Set the database back online, since otherwise, it will be impossible to create it again
@@ -3408,12 +3440,12 @@ public class SqlServerConnectorIT extends AbstractConnectorTest {
         }
 
         @Override
-        public void recover(Offsets<?, ?> offsets, Tables schema, DdlParser ddlParser) {
+        public void recover(Offsets<?, ?> offsets, Tables schema, DdlParser ddlParser) throws InterruptedException {
             delegate.recover(offsets, schema, ddlParser);
         }
 
         @Override
-        public void recover(Map<Map<String, ?>, Map<String, ?>> offsets, Tables schema, DdlParser ddlParser) {
+        public void recover(Map<Map<String, ?>, Map<String, ?>> offsets, Tables schema, DdlParser ddlParser) throws InterruptedException {
             delegate.recover(offsets, schema, ddlParser);
         }
 

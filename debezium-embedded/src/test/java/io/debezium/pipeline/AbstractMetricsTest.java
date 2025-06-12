@@ -29,10 +29,10 @@ import org.junit.Test;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.util.Testing;
 
-public abstract class AbstractMetricsTest<T extends SourceConnector> extends AbstractConnectorTest {
+public abstract class AbstractMetricsTest<T extends SourceConnector> extends AbstractAsyncEngineConnectorTest {
 
     protected abstract Class<T> getConnectorClass();
 
@@ -267,6 +267,7 @@ public abstract class AbstractMetricsTest<T extends SourceConnector> extends Abs
         Testing.print("****ASSERTIONS****");
         assertThat(mBeanServer.getAttribute(getStreamingMetricsObjectName(), "Connected")).isEqualTo(true);
         assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "TotalNumberOfCreateEventsSeen")).isEqualTo(expectedEvents);
+        assertThat(mBeanServer.getAttribute(getMultiplePartitionStreamingMetricsObjectName(), "CapturedTables")).isEqualTo(new String[]{ tableName() });
 
         if (checkAdvancedMetrics) {
             assertAdvancedMetrics(2L);

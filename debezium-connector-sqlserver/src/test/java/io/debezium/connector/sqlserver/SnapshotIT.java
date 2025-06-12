@@ -32,6 +32,7 @@ import org.junit.Test;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.SnapshotType;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotIsolationMode;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
@@ -41,7 +42,7 @@ import io.debezium.converters.spi.CloudEventsMaker;
 import io.debezium.data.SchemaAndValueField;
 import io.debezium.data.SourceRecordAssert;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.pipeline.ErrorHandler;
@@ -54,7 +55,7 @@ import io.debezium.util.Testing;
  *
  * @author Jiri Pechanec
  */
-public class SnapshotIT extends AbstractConnectorTest {
+public class SnapshotIT extends AbstractAsyncEngineConnectorTest {
 
     private static final int INITIAL_RECORDS_PER_TABLE = 500;
     private static final int STREAMING_RECORDS_PER_TABLE = 500;
@@ -141,10 +142,8 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset())
-                    .extracting("snapshot").containsExactly(true);
-            assertThat(record1.sourceOffset())
-                    .extracting("snapshot_completed").containsExactly(i == INITIAL_RECORDS_PER_TABLE - 1);
+            assertThat(record1.sourceOffset()).extracting("snapshot").isEqualTo(SnapshotType.INITIAL.toString());
+            assertThat(record1.sourceOffset()).extracting("snapshot_completed").isEqualTo(i == INITIAL_RECORDS_PER_TABLE - 1);
             assertNull(value1.get("before"));
         }
     }
@@ -280,10 +279,8 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset())
-                    .extracting("snapshot").containsExactly(true);
-            assertThat(record1.sourceOffset())
-                    .extracting("snapshot_completed").containsExactly(i == INITIAL_RECORDS_PER_TABLE - 1);
+            assertThat(record1.sourceOffset()).extracting("snapshot").isEqualTo(SnapshotType.INITIAL.toString());
+            assertThat(record1.sourceOffset()).extracting("snapshot_completed").isEqualTo(i == INITIAL_RECORDS_PER_TABLE - 1);
             assertNull(value1.get("before"));
         }
     }
